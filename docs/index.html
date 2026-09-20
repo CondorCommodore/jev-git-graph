@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#0b1120">
+    <meta name="description" content="An interactive concept for seeing Git facts, Jev relationship judgments, and a human reviewed cleanup plan.">
+    <title>Jev Git Graph — Interactive concept</title>
+    <link rel="icon" href="favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="demo.css">
+    <script src="demo.js" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <a class="brand" href="https://github.com/CondorCommodore/jev-git-graph" aria-label="Jev Git Graph on GitHub">
+          <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span>jev<span class="brand-separator">/</span>git graph</span>
+        </a>
+        <div class="topbar-right">
+          <span class="topbar-label">INTERACTIVE CONCEPT</span>
+          <a class="github-link" href="https://github.com/CondorCommodore/jev-git-graph/blob/main/docs/spec.md">Read the spec <span aria-hidden="true">↗</span></a>
+        </div>
+      </header>
+
+      <main>
+        <section class="intro" aria-labelledby="page-title">
+          <div>
+            <p class="eyebrow"><span class="eyebrow-line"></span> SEE THE RELATIONSHIPS</p>
+            <h1 id="page-title">What happened between<br><em>these branches?</em></h1>
+            <p class="intro-copy">Git gives us the facts. Jev helps judge the connections. A person decides what to preserve.</p>
+          </div>
+          <div class="intro-note"><span class="note-dot"></span><span>Synthetic example<br><strong>No live API call</strong></span></div>
+        </section>
+
+        <section class="workspace" aria-label="Interactive branch relationship demo">
+          <aside class="journey panel" aria-label="Analysis stages">
+            <div class="panel-kicker">THE ANALYSIS</div>
+            <h2>From tangled<br>to understood.</h2>
+            <div id="stage-list" class="stage-list"></div>
+            <div class="journey-footer">
+              <button id="play-button" class="play-button" type="button"><span id="play-icon" aria-hidden="true">▶</span><span id="play-label">Play the analysis</span></button>
+              <p>Choose a step or select any connection in the graph.</p>
+            </div>
+          </aside>
+
+          <section class="graph-panel panel" aria-labelledby="graph-title">
+            <div class="graph-toolbar">
+              <div>
+                <span class="panel-kicker">RELATIONSHIP MAP</span>
+                <h2 id="graph-title">A repository, made legible</h2>
+              </div>
+              <div id="phase-badge" class="phase-badge">01 / 04 · Git inventory</div>
+            </div>
+            <div class="graph-wrap">
+              <div class="graph-grid" aria-hidden="true"></div>
+              <svg id="graph" viewBox="0 0 960 630" role="img" aria-label="Interactive graph of synthetic Git branches and their relationships"></svg>
+              <div class="graph-hint">Select a node or connection to inspect it <span aria-hidden="true">↗</span></div>
+            </div>
+            <div class="graph-bottom">
+              <div class="legend"><span><i class="legend-line fact"></i> Git fact</span><span><i class="legend-line proposal"></i> Jev judgment</span><span><i class="legend-dot"></i> Work to preserve</span></div>
+              <span id="graph-count" class="graph-count">7 objects · 3 facts</span>
+            </div>
+          </section>
+
+          <aside class="inspector panel" aria-labelledby="inspector-title">
+            <div class="inspector-head">
+              <span class="panel-kicker">IN FOCUS</span>
+              <span id="focus-index" class="focus-index">01 / 03</span>
+            </div>
+            <div id="inspector-content"></div>
+          </aside>
+        </section>
+
+        <section class="principle-strip" aria-label="How decisions are made">
+          <div><span class="strip-number">01</span><span>Facts from Git remain <strong>verifiable</strong></span></div>
+          <div><span class="strip-number">02</span><span>Jev judgments carry <strong>probabilities</strong></span></div>
+          <div><span class="strip-number">03</span><span>Unique work stays <strong>visible</strong></span></div>
+          <div><span class="strip-number">04</span><span>Cleanup waits for <strong>human review</strong></span></div>
+        </section>
+      </main>
+
+      <footer>JEV GIT GRAPH <span>·</span> A visual design study using synthetic data <span>·</span> <a href="https://github.com/CondorCommodore/jev-git-graph">Source on GitHub</a></footer>
+    </div>
+  </body>
+</html>

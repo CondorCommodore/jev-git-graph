@@ -6,6 +6,8 @@ The project begins as a **read-only local CLI**. Git provides the facts and an i
 
 Start with the [project specification](docs/spec.md), including the problem statement, five whys, requirements, and acceptance criteria.
 
+Explore the [interactive visual concept](https://condorcommodore.github.io/jev-git-graph/). It walks through a synthetic repository from Git facts to candidate links, illustrative Jev judgments, and a human review plan. The demo makes no API calls.
+
 ## Design principles
 
 - Preserve every unique commit, uncommitted change, and stash until its disposition is explicit.
