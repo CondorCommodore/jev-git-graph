@@ -10,6 +10,21 @@ Point the tool at any local repository with `--repo PATH`. The default workflow 
 
 Jev use is separate and opt-in. Before a live request, the tool shows the exact payload it would send. The default payload excludes source files, raw diffs, stash contents, credentials, repository paths, and remote URLs. The full contract is in the [specification](docs/spec.md#local-only-contract).
 
+## Run it
+
+The initial CLI has no runtime dependency beyond Python and Git. Install it into an environment you control, then choose an artifact directory that is outside the repository being inspected:
+
+```bash
+python -m pip install -e .
+
+jg inventory --repo /path/to/repository --out /path/to/private-artifacts
+jg candidates --repo /path/to/repository --inventory /path/to/private-artifacts/inventory.json --out /path/to/private-artifacts
+jg relate --repo /path/to/repository --candidates /path/to/private-artifacts/candidates.json --preview --out /path/to/private-artifacts
+jg plan --repo /path/to/repository --inventory /path/to/private-artifacts/inventory.json --candidates /path/to/private-artifacts/candidates.json --out /path/to/private-artifacts
+```
+
+`relate` writes only a local preview by default. A live Jev request requires an approved preview digest, `--use-jev`, and `TYPESAFE_API_KEY` in the process environment. It is hard-capped by default at **one request and 8,192 payload bytes**; raising either cap requires an explicit command-line override after reviewing the preview. There are no OpenAI, Codex, Claude, or agent-loop calls in this project. Read the preview before approving it.
+
 Start with the [project specification](docs/spec.md), including the problem statement, five whys, requirements, and acceptance criteria.
 
 Explore the [interactive visual concept](https://condorcommodore.github.io/jev-git-graph/). It walks through a synthetic repository from Git facts to candidate links, illustrative Jev judgments, and a human review plan. The demo makes no API calls.

@@ -58,7 +58,7 @@ The first version is safe to point at a private repository because collection, c
 - It writes artifacts only to an explicit `--out DIR` outside every inspected worktree. It rejects an output path inside an inspected worktree, including through a resolved symlink.
 - It does not read credential files, environment values, Git remote URLs containing credentials, or file contents from the inspected repository.
 
-The only future network path is the opt-in Jev adapter. It has no default API key lookup and cannot run until the operator both supplies credentials through their own environment or secret store and passes `--use-jev`. Before one request, `jg relate --preview` renders the exact JSON payload, its byte count, and the destination host. A live call sends only the fields listed in the payload contract below; it never uploads a full repository, raw working-tree diff, source file, credential, or report.
+The only network path is the opt-in Jev adapter. It has no default API key lookup and cannot run until the operator both supplies credentials through their own environment or secret store and passes `--use-jev`. Before one request, `jg relate --preview` renders the exact JSON payload, its byte count, and the destination host. A live call sends only the fields listed in the payload contract below; it never uploads a full repository, raw working-tree diff, source file, credential, or report. There is no OpenAI, Codex, Claude, generic LLM, agent, model-router, or fallback API client in the project.
 
 The default inventory is metadata-only: ref names, object IDs, commit subjects, timestamps, path names, patch IDs, and worktree/stash state. Commit bodies and changed-line excerpts are disabled by default. Their inclusion requires a separate explicit flag and is shown in the Jev preview.
 
@@ -107,11 +107,10 @@ Provisional CLI:
 
 ```text
 jg inventory --repo PATH --out DIR
-jg candidates --snapshot DIR --out DIR
-jg relate --snapshot DIR --candidates DIR --preview
-jg relate --snapshot DIR --candidates DIR --use-jev --out DIR
-jg plan --snapshot DIR --relations DIR --out DIR
-jg check --snapshot DIR --repo PATH
+jg candidates --repo PATH --inventory DIR/inventory.json --out DIR
+jg relate --repo PATH --candidates DIR/candidates.json --preview --out DIR
+jg relate --repo PATH --candidates DIR/candidates.json --use-jev --approved-preview DIR/jev-preview.json --approved-payload-sha256 SHA256 --out DIR
+jg plan --repo PATH --inventory DIR/inventory.json --candidates DIR/candidates.json --out DIR
 ```
 
 `--repo` accepts a repository root or any linked worktree. It resolves the Git common directory and inventories that repository's refs, linked worktrees, and stashes. The command accepts no remote name or hosted-service argument in the first version.
@@ -120,7 +119,7 @@ jg check --snapshot DIR --repo PATH
 
 An output directory contains `manifest.json` (schema version, repository identity, timestamp, command outcomes), `inventory.json`, `candidates.json`, `relations.json`, and `plan.md`. The manifest identifies a repository by a locally generated opaque run identifier plus a hash of its canonical path; it does not publish the path or remote URL. JSON records contain evidence identifiers and source SHAs so a report can be reproduced and a stale report detected. Artifacts contain no credentials or environment variable values.
 
-The preview shows the exact fields and character count sent to Jev, with a configurable budget and a redaction check. Model use is opt-in for each run. API credentials come from the process environment or an operator-managed secret store and never enter output artifacts.
+The preview shows the exact fields and byte count sent to Jev, with a redaction check. Live use is opt-in for each run and defaults to a maximum of **one request and 8,192 total payload bytes**. The only way to raise either limit is an explicit `--max-jev-requests` or `--max-jev-payload-bytes` command-line override, after preview review. API credentials come from the process environment or an operator-managed secret store and never enter output artifacts.
 
 ### Jev payload contract
 
