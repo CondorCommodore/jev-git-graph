@@ -4,6 +4,12 @@ Find the relationships among Git branches, commits, worktrees, stashes, and pull
 
 The project begins as a **read-only local CLI**. Git provides the facts and an in-memory graph. Jev answers small, typed questions about relationships that Git ancestry alone cannot establish. A maintainer reviews the resulting preservation and cleanup plan. The first version does not execute that plan.
 
+## Use with a private repository
+
+Point the tool at any local repository with `--repo PATH`. The default workflow stays on the machine: it does not contact Git remotes or hosted services, and it writes reports only to an output directory outside the inspected repository. That means it can inspect a private repository without publishing its inventory, history, worktree state, or report.
+
+Jev use is separate and opt-in. Before a live request, the tool shows the exact payload it would send. The default payload excludes source files, raw diffs, stash contents, credentials, repository paths, and remote URLs. The full contract is in the [specification](docs/spec.md#local-only-contract).
+
 Start with the [project specification](docs/spec.md), including the problem statement, five whys, requirements, and acceptance criteria.
 
 Explore the [interactive visual concept](https://condorcommodore.github.io/jev-git-graph/). It walks through a synthetic repository from Git facts to candidate links, illustrative Jev judgments, and a human review plan. The demo makes no API calls.

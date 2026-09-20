@@ -34,7 +34,7 @@ The primary user is a maintainer responsible for a busy Git repository. They nee
 
 ### First version
 
-- Operates locally on one repository and its linked worktrees; optional read-only GitHub PR metadata is a later input.
+- Operates locally on any Git repository or linked worktree named by `--repo PATH`, including private repositories. The implementation must not contain repository-specific rules or names.
 - Inventories refs, worktrees, dirty state, stashes, unique commits, changed paths, and exact patch equivalence.
 - Builds a bounded candidate graph from deterministic signals.
 - Optionally asks Jev typed questions about candidate relationships, with explicit consent to send a previewed payload.
@@ -47,6 +47,20 @@ The primary user is a maintainer responsible for a busy Git repository. They nee
 - Indexing full source files or sending raw diffs to a model by default.
 - A required graph or relational database. The first graph is in memory and exported as files.
 - Claiming that model confidence proves a branch is safe to delete.
+
+### Local-only contract
+
+The first version is safe to point at a private repository because collection, candidate generation, report rendering, and review planning run only on the local machine.
+
+- It does not run `git fetch`, `pull`, `push`, `remote update`, or any command that contacts a Git remote.
+- It does not call GitHub, GitLab, a hosted issue tracker, analytics, telemetry, crash reporting, or an update service.
+- It does not create commits, refs, notes, stashes, worktrees, index entries, files, or directories inside the inspected repository or any linked worktree.
+- It writes artifacts only to an explicit `--out DIR` outside every inspected worktree. It rejects an output path inside an inspected worktree, including through a resolved symlink.
+- It does not read credential files, environment values, Git remote URLs containing credentials, or file contents from the inspected repository.
+
+The only future network path is the opt-in Jev adapter. It has no default API key lookup and cannot run until the operator both supplies credentials through their own environment or secret store and passes `--use-jev`. Before one request, `jg relate --preview` renders the exact JSON payload, its byte count, and the destination host. A live call sends only the fields listed in the payload contract below; it never uploads a full repository, raw working-tree diff, source file, credential, or report.
+
+The default inventory is metadata-only: ref names, object IDs, commit subjects, timestamps, path names, patch IDs, and worktree/stash state. Commit bodies and changed-line excerpts are disabled by default. Their inclusion requires a separate explicit flag and is shown in the Jev preview.
 
 ## 4. Core model
 
@@ -100,9 +114,19 @@ jg plan --snapshot DIR --relations DIR --out DIR
 jg check --snapshot DIR --repo PATH
 ```
 
-An output directory contains `manifest.json` (schema version, repository identity, timestamp, command outcomes), `inventory.json`, `candidates.json`, `relations.json`, and `plan.md`. JSON records contain evidence identifiers and source SHAs so a report can be reproduced and a stale report detected. Output is private by default, excluded from this project's Git history, and must not contain credentials or environment variable values.
+`--repo` accepts a repository root or any linked worktree. It resolves the Git common directory and inventories that repository's refs, linked worktrees, and stashes. The command accepts no remote name or hosted-service argument in the first version.
+
+`--out` is required for commands that create artifacts. It is an operator-owned local directory, not a directory in the inspected repository. The command resolves both paths before it reads Git data and fails with a clear error if the output would be inside an inspected worktree. This keeps a private repository clean even when the tool is run from that repository.
+
+An output directory contains `manifest.json` (schema version, repository identity, timestamp, command outcomes), `inventory.json`, `candidates.json`, `relations.json`, and `plan.md`. The manifest identifies a repository by a locally generated opaque run identifier plus a hash of its canonical path; it does not publish the path or remote URL. JSON records contain evidence identifiers and source SHAs so a report can be reproduced and a stale report detected. Artifacts contain no credentials or environment variable values.
 
 The preview shows the exact fields and character count sent to Jev, with a configurable budget and a redaction check. Model use is opt-in for each run. API credentials come from the process environment or an operator-managed secret store and never enter output artifacts.
+
+### Jev payload contract
+
+For each candidate pair, the default payload may include: synthetic candidate ID; endpoint tip SHAs; branch labels if the operator permits them; merge-base SHA; counts of unique commits and patch-equivalent commits; changed-path hashes or operator-approved path names; task or PR identifiers deliberately supplied by the operator; and a compact list of normalized commit subjects. It also carries question version, answer choices, and evidence identifiers.
+
+The default payload excludes: repository path and remote URL; author name, email, or signing data; commit body; source file content; diff hunks; uncommitted file content; stash content; environment values; and all local artifact paths. The preview is the authority for a live request: if a field is absent there, it must be absent from the request.
 
 ## 7. Safety invariants
 
@@ -111,17 +135,22 @@ The preview shows the exact fields and character count sent to Jev, with a confi
 - A branch with unique commits, a dirty worktree, or a referenced stash cannot be classified as safe to remove solely from semantic similarity.
 - Every proposed relation is traceable to immutable inputs; changed inputs invalidate it.
 - Absence of a discovered relation is not evidence of independence when candidate coverage is incomplete.
+- A default local run opens no network connection and modifies no file within the inspected repository or linked worktree.
+- An artifact path nested under an inspected worktree is rejected before data collection starts.
+- A live Jev request cannot occur without `--use-jev`, successful payload preview, and an operator-provided credential outside the artifact directory.
 - Public fixtures contain synthetic or explicitly public data only.
 
 ## 8. Validation and success measures
 
 Build a labeled fixture set covering merged branches, cherry-picks, rebases, stacked branches, partial extraction, independent branches touching the same file, renamed paths, gone upstreams, dirty worktrees, and stashes. Tests must prove inventory completeness on these fixtures and ensure no unique work is omitted from the plan. Compare candidate recall and Jev judgments against maintainer labels; report per-relation errors and unknowns rather than one aggregate score. Calibrate any confidence threshold from the fixture results.
 
+Privacy and isolation tests must prove that a normal inventory run makes no network request, performs no Git remote operation, leaves the repository status and ref set byte-for-byte unchanged, and writes nothing inside the repository or linked worktrees. Tests must also prove rejection of a nested output path and verify that a Jev preview and live-request fixture contain only the declared payload fields.
+
 Success for a real repo is measurable: the canonical checkout is clean and current; every remaining branch, worktree, and stash has a recorded disposition; no unique work is lost; and a repeat snapshot detects new or stale items. Time spent reviewing and the number of unresolved items should decline across repeated runs.
 
 ## 9. Build sequence
 
-1. **Inventory CLI:** Git-only read-only snapshot, completeness warnings, JSON schema, and synthetic fixtures.
+1. **Local inventory CLI:** Git-only read-only snapshot for an arbitrary `--repo PATH`, output-path guard, completeness warnings, JSON schema, and synthetic fixtures.
 2. **Candidate graph:** factual edges, patch equivalence, candidate generation, and coverage report.
 3. **Jev adapter:** payload preview, typed question versions, fake client tests, bounded live evaluation on public fixtures.
 4. **Review report:** cluster view, evidence links, dispositions, and stale-input detection.
