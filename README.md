@@ -23,3 +23,9 @@ Explore the [interactive visual concept](https://condorcommodore.github.io/jev-g
 - [TypeSafe agent skills](https://github.com/typesafe-ai/skills): official guidance for typed System One questions.
 
 These are design references, not dependencies or code incorporated into this repository.
+
+## License and contributions
+
+Copyright 2026 CondorCommodore. This project's code and documentation are licensed under the [Apache License, Version 2.0](LICENSE). See [NOTICE](NOTICE) for attribution.
+
+Comments, suggestions, and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution terms.
