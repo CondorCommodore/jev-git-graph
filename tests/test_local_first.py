@@ -242,6 +242,35 @@ class LocalFirstTest(unittest.TestCase):
         with self.assertRaisesRegex(JgError, "different inventory"):
             build_plan(inventory_path, candidates_path, review_path=review_path)
 
+    def test_plan_downgrades_tampered_preservation_proof(self) -> None:
+        inventory_path = write_inventory(self.repo, self.output)
+        candidates_path = write_candidates(self.repo, inventory_path, self.output)
+        inventory = json.loads(inventory_path.read_text())
+        candidates = json.loads(candidates_path.read_text())
+        branch = next(item for item in inventory["branches"] if item["name"] == "auth-v1")
+        destination = {"kind": "branch", "name": "auth-v1"}
+        fingerprint = object_fingerprint("branch", branch)
+        review = {
+            "kind": "relationship-review", "schema_version": 2,
+            "repository_id": inventory["repository"]["id"],
+            "inventory_digest": digest(inventory), "candidate_digest": digest(candidates), "relations_digest": None,
+            "provenance": {"repository_id": inventory["repository"]["id"], "inventory_digest": digest(inventory), "candidate_digest": digest(candidates), "relations_digest": None},
+            "reviewer_identity": "reviewer@example.test",
+            "decisions": [{
+                "object_id": "branch:auth-v1", "kind": "branch", "fingerprint": fingerprint, "source_fingerprint": fingerprint,
+                "source_provenance": {"repository_id": inventory["repository"]["id"], "inventory_digest": digest(inventory), "candidate_digest": digest(candidates), "relations_digest": None}, "reviewer_id": "reviewer@example.test",
+                "reviewed_at": "2026-09-21T00:00:00Z", "disposition": "PRESERVE_IN_BRANCH", "rationale": "retain",
+                "preservation_destination": destination,
+                "preservation_proof": {"verified": True, "source_fingerprint": fingerprint, "destination_fingerprint": "0" * 64, "destination": destination},
+            }], "limitations": [],
+        }
+        review_path = self.output / "tampered-review.json"
+        review_path.write_text(json.dumps(review), encoding="utf-8")
+        plan, _ = build_plan(inventory_path, candidates_path, review_path=review_path)
+        decision = next(item for item in plan["dispositions"] if item.get("name") == "auth-v1")
+        self.assertEqual("UNRESOLVED", decision["disposition"])
+        self.assertEqual("stale", decision["review_status"])
+
     def test_plan_accounts_for_each_branch_dirty_worktree_and_stash(self) -> None:
         inventory_path = write_inventory(self.repo, self.output)
         candidates_path = write_candidates(self.repo, inventory_path, self.output)

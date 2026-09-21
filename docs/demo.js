@@ -40,6 +40,11 @@
       state.artifacts[kind] = document;
       if (kind === "review") {
         state.reviewSchemaVersion = document.schema_version;
+        for (const decision of document.decisions) {
+          const proof = decision?.preservation_proof;
+          const verified = !preservationDispositions.has(decision?.disposition) || Boolean(proof && await sha256(proof.destination) === proof.destination_fingerprint);
+          Object.defineProperty(decision, "_destinationFingerprintVerified", { value: verified, enumerable: false, configurable: true });
+        }
         state.reviews = new Map(document.decisions.map((decision) => [decision.object_id, decision]));
       }
       $(`#${kind}-file-name`).textContent = file.name;
@@ -249,7 +254,7 @@
     const destination = decision?.preservation_destination;
     const proof = decision?.preservation_proof;
     const source = decision?.source_fingerprint || decision?.fingerprint;
-    return meaningfulDestination(destination) && proof && proof.verified === true && typeof proof.source_fingerprint === "string" && proof.source_fingerprint === source && typeof proof.destination_fingerprint === "string" && stable(proof.destination) === stable(destination);
+    return meaningfulDestination(destination) && proof && proof.verified === true && decision._destinationFingerprintVerified === true && typeof proof.source_fingerprint === "string" && proof.source_fingerprint === source && typeof proof.destination_fingerprint === "string" && stable(proof.destination) === stable(destination);
   }
   function reviewStatus(item) {
     const identity = reviewIdentity(item); if (!identity) return "none";
@@ -310,7 +315,9 @@
       }
       const sourceProvenance = await reviewProvenance();
       state.reviewSchemaVersion = 2;
-      state.reviews.set(identity.id, { object_id: identity.id, kind: identity.kind, fingerprint: sourceFingerprint, source_fingerprint: sourceFingerprint, source_provenance: sourceProvenance, reviewer_id: reviewer.value.trim(), reviewer: reviewer.value.trim(), observed: identity.observed, disposition: select.value, rationale: rationale.value.trim(), reviewed_at: new Date().toISOString(), preservation_destination: destination, preservation_proof: proof, reconciliation: { status: "current", reasons: ["browser_reviewed"] } });
+      const savedDecision = { object_id: identity.id, kind: identity.kind, fingerprint: sourceFingerprint, source_fingerprint: sourceFingerprint, source_provenance: sourceProvenance, reviewer_id: reviewer.value.trim(), reviewer: reviewer.value.trim(), observed: identity.observed, disposition: select.value, rationale: rationale.value.trim(), reviewed_at: new Date().toISOString(), preservation_destination: destination, preservation_proof: proof, reconciliation: { status: "current", reasons: ["browser_reviewed"] } };
+      Object.defineProperty(savedDecision, "_destinationFingerprintVerified", { value: true, enumerable: false, configurable: true });
+      state.reviews.set(identity.id, savedDecision);
       save.textContent = "Saved locally";
     });
     editor.append(select, reviewer, rationale, destinationControls, save); elements.inspector.append(editor);

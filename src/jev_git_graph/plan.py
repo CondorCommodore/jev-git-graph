@@ -5,7 +5,7 @@ from typing import Any
 
 from .artifacts import validate_artifacts
 from .errors import JgError
-from .review import object_fingerprint, object_id, validate_review
+from .review import PRESERVATION_REQUIRED_DISPOSITIONS, _preservation_stale_reasons, object_fingerprint, object_id, validate_review
 from .safety import digest, read_json, write_json, write_private_text
 
 
@@ -46,9 +46,15 @@ def build_plan(inventory_path: str | Path, candidates_path: str | Path, relation
         decision = reviews.get(object_id(kind, item))
         if not decision:
             return fallback, reason, "unreviewed"
-        if decision["fingerprint"] != object_fingerprint(kind, item):
+        current_fingerprint = object_fingerprint(kind, item)
+        if decision["fingerprint"] != current_fingerprint:
             stale_reviews += 1
             return "UNRESOLVED", "prior human review is stale because immutable inputs changed", "stale"
+        if decision.get("disposition") in PRESERVATION_REQUIRED_DISPOSITIONS:
+            proof_reasons = _preservation_stale_reasons(decision, current_fingerprint)
+            if proof_reasons:
+                stale_reviews += 1
+                return "UNRESOLVED", "prior preservation proof is incomplete or stale", "stale"
         return decision["disposition"], decision["rationale"], "current"
 
     for branch in inventory.get("branches", []):
