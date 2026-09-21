@@ -61,6 +61,30 @@ def _require_string(value: Any, label: str) -> str:
     return value
 
 
+def _require_text(value: Any, label: str) -> str:
+    if not isinstance(value, str):
+        raise JgError(f"{label} must be a string")
+    return value
+
+
+def _optional_string(record: dict[str, Any], field: str, label: str, allow_none: bool = False) -> None:
+    if field not in record:
+        return
+    value = record[field]
+    if allow_none and value is None:
+        return
+    _require_string(value, label)
+
+
+def _optional_text(record: dict[str, Any], field: str, label: str, allow_none: bool = False) -> None:
+    if field not in record:
+        return
+    value = record[field]
+    if allow_none and value is None:
+        return
+    _require_text(value, label)
+
+
 def _require_digest(value: Any, label: str) -> str:
     result = _require_string(value, label)
     if len(result) != 64 or any(character not in "0123456789abcdef" for character in result):
@@ -73,7 +97,9 @@ def _validate_inventory(inventory: dict[str, Any]) -> dict[str, Any]:
         raise JgError("inventory artifact has an unsupported schema")
     repository = _require_mapping(inventory.get("repository"), "inventory repository")
     repository_id = _require_string(repository.get("id"), "inventory repository id")
-    _require_string(repository.get("default_branch"), "inventory default branch")
+    default_branch = _require_string(repository.get("default_branch"), "inventory default branch")
+    _optional_string(repository, "head", "inventory repository head")
+    _optional_string(repository, "common_dir_id", "inventory common directory id")
 
     branches = inventory.get("branches")
     if not isinstance(branches, list):
@@ -85,14 +111,82 @@ def _validate_inventory(inventory: dict[str, Any]) -> dict[str, Any]:
         tip = _require_string(record.get("tip"), f"inventory branch {name} tip")
         if name in branch_by_name:
             raise JgError(f"inventory contains duplicate branch: {name}")
+        _optional_string(record, "committed_at", f"inventory branch {name} committed_at")
+        _optional_text(record, "subject", f"inventory branch {name} subject")
+        _optional_string(record, "merge_base", f"inventory branch {name} merge_base", allow_none=True)
+        if "unique_commits" in record:
+            unique_commits = record["unique_commits"]
+            if not isinstance(unique_commits, list):
+                raise JgError(f"inventory branch {name} unique_commits must be a list")
+            for commit_index, commit in enumerate(unique_commits):
+                commit_record = _require_mapping(commit, f"inventory branch {name} unique commit {commit_index}")
+                _require_string(commit_record.get("sha"), f"inventory branch {name} unique commit {commit_index} sha")
+                _optional_text(commit_record, "subject", f"inventory branch {name} unique commit {commit_index} subject")
+        if "changed_paths" in record:
+            changed_paths = record["changed_paths"]
+            if not isinstance(changed_paths, list) or any(not isinstance(path, str) for path in changed_paths):
+                raise JgError(f"inventory branch {name} changed_paths must be a list of strings")
+        if "merged_into_default" in record and not isinstance(record["merged_into_default"], bool):
+            raise JgError(f"inventory branch {name} merged_into_default must be boolean")
         branch_by_name[name] = {"name": name, "tip": tip}
+    if default_branch not in branch_by_name:
+        raise JgError("inventory default branch is not present in branches")
 
     for field in ("worktrees", "stashes"):
         if not isinstance(inventory.get(field), list):
             raise JgError(f"inventory is missing {field}")
+    worktree_ids: set[str] = set()
+    for index, worktree in enumerate(inventory["worktrees"]):
+        record = _require_mapping(worktree, f"inventory worktree record {index}")
+        path_id = _require_string(record.get("path_id"), f"inventory worktree {index} path_id")
+        if path_id in worktree_ids:
+            raise JgError(f"inventory contains duplicate worktree identity: {path_id}")
+        worktree_ids.add(path_id)
+        _require_string(record.get("head"), f"inventory worktree {index} head")
+        branch = record.get("branch")
+        if branch is not None:
+            _require_string(branch, f"inventory worktree {index} branch")
+        for field in ("detached", "locked"):
+            if not isinstance(record.get(field), bool):
+                raise JgError(f"inventory worktree {index} {field} must be boolean")
+        if "status" not in record or not isinstance(record["status"], list) or any(not isinstance(item, str) for item in record["status"]):
+            raise JgError(f"inventory worktree {index} status must be a list of strings")
+    stash_ids: set[tuple[str, str]] = set()
+    for index, stash in enumerate(inventory["stashes"]):
+        record = _require_mapping(stash, f"inventory stash record {index}")
+        sha = _require_string(record.get("sha"), f"inventory stash {index} sha")
+        reference = _require_string(record.get("reference"), f"inventory stash {index} reference")
+        _require_text(record.get("subject"), f"inventory stash {index} subject")
+        identity = (reference, sha)
+        if identity in stash_ids:
+            raise JgError(f"inventory contains duplicate stash identity: {reference}:{sha}")
+        stash_ids.add(identity)
     collection = _require_mapping(inventory.get("collection"), "inventory collection")
     if collection.get("complete") is not True:
         raise JgError("inventory is incomplete; cannot build a review plan")
+    counts = collection.get("counts")
+    if counts is not None:
+        counts = _require_mapping(counts, "inventory collection counts")
+        for field, records in (
+            ("branches", inventory["branches"]),
+            ("worktrees", inventory["worktrees"]),
+            ("stashes", inventory["stashes"]),
+        ):
+            if field in counts:
+                count = counts[field]
+                if not isinstance(count, int) or isinstance(count, bool) or count < 0 or count != len(records):
+                    raise JgError(f"inventory collection count for {field} does not match records")
+        if "remote_tracking_refs" in counts:
+            remote_refs = inventory.get("remote_tracking_refs")
+            remote_count = counts["remote_tracking_refs"]
+            if (
+                not isinstance(remote_count, int)
+                or isinstance(remote_count, bool)
+                or remote_count < 0
+                or not isinstance(remote_refs, list)
+                or remote_count != len(remote_refs)
+            ):
+                raise JgError("inventory collection count for remote_tracking_refs does not match records")
     return {"repository_id": repository_id, "branches": branch_by_name}
 
 
@@ -218,10 +312,7 @@ def _validate_v2_response(response: Any) -> None:
     if "confidence" in relationship:
         _bounded_probability(relationship["confidence"], "historical v2 relationship confidence")
     probabilities = relationship.get("probabilities")
-    if not isinstance(probabilities, dict) or set(probabilities) not in {
-        V2_RELATION_CHOICES,
-        V2_RELATION_CHOICES_WITH_UNKNOWN,
-    }:
+    if not isinstance(probabilities, dict) or not probabilities or not set(probabilities) <= V2_RELATION_CHOICES_WITH_UNKNOWN or choice not in probabilities:
         raise JgError("historical v2 relation response has malformed probabilities")
     for option, probability in probabilities.items():
         _bounded_probability(probability, f"historical v2 probability {option}")
@@ -235,6 +326,29 @@ def _validate_v2_response(response: Any) -> None:
                 raise JgError(f"historical v2 response usage.{field} is malformed")
 
 
+def _validate_stored_v3_response(response: Any) -> bool:
+    """Validate a v3 response, allowing historical normalized records.
+
+    Live v3 responses include model and usage metadata. Older exported judgment
+    records may retain only the typed answers; those remain readable but are
+    reported as missing runtime provenance by the artifact-chain validator.
+    """
+
+    if isinstance(response, dict) and "model" not in response and "usage" not in response:
+        answers = response.get("answers")
+        if not isinstance(answers, dict) or set(answers) != V3_QUESTION_IDS:
+            raise JgError("relation response does not satisfy the v3 contract")
+        for question_id, answer in answers.items():
+            answer_record = _require_mapping(answer, f"v3 answer {question_id}")
+            _bounded_probability(answer_record.get("noul"), f"v3 answer {question_id}")
+        return False
+    try:
+        validate_v3_response({"questions": relationship_questions()}, response)
+    except Exception as exc:
+        raise JgError("relation response does not satisfy the v3 contract") from exc
+    return True
+
+
 def validate_relation_response(response: Any, question_version: str | None = None) -> str:
     """Validate either the current v3 response or a readable historical v2 response."""
 
@@ -242,10 +356,7 @@ def validate_relation_response(response: Any, question_version: str | None = Non
         answers = response.get("answers") if isinstance(response, dict) else None
         question_version = QUESTION_VERSION if isinstance(answers, dict) and set(answers) == V3_QUESTION_IDS else "branch-relationship-v2"
     if question_version == QUESTION_VERSION:
-        try:
-            validate_v3_response({"questions": relationship_questions()}, response)
-        except Exception as exc:
-            raise JgError("relation response does not satisfy the v3 contract") from exc
+        _validate_stored_v3_response(response)
         return question_version
     if question_version in LEGACY_QUESTION_VERSIONS:
         _validate_v2_response(response)
@@ -302,12 +413,11 @@ def validate_relations(
     if root_question_version is None and records:
         limitations.append("relations_question_version_missing")
     seen_ids: set[str] = set()
+    seen_judgment_identities: dict[tuple[Any, ...], str] = {}
     versions: set[str] = set()
     for index, relation in enumerate(records):
         record = _require_mapping(relation, f"relation record {index}")
         candidate_id = _require_string(record.get("candidate_id"), f"relation record {index} candidate id")
-        if candidate_id in seen_ids:
-            raise JgError(f"relations contain duplicate candidate id: {candidate_id}")
         seen_ids.add(candidate_id)
         candidate = candidate_by_id.get(candidate_id)
         if candidates is not None and candidate is None:
@@ -325,20 +435,49 @@ def validate_relations(
         if relation_version is None:
             answers = record.get("response", {}).get("answers") if isinstance(record.get("response"), dict) else None
             relation_version = QUESTION_VERSION if isinstance(answers, dict) and set(answers) == V3_QUESTION_IDS else "branch-relationship-v2"
-        if root_question_version is not None and relation_version != root_question_version:
-            raise JgError(f"relation {candidate_id} question version conflicts with its artifact")
-        versions.add(validate_relation_response(record.get("response"), relation_version))
+        validated_version = validate_relation_response(record.get("response"), relation_version)
+        versions.add(validated_version)
+        evidence_profile = record.get("evidence_profile", relations.get("evidence_profile"))
+        if evidence_profile is not None:
+            _require_string(evidence_profile, f"relation {candidate_id} evidence profile")
+        judgment_id = record.get("judgment_id")
+        request_sha = record.get("request_sha256")
+        if judgment_id is not None:
+            _require_string(judgment_id, f"relation {candidate_id} judgment id")
+        if request_sha is not None:
+            _require_digest(request_sha, f"relation {candidate_id} request sha256")
+        identities: list[tuple[Any, ...]] = []
+        if judgment_id is not None:
+            identities.append(("judgment", judgment_id))
+        if request_sha is not None:
+            identities.append(("request", request_sha))
+        if not identities:
+            response_value = record.get("response")
+            model = response_value.get("model") if isinstance(response_value, dict) else None
+            identities.append(("derived", candidate_id, validated_version, model, evidence_profile))
+        record_digest = digest(record)
+        for identity in identities:
+            prior_digest = seen_judgment_identities.get(identity)
+            if prior_digest is not None:
+                if prior_digest == record_digest:
+                    raise JgError(f"relations contain duplicate judgment identity: {identity[-1]}")
+                raise JgError(f"relations contain conflicting duplicate judgment identity: {identity[-1]}")
+        for identity in identities:
+            seen_judgment_identities[identity] = record_digest
+        if validated_version == QUESTION_VERSION and isinstance(record.get("response"), dict):
+            response = record["response"]
+            if "model" not in response and "usage" not in response:
+                limitations.append("relation_runtime_provenance_missing")
 
-    if len(versions) > 1:
-        raise JgError("relations contain incompatible question versions")
     if records and root_question_version is None:
         limitations.append("historical_relations_question_version_inferred")
-    if versions and next(iter(versions)) in LEGACY_QUESTION_VERSIONS:
+    if any(version in LEGACY_QUESTION_VERSIONS for version in versions):
         limitations.append("historical_relation_contract")
     return {
         "relation_count": len(records),
         "candidate_ids": sorted(seen_ids),
         "question_versions": sorted(versions),
+        "mixed_question_versions": len(versions) > 1,
         "limitations": limitations,
     }
 

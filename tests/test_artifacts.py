@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from jev_git_graph.artifacts import candidate_content_digest, validate_artifacts, validate_relation_response
+from jev_git_graph.artifacts import candidate_content_digest, validate_artifacts, validate_inventory, validate_relation_response
 from jev_git_graph.errors import JgError
 from jev_git_graph.plan import build_plan
 from jev_git_graph.questions import QUESTION_IDS, QUESTION_VERSION
@@ -56,6 +56,58 @@ def make_artifacts() -> tuple[dict, dict, dict]:
 
 
 class ArtifactValidationTests(unittest.TestCase):
+    def test_inventory_rejects_malformed_worktrees_stashes_and_duplicate_identities(self):
+        inventory, _candidates, _relations = make_artifacts()
+        inventory["worktrees"] = [None]
+        with self.assertRaisesRegex(JgError, "worktree record"):
+            validate_inventory(inventory)
+
+        inventory, _candidates, _relations = make_artifacts()
+        inventory["stashes"] = [None]
+        with self.assertRaisesRegex(JgError, "stash record"):
+            validate_inventory(inventory)
+
+        worktree = {"path_id": "path-1", "head": "a" * 40, "branch": "main", "detached": False, "locked": False, "status": []}
+        incomplete_status = copy.deepcopy(worktree)
+        incomplete_status["status"] = None
+        inventory, _candidates, _relations = make_artifacts()
+        inventory["worktrees"] = [incomplete_status]
+        with self.assertRaisesRegex(JgError, "status must be a list"):
+            validate_inventory(inventory)
+        missing_status = copy.deepcopy(worktree)
+        del missing_status["status"]
+        inventory, _candidates, _relations = make_artifacts()
+        inventory["worktrees"] = [missing_status]
+        with self.assertRaisesRegex(JgError, "status must be a list"):
+            validate_inventory(inventory)
+
+        inventory, _candidates, _relations = make_artifacts()
+        inventory["worktrees"] = [worktree, copy.deepcopy(worktree)]
+        with self.assertRaisesRegex(JgError, "duplicate worktree identity"):
+            validate_inventory(inventory)
+
+        stash = {"sha": "c" * 40, "reference": "stash@{0}", "subject": "saved"}
+        inventory, _candidates, _relations = make_artifacts()
+        inventory["stashes"] = [stash, copy.deepcopy(stash)]
+        with self.assertRaisesRegex(JgError, "duplicate stash identity"):
+            validate_inventory(inventory)
+
+    def test_inventory_validates_optional_branch_structure_and_counts(self):
+        inventory, _candidates, _relations = make_artifacts()
+        inventory["branches"][0]["unique_commits"] = None
+        with self.assertRaisesRegex(JgError, "unique_commits"):
+            validate_inventory(inventory)
+
+        inventory, _candidates, _relations = make_artifacts()
+        inventory["branches"][0]["subject"] = ""
+        inventory["branches"][0]["unique_commits"] = [{"sha": "c" * 40, "subject": ""}]
+        validate_inventory(inventory)
+
+        inventory, _candidates, _relations = make_artifacts()
+        inventory["collection"]["counts"] = {"branches": 99}
+        with self.assertRaisesRegex(JgError, "count for branches"):
+            validate_inventory(inventory)
+
     def test_altered_candidate_payload_and_endpoint_tip_are_rejected(self):
         inventory, candidates, relations = make_artifacts()
         altered = copy.deepcopy(candidates)
@@ -123,6 +175,52 @@ class ArtifactValidationTests(unittest.TestCase):
         self.assertEqual("not_verified", result["cleanup_readiness"])
         with self.assertRaises(JgError):
             validate_relation_response({"answers": {"same_intent": {"noul": 2}}}, "branch-relationship-v2")
+
+    def test_judgment_history_allows_mixed_versions_but_rejects_identity_conflicts(self):
+        inventory, candidates, relations = make_artifacts()
+        legacy_response = {
+            "answers": {
+                "same_intent": {"noul": 0.5},
+                "relationship": {
+                    "choice": "PARTIAL_OVERLAP",
+                    "confidence": 0.5,
+                    "probabilities": {"PARTIAL_OVERLAP": 0.8, "UNKNOWN": 0.2},
+                },
+            }
+        }
+        v3_response = {"answers": {question_id: {"noul": 0.5} for question_id in QUESTION_IDS}}
+        history = copy.deepcopy(relations)
+        history["question_version"] = QUESTION_VERSION
+        history["relations"] = [
+            {"candidate_id": "pair-1", "judgment_id": "judgment-v2", "question_version": "branch-relationship-v2", "response": legacy_response},
+            {"candidate_id": "pair-1", "judgment_id": "judgment-v3", "question_version": QUESTION_VERSION, "response": v3_response},
+        ]
+        result = validate_artifacts(inventory, candidates, history)
+        self.assertEqual(["branch-relationship-v2", QUESTION_VERSION], result["relations"]["question_versions"])
+
+        duplicate = copy.deepcopy(history)
+        duplicate["relations"].append(copy.deepcopy(history["relations"][0]))
+        with self.assertRaisesRegex(JgError, "duplicate judgment identity"):
+            validate_artifacts(inventory, candidates, duplicate)
+
+        conflict = copy.deepcopy(history)
+        conflicting = copy.deepcopy(history["relations"][1])
+        conflicting["response"]["answers"]["same_intent"]["noul"] = 0.9
+        conflict["relations"].append(conflicting)
+        with self.assertRaisesRegex(JgError, "conflicting duplicate judgment identity"):
+            validate_artifacts(inventory, candidates, conflict)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory_path = root / "inventory.json"
+            candidates_path = root / "candidates.json"
+            relations_path = root / "relations.json"
+            write_json(inventory_path, inventory)
+            write_json(candidates_path, candidates)
+            write_json(relations_path, history)
+            plan, rendered = build_plan(inventory_path, candidates_path, relations_path)
+        self.assertEqual(2, plan["relation_count"])
+        self.assertIn("no single response selected", rendered)
 
     def test_build_plan_surfaces_validation_limitations_without_changing_api(self):
         inventory, candidates, relations = make_artifacts()

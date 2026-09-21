@@ -34,7 +34,9 @@ def build_plan(inventory_path: str | Path, candidates_path: str | Path, relation
         if review.get("relations_digest") and relations and review["relations_digest"] != digest(relations):
             raise JgError("review was exported from different relations")
     reviews = validate_review(review, inventory["repository"]["id"]) if review else {}
-    relation_by_candidate = {item.get("candidate_id"): item for item in (relations or {}).get("relations", [])}
+    relation_history_by_candidate: dict[str, list[dict[str, Any]]] = {}
+    for relation in (relations or {}).get("relations", []):
+        relation_history_by_candidate.setdefault(relation.get("candidate_id"), []).append(relation)
     default = inventory["repository"].get("default_branch")
     disposition: list[dict[str, Any]] = []
     stale_reviews = 0
@@ -79,7 +81,7 @@ def build_plan(inventory_path: str | Path, candidates_path: str | Path, relation
         "network_performed": bool(relations and relations.get("network_performed")),
         "dispositions": disposition,
         "candidate_count": len(candidates.get("candidates", [])),
-        "relation_count": len(relation_by_candidate),
+        "relation_count": sum(len(history) for history in relation_history_by_candidate.values()),
         "artifact_validation": artifact_validation,
         "validation_limitations": artifact_validation["limitations"],
         "cleanup_readiness": artifact_validation["cleanup_readiness"],
@@ -94,8 +96,13 @@ def build_plan(inventory_path: str | Path, candidates_path: str | Path, relation
     else:
         for candidate in candidates["candidates"]:
             a, b = candidate["endpoints"]["a"]["branch"], candidate["endpoints"]["b"]["branch"]
-            answer = relation_by_candidate.get(candidate["id"], {}).get("response")
-            relation_note = "No Jev response recorded." if answer is None else "Jev response recorded; maintainer review still required."
+            history = relation_history_by_candidate.get(candidate["id"], [])
+            if not history:
+                relation_note = "No Jev response recorded."
+            elif len(history) == 1:
+                relation_note = "Jev response recorded; maintainer review still required."
+            else:
+                relation_note = f"{len(history)} Jev judgment history records retained; no single response selected."
             lines.append(f"- `{a}` ↔ `{b}`: {', '.join(candidate['reasons'])}. {relation_note}")
     return plan, "\n".join(lines) + "\n"
 

@@ -2,6 +2,7 @@
 from pathlib import Path
 from collections import defaultdict, deque
 
+from .artifacts import candidate_content_digest
 from .errors import JgError
 from .jev import JEV_MODEL, QUESTION_VERSION, build_preview, payload_for_candidate, save_checkpoint
 from .safety import digest, read_json, write_json
@@ -70,7 +71,10 @@ def prepare_batches(candidates_path, output, size=32, previous=(), evidence_prof
         for endpoint in candidate.get("endpoints", {}).values()
     }
     pending = stratify_pending(pending, previously_touched_branches)
-    manifest = {"kind": "jev-batch-plan", "candidate_digest": digest(source),
+    source_candidate_digest = digest(source)
+    source_content_digest = source.get("content_digest") or candidate_content_digest(source)
+    manifest = {"kind": "jev-batch-plan", "candidate_digest": source_candidate_digest,
+                "candidate_content_digest": source_content_digest,
                 "candidate_count": len(source["candidates"]), "pending_requests": len(pending),
                 "fact_only_pairs": skipped_fact, "previously_attempted": skipped_attempt,
                 "question_version": QUESTION_VERSION, "evidence_profile": evidence_profile,
@@ -80,6 +84,9 @@ def prepare_batches(candidates_path, output, size=32, previous=(), evidence_prof
         name = f"batch-{offset // size + 1:04d}"
         subset = dict(source, candidates=pending[offset:offset + size])
         subset["candidate_count"] = len(subset["candidates"])
+        subset["source_candidate_digest"] = source_candidate_digest
+        subset["source_content_digest"] = source_content_digest
+        subset["content_digest"] = candidate_content_digest(subset)
         preview = build_preview(subset, evidence_profile)
         write_json(destination / name / "candidates.json", subset)
         write_json(destination / name / "jev-preview.json", preview)
@@ -97,7 +104,7 @@ def collect_batches(manifest_paths, candidates_path, output):
               "repository_id": candidates.get("repository_id"),
               "candidate_content_digest": candidates.get("content_digest"),
               "source_batch_plan_sha256": [], "relations": [], "attempts": [],
-              "network_performed": False, "missing_batches": 0}
+              "network_performed": False, "missing_batches": 0, "limitations": []}
     seen = set()
     planned_requests = set()
     seen_relations = set()
@@ -106,11 +113,31 @@ def collect_batches(manifest_paths, candidates_path, output):
         manifest = read_json(manifest_path)
         if manifest.get("kind") != "jev-batch-plan" or manifest.get("candidate_digest") != digest(candidates):
             raise JgError("batch plan does not match the candidate artifact")
+        expected_source_content_digest = candidates.get("content_digest") or candidate_content_digest(candidates)
+        if manifest.get("candidate_content_digest") is not None and manifest["candidate_content_digest"] != expected_source_content_digest:
+            raise JgError("batch plan does not match the candidate content")
         result["source_batch_plan_sha256"].append(digest(manifest))
         for batch in manifest["batches"]:
             directory = (manifest_path.parent / batch["directory"]).resolve()
             if directory.parent != manifest_path.parent:
                 raise JgError("batch directory escapes the plan directory")
+            batch_candidates_path = directory / "candidates.json"
+            if batch_candidates_path.exists():
+                batch_candidates = read_json(batch_candidates_path)
+                source_candidate_digest = batch_candidates.get("source_candidate_digest")
+                batch_source_content_digest = batch_candidates.get("source_content_digest")
+                has_new_provenance = source_candidate_digest is not None or batch_source_content_digest is not None
+                if source_candidate_digest is not None and source_candidate_digest != digest(candidates):
+                    raise JgError("batch candidates do not match the source candidate artifact")
+                if batch_source_content_digest is not None and batch_source_content_digest != expected_source_content_digest:
+                    raise JgError("batch candidates do not match the source candidate content")
+                if has_new_provenance and batch_candidates.get("content_digest") != candidate_content_digest(batch_candidates):
+                    raise JgError("batch candidates content digest does not match its subset")
+                if not has_new_provenance:
+                    legacy_content_digest = batch_candidates.get("content_digest")
+                    if legacy_content_digest is not None and legacy_content_digest != expected_source_content_digest:
+                        raise JgError("legacy batch candidates content digest does not match its source")
+                    result["limitations"].append(f"legacy_batch_provenance_missing:{batch['directory']}")
             preview = read_json(directory / "jev-preview.json")
             if digest(preview["requests"]) != batch["payload_sha256"]:
                 raise JgError("batch preview no longer matches its plan")
