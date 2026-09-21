@@ -21,6 +21,12 @@ DISPOSITIONS = {
     "UNRESOLVED",
 }
 OBJECT_KINDS = {"branch", "worktree", "stash"}
+PRESERVATION_REQUIRED_DISPOSITIONS = {
+    "PRESERVE_IN_PR",
+    "PRESERVE_IN_BRANCH",
+    "PRESERVE_IN_ARCHIVE",
+    "CLEANUP_CANDIDATE",
+}
 PROVENANCE_FIELDS = (
     "repository_id",
     "inventory_digest",
@@ -149,6 +155,14 @@ def _reviewer_identity(value: Any, label: str) -> str | None:
     raise JgError(f"{label} must be a string or JSON object")
 
 
+def _meaningful_destination(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (dict, list)):
+        return bool(value)
+    return False
+
+
 def _validate_preservation(decision: dict[str, Any], schema_version: int, limitations: list[str]) -> None:
     if schema_version == LEGACY_REVIEW_SCHEMA_VERSION:
         return
@@ -167,7 +181,14 @@ def _validate_preservation(decision: dict[str, Any], schema_version: int, limita
         _optional_digest(proof, "destination_fingerprint", "preservation proof destination fingerprint")
         if "destination" in proof and proof["destination"] != destination:
             raise JgError("review preservation proof destination does not match destination")
-    if destination is not None and proof is None:
+    if decision.get("disposition") in PRESERVATION_REQUIRED_DISPOSITIONS:
+        if not _meaningful_destination(destination):
+            limitations.append("preservation_destination_missing")
+        if not isinstance(proof, dict) or not proof:
+            limitations.append("preservation_proof_missing")
+        elif proof.get("verified") is not True:
+            limitations.append("preservation_proof_unverified")
+    elif destination is not None and proof is None:
         limitations.append("preservation_proof_missing")
 
 
@@ -326,12 +347,17 @@ def _inventory_objects(inventory: dict[str, Any]) -> dict[str, tuple[str, dict[s
 
 def _preservation_stale_reasons(decision: dict[str, Any], current_fingerprint: str) -> list[str]:
     reasons: list[str] = []
+    requires_preservation = decision.get("disposition") in PRESERVATION_REQUIRED_DISPOSITIONS
     destination = decision.get("preservation_destination")
     proof = decision.get("preservation_proof")
-    if destination is not None and proof is None:
+    if requires_preservation and not _meaningful_destination(destination):
+        reasons.append("preservation_destination_missing")
+    if (requires_preservation and (not isinstance(proof, dict) or not proof)) or (destination is not None and proof is None):
         reasons.append("preservation_proof_missing")
     if isinstance(proof, dict):
-        if proof.get("verified") is False:
+        if requires_preservation and proof.get("verified") is not True:
+            reasons.append("preservation_proof_unverified")
+        elif proof.get("verified") is False:
             reasons.append("preservation_proof_stale")
         if proof.get("source_fingerprint") not in (None, current_fingerprint):
             reasons.append("preservation_proof_stale")
@@ -472,4 +498,5 @@ def reconcile_reviews(
             "from_schema_version": previous["schema_version"],
             "previous_review_digest": digest(previous_review),
         },
+        "cleanup_readiness": "not_verified",
     }

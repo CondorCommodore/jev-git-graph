@@ -179,6 +179,43 @@ class ReviewReconciliationTests(unittest.TestCase):
         self.assertIn("preservation_proof_stale", carried["reconciliation"]["reasons"])
         self.assertIn("preservation_destination_stale", carried["reconciliation"]["reasons"])
 
+    def test_required_dispositions_cannot_be_current_without_preservation_evidence(self):
+        inventory, candidates, relations = make_artifacts()
+        for disposition in (
+            "PRESERVE_IN_PR",
+            "PRESERVE_IN_BRANCH",
+            "PRESERVE_IN_ARCHIVE",
+            "CLEANUP_CANDIDATE",
+        ):
+            review = v2_review(inventory, candidates, relations)
+            decision = review["decisions"][0]
+            decision["disposition"] = disposition
+            decision["preservation_destination"] = None
+            decision["preservation_proof"] = None
+            validated = validate_review_document(review, inventory["repository"]["id"])
+            self.assertIn("preservation_destination_missing", validated["limitations"])
+            self.assertIn("preservation_proof_missing", validated["limitations"])
+            result = reconcile_reviews(review, inventory, candidates, relations)
+            carried = next(item for item in result["decisions"] if item["object_id"] == decision["object_id"])
+            self.assertEqual("stale", carried["reconciliation"]["status"])
+            self.assertIn("preservation_destination_missing", carried["reconciliation"]["reasons"])
+            self.assertIn("preservation_proof_missing", carried["reconciliation"]["reasons"])
+            self.assertEqual("not_verified", result["cleanup_readiness"])
+
+    def test_active_and_unresolved_allow_null_preservation_fields(self):
+        inventory, candidates, relations = make_artifacts()
+        for disposition in ("ACTIVE", "UNRESOLVED"):
+            review = v2_review(inventory, candidates, relations)
+            decision = review["decisions"][0]
+            decision["disposition"] = disposition
+            decision["preservation_destination"] = None
+            decision["preservation_proof"] = None
+            validated = validate_review_document(review, inventory["repository"]["id"])
+            self.assertNotIn("preservation_destination_missing", validated["limitations"])
+            result = reconcile_reviews(review, inventory, candidates, relations)
+            carried = next(item for item in result["decisions"] if item["object_id"] == decision["object_id"])
+            self.assertEqual("current", carried["reconciliation"]["status"])
+
     def test_v1_is_readable_but_reconciled_as_historical_limited(self):
         inventory, candidates, relations = make_artifacts()
         decisions = []
