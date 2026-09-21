@@ -27,7 +27,7 @@
     if (kind === "relations" && !Array.isArray(value.relations)) return ["relations.json is missing relations[]."];
     if (kind === "review") {
       if (value.kind !== "relationship-review" || ![1, 2].includes(value.schema_version) || !Array.isArray(value.decisions)) return ["review.json has an unsupported schema or is missing decisions[]."];
-      if (value.decisions.some((decision) => !decision || typeof decision.object_id !== "string" || typeof decision.rationale !== "string" || typeof decision.disposition !== "string" || (typeof decision.fingerprint !== "string" && typeof decision.source_fingerprint !== "string"))) return ["review.json contains an invalid decision."];
+      if (value.decisions.some((decision) => !decision || typeof decision.object_id !== "string" || typeof decision.rationale !== "string" || typeof decision.disposition !== "string" || (typeof decision.fingerprint !== "string" && typeof decision.source_fingerprint !== "string") || (value.schema_version === 1 && typeof decision.reviewed_at !== "string"))) return ["review.json contains an invalid decision."];
     }
     return [];
   }

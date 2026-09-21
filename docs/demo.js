@@ -237,6 +237,9 @@
   function reviewStatus(item) {
     const identity = reviewIdentity(item); if (!identity) return "none";
     const prior = state.reviews.get(identity.id); if (!prior) return "none";
+    if (prior.reconciliation?.status === "stale" || prior.reconciliation?.status === "historical-limited") return "stale";
+    if (prior.reconciliation?.status === "current") return "current";
+    if (typeof prior.source_fingerprint === "string" && typeof prior.fingerprint === "string" && prior.source_fingerprint === prior.fingerprint) return "current";
     return stable(prior.observed) === stable(identity.observed) ? "current" : "stale";
   }
   function scalar(value) { return JSON.stringify(value).replace(/[\u007f-\uffff]/g, (character) => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`); }

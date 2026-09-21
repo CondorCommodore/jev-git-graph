@@ -174,6 +174,12 @@ test("accepts schema v2 review artifacts with provenance fields", () => {
   }), []);
 });
 
+test("rejects schema v1 review decisions without review time", () => {
+  assert.deepEqual(viewer.validate("review", {
+    kind: "relationship-review", schema_version: 1, decisions: [{ object_id: "branch:feature/alpha", fingerprint: "f", disposition: "ACTIVE", rationale: "keep" }],
+  }), ["review.json contains an invalid decision."]);
+});
+
 test("rejects a relation artifact produced from different candidate content", () => {
   const withDigest = { ...candidates, content_digest: "candidate-digest" };
   const wrong = { ...relations, candidate_content_digest: "other-digest" };
