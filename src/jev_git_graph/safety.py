@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -40,8 +41,22 @@ def validate_output_path(output: str | Path, protected_paths: list[Path]) -> Pat
 
 
 def write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    write_private_text(path, json.dumps(value, indent=2, sort_keys=True) + "\n")
+
+
+def write_private_text(path: Path, value: str) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if path.parent.stat().st_mode & 0o077:
+        raise JgError(f"artifact directory must be owner-only: {path.parent}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        stream.write(value)
 
 
 def read_json(path: str | Path) -> dict[str, Any]:

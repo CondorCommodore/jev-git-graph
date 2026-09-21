@@ -1,284 +1,533 @@
 "use strict";
 
-// This page is an illustrative design study. All names, Git facts, and Jev-shaped
-// responses below are synthetic. It makes no network or TypeSafe API requests.
-const stages = [
-  { title: "Git inventory", subtitle: "Find every ref, worktree and stash.", badge: "01 / 04 · Git inventory" },
-  { title: "Candidate links", subtitle: "Connect work that might be related.", badge: "02 / 04 · Candidate links" },
-  { title: "Jev judgments", subtitle: "Ask small, directional questions.", badge: "03 / 04 · Jev judgments" },
-  { title: "Human plan", subtitle: "Preserve unique work, then review.", badge: "04 / 04 · Human plan" },
-];
+// This viewer deliberately has no fetch(), XMLHttpRequest, WebSocket, storage,
+// or network client. JSON is read only from files chosen by the operator.
+(() => {
+  const data = window.JevGraphData;
+  const state = { artifacts: {}, reviews: new Map(), reviewSchemaVersion: null, fileErrors: [], model: data.normalize({}), filter: "all", viewMode: "components", query: "", group: null, selected: null, graphTargets: [], page: 0, graphPage: 0, pageSize: 100, graphPageSize: 24 };
+  const $ = (selector) => document.querySelector(selector);
+  const elements = {
+    notices: $("#notices"), loadStatus: $("#load-status"), coverageCount: $("#coverage-count"), coverageDetail: $("#coverage-detail"), search: $("#search"), virtualList: $("#virtual-list"), visibleCount: $("#visible-count"), pagePrev: $("#page-prev"), pageNext: $("#page-next"), pageStatus: $("#page-status"), graph: $("#graph"), graphWrap: $("#graph-wrap"), graphEmpty: $("#graph-empty"), graphHint: $("#graph-hint"), graphCount: $("#graph-count"), graphPrev: $("#graph-prev"), graphNext: $("#graph-next"), graphPageStatus: $("#graph-page-status"), inspector: $("#inspector-content"), focusIndex: $("#focus-index"), overview: $("#overview-button"),
+  };
+  const summary = [
+    ["object-count", "object-detail", "objects", (counts) => `${counts.branches} branches · ${counts.worktrees} worktrees · ${counts.stashes} stashes`],
+    ["fact-count", "fact-detail", "facts", () => "Observed Git relationships"],
+    ["candidate-count", "candidate-detail", "candidates", (counts) => `${counts.branchesWithCandidates.toLocaleString()} branches represented`],
+    ["evaluated-count", "evaluated-detail", "evaluated", (counts) => `${counts.branchesEvaluated.toLocaleString()} branches touched`],
+    ["unresolved-count", "unresolved-detail", "unresolved", (counts) => `${counts.likelyDuplicates.toLocaleString()} likely dupes · ${counts.superseded.toLocaleString()} superseded`],
+  ];
 
-const nodes = [
-  { id: "main", title: "main", subtitle: "canonical branch", kind: "main", icon: "◆", x: 135, y: 325, tag: "CLEAN", detail: "The canonical checkout is clean in this synthetic snapshot." },
-  { id: "pr", title: "PR #214", subtitle: "merged", kind: "merged", icon: "✓", x: 370, y: 130, tag: "MERGED", detail: "Git and PR metadata prove this change landed in main." },
-  { id: "auth-old", title: "auth/v1", subtitle: "2 commits ahead", kind: "branch", icon: "⑂", x: 350, y: 330, tag: "REVIEW", detail: "This branch has one patch equivalent to auth/v2 and one unique commit that still needs a destination." },
-  { id: "auth-new", title: "auth/v2", subtitle: "active branch", kind: "branch", icon: "⑂", x: 650, y: 230, tag: "ACTIVE", detail: "The likely successor to auth/v1. Its relationship is a model suggestion, not a Git fact." },
-  { id: "validator", title: "validator", subtitle: "stacked work", kind: "branch", icon: "⑂", x: 795, y: 390, tag: "WAITING", detail: "The validator branch appears to require auth/v2 behavior. The dependency still needs maintainer review." },
-  { id: "stash", title: "stash@{0}", subtitle: "uncommitted work", kind: "stash", icon: "▤", x: 595, y: 535, tag: "PRESERVE", detail: "The stash contains work from auth/v1. It stays accounted for until a maintainer preserves or discards it explicitly." },
-  { id: "metrics", title: "telemetry", subtitle: "independent work", kind: "branch", icon: "⑂", x: 255, y: 525, tag: "ACTIVE", detail: "A separate active branch. Shared ancestry with main does not make it part of the auth cluster." },
-];
+  function plural(count, word) {
+    const forms = { branch: "branches", stash: "stashes" };
+    return `${count.toLocaleString()} ${count === 1 ? word : (forms[word] || `${word}s`)}`;
+  }
+  function fragment(...children) { const value = document.createDocumentFragment(); children.flat().filter(Boolean).forEach((child) => value.append(child)); return value; }
+  function node(name, className, value) { const element = document.createElement(name); if (className) element.className = className; if (value !== undefined) element.textContent = value; return element; }
+  function detail(label, value) { const row = node("div", "detail-row"); row.append(node("span", "detail-label", label), node("code", "detail-value", value)); return row; }
+  function list(values, className = "evidence-list") { const ul = node("ul", className); values.filter(Boolean).forEach((value) => ul.append(node("li", "", value))); return ul; }
+  function percentage(value) { if (typeof value !== "number" || !Number.isFinite(value)) return "not reported"; const normalized = value <= 1 ? value * 100 : value; return `${Math.round(normalized)}%`; }
+  function truncate(value, length = 28) { const text = String(value || ""); return text.length > length ? `${text.slice(0, length - 1)}…` : text; }
 
-const edges = [
-  { id: "main-pr", from: "main", to: "pr", type: "fact", label: "merged into", path: "M 157 305 Q 215 153 346 137", evidence: ["PR #214 merge commit is reachable from main", "Merge SHA is recorded in the inventory"] },
-  { id: "main-old", from: "main", to: "auth-old", type: "fact", label: "diverged from", path: "M 159 326 Q 245 308 326 330", evidence: ["Known merge base", "2 commits unique to auth/v1"] },
-  { id: "main-new", from: "main", to: "auth-new", type: "fact", label: "diverged from", path: "M 151 303 Q 345 105 625 221", evidence: ["Known merge base", "3 commits unique to auth/v2"] },
-  { id: "old-stash", from: "auth-old", to: "stash", type: "fact", label: "stash origin", path: "M 371 349 Q 420 506 572 531", evidence: ["Stash parent points to auth/v1 tip at creation", "Uncommitted content is present"] },
-  { id: "main-metrics", from: "main", to: "metrics", type: "fact", label: "diverged from", path: "M 143 349 Q 157 475 240 511", evidence: ["Known merge base", "Telemetry commits are unique"] },
-  {
-    id: "supersedes", from: "auth-old", to: "auth-new", type: "proposed", label: "supersedes", path: "M 373 316 Q 477 180 625 232", pill: { x: 505, y: 220, text: "91%" },
-    question: "Has one branch replaced the other's intended change?",
-    answer: "B_REPLACES_A", distribution: [["B replaces A", 91], ["Neither", 6], ["Unknown", 3]],
-    evidence: ["Both branches reference task AUTH-42", "One commit is patch equivalent", "Both change session validation", "One commit remains unique to auth/v1"],
-    implication: "Review the unique auth/v1 commit before closing that branch."
-  },
-  {
-    id: "depends", from: "auth-new", to: "validator", type: "proposed", label: "depends on", path: "M 671 248 Q 799 250 797 366", pill: { x: 787, y: 297, text: "86%" },
-    question: "Does either branch require work unique to the other?",
-    answer: "VALIDATOR_REQUIRES_AUTH_V2", distribution: [["Requires auth/v2", 86], ["Neither", 9], ["Unknown", 5]],
-    evidence: ["Validator imports the new session interface", "Its tests reference behavior added on auth/v2", "The branches are not ancestry-linked"],
-    implication: "Keep validator active and review this dependency before integration."
-  },
-];
-
-const stageList = document.querySelector("#stage-list");
-const graph = document.querySelector("#graph");
-const inspector = document.querySelector("#inspector-content");
-const phaseBadge = document.querySelector("#phase-badge");
-const count = document.querySelector("#graph-count");
-const focusIndex = document.querySelector("#focus-index");
-const playButton = document.querySelector("#play-button");
-const playLabel = document.querySelector("#play-label");
-const playIcon = document.querySelector("#play-icon");
-let stage = 0;
-let selected = null;
-let timer = null;
-
-const svgNS = "http://www.w3.org/2000/svg";
-function svgElement(name, attributes = {}, value = "") {
-  const element = document.createElementNS(svgNS, name);
-  for (const [key, attribute] of Object.entries(attributes)) element.setAttribute(key, attribute);
-  if (value) element.textContent = value;
-  return element;
-}
-
-function makeStages() {
-  stageList.replaceChildren();
-  stages.forEach((item, index) => {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = `stage${index === stage ? " active" : ""}${index < stage ? " complete" : ""}`;
-    button.setAttribute("aria-current", index === stage ? "step" : "false");
-    const number = document.createElement("span");
-    number.className = "stage-index";
-    number.textContent = index < stage ? "✓" : String(index + 1).padStart(2, "0");
-    const copy = document.createElement("span");
-    copy.className = "stage-copy";
-    const title = document.createElement("strong");
-    title.textContent = item.title;
-    const description = document.createElement("small");
-    description.textContent = item.subtitle;
-    copy.append(title, description);
-    button.append(number, copy);
-    button.addEventListener("click", () => { stopPlayback(); setStage(index); });
-    stageList.append(button);
-  });
-}
-
-function makeGraph() {
-  graph.replaceChildren();
-  const edgeLayer = svgElement("g", { "aria-label": "Relationships" });
-  edges.forEach((edge) => {
-    const hidden = edge.type === "proposed" && stage === 0;
-    const judged = edge.type === "proposed" && stage >= 2;
-    const group = svgElement("g", {
-      class: `graph-edge ${edge.type === "proposed" ? "proposed" : "fact"}${judged ? " judged" : ""}${edge.id === "depends" ? " dependency" : ""}${hidden ? " hidden" : ""}${selected === edge.id ? " selected" : ""}`,
-      role: "button", tabindex: hidden ? "-1" : "0", "aria-hidden": hidden ? "true" : "false", "data-edge": edge.id,
-      "aria-label": `${edge.from} ${edge.label} ${edge.to}${judged ? `, ${edge.pill.text} illustrative confidence` : ""}`,
-    });
-    group.append(svgElement("path", { class: "edge-visible", d: edge.path }));
-    group.append(svgElement("path", { class: "edge-hit", d: edge.path }));
-    if (edge.pill) {
-      const pill = svgElement("g", { class: "edge-pill" });
-      pill.append(svgElement("rect", { class: "edge-pill-bg", x: edge.pill.x - 24, y: edge.pill.y - 14, width: 48, height: 27, rx: 13 }));
-      pill.append(svgElement("text", { class: "edge-pill-text", x: edge.pill.x, y: edge.pill.y + 5 }, edge.pill.text));
-      group.append(pill);
+  async function readFile(kind, input) {
+    const file = input.files && input.files[0];
+    if (!file) return;
+    state.fileErrors = state.fileErrors.filter((error) => !error.startsWith(`${kind}.json:`));
+    try {
+      const document = JSON.parse(await file.text());
+      const problems = data.validate(kind, document);
+      if (problems.length) throw new Error(problems.join(" "));
+      if (kind === "review" && state.artifacts.inventory?.repository?.id && document.repository_id !== state.artifacts.inventory.repository.id) throw new Error("review repository mismatch");
+      state.artifacts[kind] = document;
+      if (kind === "review") {
+        state.reviewSchemaVersion = document.schema_version;
+        for (const decision of document.decisions) {
+          const proof = decision?.preservation_proof;
+          const verified = !preservationDispositions.has(decision?.disposition) || Boolean(proof && await sha256(proof.destination) === proof.destination_fingerprint);
+          Object.defineProperty(decision, "_destinationFingerprintVerified", { value: verified, enumerable: false, configurable: true });
+        }
+        state.reviews = new Map(document.decisions.map((decision) => [decision.object_id, decision]));
+      }
+      $(`#${kind}-file-name`).textContent = file.name;
+    } catch (error) {
+      state.fileErrors.push(`${kind}.json: ${error instanceof SyntaxError ? "Invalid JSON; previous loaded file retained." : "Could not load this artifact; check its schema and file access."}`);
+      input.value = "";
     }
-    group.addEventListener("click", () => select(edge.id));
-    group.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); select(edge.id); } });
-    edgeLayer.append(group);
-  });
-  graph.append(edgeLayer);
+    rebuild();
+  }
 
-  const nodeLayer = svgElement("g", { "aria-label": "Git objects" });
-  nodes.forEach((node) => {
-    const atRisk = stage === 3 && ["auth-old", "stash"].includes(node.id);
-    const group = svgElement("g", {
-      class: `graph-node ${node.kind}${selected === node.id ? " selected" : ""}${atRisk ? " at-risk" : ""}`,
-      role: "button", tabindex: "0", "data-node": node.id,
-      "aria-label": `${node.title}, ${node.subtitle}. ${node.detail}`,
-    });
-    group.append(svgElement("circle", { class: "node-halo", cx: node.x, cy: node.y, r: 33 }));
-    group.append(svgElement("circle", { class: "node-circle", cx: node.x, cy: node.y, r: 23 }));
-    group.append(svgElement("text", { class: "node-icon", x: node.x, y: node.y + 1 }, node.icon));
-    group.append(svgElement("text", { class: "node-title", x: node.x, y: node.y + 48 }, node.title));
-    group.append(svgElement("text", { class: "node-subtitle", x: node.x, y: node.y + 65 }, node.subtitle));
-    if (stage === 3 || node.kind === "stash") {
-      const width = Math.max(55, node.tag.length * 7 + 18);
-      group.append(svgElement("rect", { class: "node-tag-bg", x: node.x - width / 2, y: node.y + 74, width, height: 20, rx: 5 }));
-      group.append(svgElement("text", { class: "node-tag-text", x: node.x, y: node.y + 88 }, node.tag));
+  function rebuild() {
+    state.model = data.normalize(state.artifacts);
+    state.selected = state.selected ? [...state.model.objects, ...state.model.candidates].find((item) => item.id === state.selected.id) || null : null;
+    if (!state.model.objects.length && state.filter !== "candidate" && state.filter !== "unresolved") state.selected = null;
+    renderAll();
+  }
+
+  function filteredItems() {
+    const term = state.query.trim().toLowerCase();
+    const items = state.viewMode === "candidates" ? state.model.candidates : state.viewMode === "judgments" ? state.model.candidates.filter((item) => item.relation) : state.model.objects;
+    return items.filter((item) => {
+      const kindMatch = state.filter === "all" ||
+        (state.filter === "inactive" ? item.inactiveWithWork :
+        state.filter === "integrated" ? item.branch?.merged_into_default === true :
+        state.filter === "unique" ? item.kind === "branch" && (item.branch?.unique_commits || []).length > 0 :
+        state.filter === "likely-duplicate" ? item.likelyDuplicate :
+        state.filter === "superseded" ? item.superseded :
+        state.filter === "reviewed" ? reviewStatus(item) === "current" :
+        state.filter === "stale-review" ? reviewStatus(item) === "stale" :
+        state.filter === "unresolved" ? item.kind === "candidate" && !item.resolved : item.kind === state.filter);
+      const groupMatch = !state.group || item.groupKey === state.group;
+      const textMatch = !term || item.searchable.includes(term) || item.title.toLowerCase().includes(term);
+      return kindMatch && groupMatch && textMatch;
+    }).sort((a, b) => a.kind.localeCompare(b.kind) || a.title.localeCompare(b.title));
+  }
+
+  function renderAll() {
+    renderStatus(); renderNotices(); renderSummary(); renderCoverage(); renderList(true); renderInspector(); drawGraph();
+  }
+
+  function renderStatus() {
+    const loaded = ["inventory", "candidates", "relations", "review"].filter((kind) => state.artifacts[kind]);
+    const missing = ["inventory", "candidates", "relations", "review"].filter((kind) => !state.artifacts[kind]);
+    elements.loadStatus.textContent = loaded.length ? `Loaded ${loaded.join(", ")}. ${missing.length ? `Still optional or missing: ${missing.join(", ")}.` : "All three artifact files are loaded locally."}` : "Nothing has been loaded. Choose inventory.json first; candidates.json and relations.json are optional and may be loaded afterward.";
+    const attempts = state.model.relationsDocument.attempts;
+    if (Array.isArray(attempts)) {
+      elements.loadStatus.textContent += ` Jev attempts: ${attempts.length}; succeeded: ${attempts.filter((item) => item.status === "succeeded").length}; uncertain: ${attempts.filter((item) => item.status === "uncertain").length}.`;
     }
-    group.addEventListener("click", () => select(node.id));
-    group.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); select(node.id); } });
-    nodeLayer.append(group);
+    const reviewCounts = [...state.model.objects].reduce((counts, item) => {
+      const status = reviewStatus(item); if (status === "current") counts.current += 1; else if (status === "stale") counts.stale += 1; return counts;
+    }, { current: 0, stale: 0 });
+    if (state.reviews.size) elements.loadStatus.textContent += ` Human reviews: ${reviewCounts.current} current; ${reviewCounts.stale} stale; ${state.reviews.size - reviewCounts.current - reviewCounts.stale} unmatched.`;
+  }
+
+  function renderNotices() {
+    elements.notices.replaceChildren();
+    const notices = [
+      ...state.fileErrors.map((message) => ({ kind: "error", message })),
+      ...state.model.errors.map((message) => ({ kind: "error", message })),
+      ...state.model.warnings.map((message) => ({ kind: "warning", message })),
+    ];
+    notices.forEach(({ kind, message }) => {
+      const item = node("div", `notice ${kind}`); item.append(node("strong", "", kind === "error" ? "Cannot safely join these files" : "Limitation"), node("span", "", message)); elements.notices.append(item);
+    });
+  }
+
+  function renderSummary() {
+    const inventoryLoaded = Boolean(state.artifacts.inventory);
+    const candidatesLoaded = Boolean(state.artifacts.candidates);
+    const relationsLoaded = Boolean(state.artifacts.relations);
+    summary.forEach(([numberId, detailId, key, description], index) => {
+      const available = index < 2 ? inventoryLoaded : index === 2 ? candidatesLoaded : index === 3 ? relationsLoaded : candidatesLoaded;
+      $(`#${numberId}`).textContent = available ? state.model.counts[key].toLocaleString() : "—";
+      $(`#${detailId}`).textContent = available ? description(state.model.counts) : index < 2 ? "No inventory" : index === 2 ? "Not loaded" : index === 3 ? "Not loaded" : "No candidate set";
+    });
+  }
+
+  function renderCoverage() {
+    const counts = state.model.counts;
+    if (!state.artifacts.candidates) {
+      elements.coverageCount.textContent = "Load candidates.json to see coverage.";
+      elements.coverageDetail.textContent = "Candidate records, Jev judgments, and pending work are counted separately.";
+      return;
+    }
+    elements.coverageCount.textContent = `${counts.candidates.toLocaleString()} candidates · ${counts.evaluated.toLocaleString()} judged · ${counts.pending.toLocaleString()} pending`;
+    const discovered = counts.candidateCountBeforeLimit !== counts.candidates ? ` ${counts.candidateCountBeforeLimit.toLocaleString()} discovered before the candidate limit.` : "";
+    elements.coverageDetail.textContent = `Showing the loaded candidate artifact; pending is the run-reported Jev request count.${discovered} Use the three relationship views and pagination to inspect every loaded record.`;
+  }
+
+  function renderList(resetScroll) {
+    const items = filteredItems();
+    if (resetScroll) elements.virtualList.scrollTop = 0;
+    elements.visibleCount.textContent = items.length.toLocaleString();
+    const pageCount = Math.max(1, Math.ceil(items.length / state.pageSize));
+    state.page = Math.min(state.page, pageCount - 1);
+    const pageStart = state.page * state.pageSize;
+    const pageItems = items.slice(pageStart, pageStart + state.pageSize);
+    elements.pageStatus.textContent = `Page ${state.page + 1} of ${pageCount} · ${pageStart + 1}-${Math.min(items.length, pageStart + state.pageSize)} of ${items.length}`;
+    elements.pagePrev.disabled = state.page === 0;
+    elements.pageNext.disabled = state.page >= pageCount - 1;
+    const rowHeight = 58;
+    const viewport = Math.max(260, elements.virtualList.clientHeight || 440);
+    const start = Math.max(0, Math.floor(elements.virtualList.scrollTop / rowHeight) - 4);
+    const end = Math.min(items.length, Math.ceil((elements.virtualList.scrollTop + viewport) / rowHeight) + 5);
+    const spacer = node("div", "list-spacer"); spacer.style.height = `${pageItems.length * rowHeight}px`;
+    const rows = node("div", "list-rows"); rows.style.transform = `translateY(${start * rowHeight}px)`;
+    for (const item of pageItems.slice(start, end)) {
+      const button = node("button", `record ${item.kind}${state.selected && state.selected.id === item.id ? " selected" : ""}`);
+      button.type = "button";
+      button.title = item.title;
+      button.append(node("span", "record-kind", item.kind === "candidate" ? (item.relation ? "JEV" : "PAIR") : item.kind.toUpperCase()), node("strong", "", truncate(item.title, 42)), node("small", "", truncate(item.subtitle, 58)));
+      button.addEventListener("click", () => select(item));
+      rows.append(button);
+    }
+    elements.virtualList.replaceChildren(spacer, rows);
+  }
+
+  function select(item) {
+    state.selected = item;
+    state.group = null;
+    renderList(false); renderInspector(); drawGraph();
+  }
+
+  function pagedGraphItems() {
+    const items = state.viewMode === "candidates" ? state.model.candidates : state.viewMode === "judgments" ? state.model.candidates.filter((item) => item.relation) : state.model.groups;
+    const pageCount = Math.max(1, Math.ceil(items.length / state.graphPageSize));
+    state.graphPage = Math.min(state.graphPage, pageCount - 1);
+    const start = state.graphPage * state.graphPageSize;
+    elements.graphPageStatus.textContent = `Page ${state.graphPage + 1} of ${pageCount}`;
+    elements.graphPrev.disabled = state.graphPage === 0;
+    elements.graphNext.disabled = state.graphPage >= pageCount - 1;
+    return { items, page: items.slice(start, start + state.graphPageSize), start, pageCount };
+  }
+
+  function renderInspector() {
+    const model = state.model;
+    const selected = state.selected;
+    elements.inspector.replaceChildren();
+    if (!selected) {
+      elements.focusIndex.textContent = model.objects.length ? "OVERVIEW" : "WAITING";
+      if (!model.objects.length) {
+        elements.inspector.append(node("div", "empty-focus", "Choose inventory.json to start. The viewer reads files selected from this device and does not upload them."));
+        return;
+      }
+      elements.inspector.append(node("span", "focus-kicker fact", "LOCAL SNAPSHOT"), node("h2", "", "Explore before deciding."), node("p", "", "Groups connect branches through identical tips and candidate links. A group may include uncertain hypotheses; it is not a declaration that every member is a duplicate. Search or select a group to inspect its evidence."), node("span", "inspector-label", "IN THIS LOAD"), list([plural(model.counts.branches, "branch"), plural(model.counts.worktrees, "worktree"), plural(model.counts.stashes, "stash"), plural(model.counts.facts, "Git fact"), plural(model.counts.candidates, "candidate pair"), plural(model.counts.evaluated, "Jev judgment")]), node("div", "conclusion", "A missing judgment is unresolved. It does not mean the pair is unrelated."));
+      return;
+    }
+    elements.focusIndex.textContent = selected.kind === "candidate" ? (selected.relation ? "JEV JUDGED" : "UNRESOLVED") : selected.kind.toUpperCase();
+    if (selected.kind === "candidate") renderCandidateInspector(selected); else renderObjectInspector(selected);
+  }
+
+  function renderObjectInspector(selected) {
+    const type = selected.kind === "branch" ? "GIT BRANCH" : selected.kind === "worktree" ? "GIT WORKTREE" : "GIT STASH";
+    elements.inspector.append(node("span", "focus-kicker fact", type), node("h2", "", selected.title), node("p", "", selected.subtitle), node("span", "inspector-label", "IMMUTABLE OR OBSERVED DETAILS"));
+    if (selected.branch) {
+      const branch = selected.branch;
+      elements.inspector.append(fragment(detail("Tip SHA", data.shortSha(branch.tip)), detail("Merge base", data.shortSha(branch.merge_base)), detail("Unique commits", String((branch.unique_commits || []).length)), detail("Merged into default", branch.merged_into_default ? "yes" : "no"), detail("Changed paths", String((branch.changed_paths || []).length))));
+      elements.inspector.append(detail("Tip age at snapshot", selected.ageDays === null ? "unknown" : `${selected.ageDays} days`));
+      elements.inspector.append(detail("Identical tips", String(selected.identicalTips.length)));
+      elements.inspector.append(detail("Discovery coverage", selected.coverage?.status || "not recorded"));
+      const worktrees = state.model.objects.filter((item) => item.worktree?.branch === selected.title);
+      elements.inspector.append(detail("Attached worktrees", String(worktrees.length)));
+      for (const worktree of worktrees) elements.inspector.append(detail("Worktree state", worktree.subtitle));
+      elements.inspector.append(detail("Evaluated pairs", String(selected.relatedPairs.filter((pair) => pair.relation).length)));
+      elements.inspector.append(detail("Unresolved pairs", String(selected.relatedPairs.filter((pair) => !pair.resolved).length)));
+      if (selected.inactiveWithWork) elements.inspector.append(node("div", "conclusion", "Tip is at least 30 days old and has commits outside its merge base with default. Review remaining work before disposition."));
+      for (const other of selected.identicalTips.slice(0, 20)) {
+        const button = node("button", "quiet-button", `Identical tip: ${other.title}`);
+        button.addEventListener("click", () => select(other));
+        elements.inspector.append(button);
+      }
+      for (const pair of selected.relatedPairs.slice(0, 40)) {
+        const button = node("button", "quiet-button", pair.title);
+        button.addEventListener("click", () => select(pair));
+        elements.inspector.append(button);
+      }
+      const factTypes = state.model.facts.filter((fact) => fact.branch === branch.name || fact.commit === branch.tip).map((fact) => fact.type);
+      elements.inspector.append(node("span", "inspector-label", "FACTUAL RELATIONSHIPS"), factTypes.length ? list([...new Set(factTypes)]) : node("p", "muted-copy", "No directly indexed fact is attached to this branch record."));
+    } else if (selected.worktree) {
+      const worktree = selected.worktree;
+      elements.inspector.append(fragment(detail("Branch", worktree.branch || "detached"), detail("Head SHA", data.shortSha(worktree.head)), detail("Status", selected.subtitle), detail("Locked", worktree.locked ? "yes" : "no"), detail("Path identity", data.shortSha(worktree.path_id))));
+    } else if (selected.stash) {
+      const stash = selected.stash;
+      elements.inspector.append(fragment(detail("Reference", stash.reference || "unknown"), detail("Commit SHA", data.shortSha(stash.sha)), detail("Subject", stash.subject || "not recorded")));
+    }
+    const related = relatedCandidates(selected).length;
+    elements.inspector.append(node("div", "conclusion", related ? `${plural(related, "candidate pair")} is available for bounded graph expansion.` : "No candidate pair is loaded for this object. This is not evidence of independence."));
+    renderReviewEditor(selected);
+  }
+
+  const dispositions = ["ACTIVE", "PRESERVE_IN_PR", "PRESERVE_IN_BRANCH", "PRESERVE_IN_ARCHIVE", "CLEANUP_CANDIDATE", "UNRESOLVED"];
+  function reviewIdentity(item) {
+    if (item.branch) return { id: `branch:${item.branch.name}`, kind: "branch", observed: { kind: "branch", name: item.branch.name, tip: item.branch.tip } };
+    if (item.worktree) return { id: `worktree:${item.worktree.path_id}`, kind: "worktree", observed: { kind: "worktree", path_id: item.worktree.path_id ?? null, head: item.worktree.head ?? null, branch: item.worktree.branch ?? null, status: item.worktree.status ?? null } };
+    if (item.stash) return { id: `stash:${item.stash.reference}:${item.stash.sha}`, kind: "stash", observed: { kind: "stash", reference: item.stash.reference, sha: item.stash.sha } };
+    return null;
+  }
+  const preservationDispositions = new Set(["PRESERVE_IN_PR", "PRESERVE_IN_BRANCH", "PRESERVE_IN_ARCHIVE", "CLEANUP_CANDIDATE"]);
+  const destinationFields = { local: ["path", "path_id", "directory_id"], archive: ["archive_id", "path", "path_id"], branch: ["name", "ref"], pr: ["number", "pr_id", "url"] };
+  function meaningfulDestination(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value) || typeof value.kind !== "string") return false;
+    const fields = destinationFields[value.kind.toLowerCase()]; if (!fields) return false;
+    return fields.some((field) => (typeof value[field] === "string" && value[field].trim()) || (field === "number" && Number.isInteger(value[field]) && value[field] > 0));
+  }
+  function preservationProofSafe(decision) {
+    if (!preservationDispositions.has(decision?.disposition)) return true;
+    const destination = decision?.preservation_destination;
+    const proof = decision?.preservation_proof;
+    const source = decision?.source_fingerprint || decision?.fingerprint;
+    return meaningfulDestination(destination) && proof && proof.verified === true && decision._destinationFingerprintVerified === true && typeof proof.source_fingerprint === "string" && proof.source_fingerprint === source && typeof proof.destination_fingerprint === "string" && stable(proof.destination) === stable(destination);
+  }
+  function reviewStatus(item) {
+    const identity = reviewIdentity(item); if (!identity) return "none";
+    const prior = state.reviews.get(identity.id); if (!prior) return "none";
+    if (state.reviewSchemaVersion !== 2) return "stale";
+    if (prior.reconciliation?.status === "unreviewed") return "unreviewed";
+    if (prior.reconciliation?.status === "stale" || prior.reconciliation?.status === "historical-limited") return "stale";
+    if (!preservationProofSafe(prior)) return "stale";
+    if (prior.reconciliation?.status === "current") return "current";
+    if (typeof prior.source_fingerprint === "string" && typeof prior.fingerprint === "string" && prior.source_fingerprint === prior.fingerprint) return "current";
+    return stable(prior.observed) === stable(identity.observed) ? "current" : "stale";
+  }
+  function scalar(value) { return JSON.stringify(value).replace(/[\u007f-\uffff]/g, (character) => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`); }
+  function stable(value) {
+    if (Array.isArray(value)) return `[${value.map(stable).join(",")}]`;
+    if (value && typeof value === "object") return `{${Object.keys(value).sort().map((key) => `${scalar(key)}:${stable(value[key])}`).join(",")}}`;
+    return scalar(value);
+  }
+  async function sha256(value) {
+    const bytes = new TextEncoder().encode(stable(value));
+    const result = await crypto.subtle.digest("SHA-256", bytes);
+    return [...new Uint8Array(result)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  }
+  function renderReviewEditor(item) {
+    const identity = reviewIdentity(item); if (!identity) return;
+    const prior = state.reviews.get(identity.id);
+    const status = reviewStatus(item);
+    const current = status === "current";
+    const editor = node("div", "review-editor");
+    editor.append(node("span", "inspector-label", "HUMAN DISPOSITION"));
+    if (prior) editor.append(node("div", "conclusion", current ? `Current review · ${prior.reviewed_at}` : status === "unreviewed" ? "Unreviewed snapshot · record a human disposition." : "Stale review · object inputs changed; save a new decision."));
+    const select = document.createElement("select"); select.id = "review-disposition"; dispositions.forEach((value) => { const option = node("option", "", value); option.value = value; select.append(option); }); select.value = current ? prior.disposition : "UNRESOLVED";
+    const rationale = document.createElement("textarea"); rationale.placeholder = "Required rationale"; rationale.value = current ? prior.rationale : "";
+    const reviewer = document.createElement("input"); reviewer.id = "reviewer-identity"; reviewer.type = "text"; reviewer.placeholder = "Reviewer identity"; reviewer.value = current ? (prior.reviewer_id || prior.reviewer || "") : "browser-local-reviewer";
+    const destinationKind = document.createElement("select"); destinationKind.id = "preservation-destination-kind";
+    [["", "No preservation destination"], ["branch", "Branch"], ["pr", "Pull request"], ["archive", "Archive"], ["local", "Local path"]].forEach(([value, label]) => { const option = node("option", "", label); option.value = value; destinationKind.append(option); });
+    const destinationValue = document.createElement("input"); destinationValue.id = "preservation-destination-value"; destinationValue.type = "text"; destinationValue.placeholder = "Concrete destination name, path, or number";
+    const verification = document.createElement("label"); verification.className = "preservation-verification";
+    const verificationBox = document.createElement("input"); verificationBox.id = "preservation-verified"; verificationBox.type = "checkbox";
+    verification.append(verificationBox, node("span", "", "I verified this destination is concrete and ready."));
+    const destinationControls = node("div", "preservation-controls", destinationKind, destinationValue, verification);
+    const existingDestination = current ? prior.preservation_destination : null;
+    if (meaningfulDestination(existingDestination)) { destinationKind.value = existingDestination.kind; destinationValue.value = String(existingDestination.number || existingDestination.name || existingDestination.ref || existingDestination.archive_id || existingDestination.path || existingDestination.pr_id || existingDestination.url || ""); verificationBox.checked = preservationProofSafe(prior); }
+    const updateDestinationState = () => { const required = preservationDispositions.has(select.value); destinationControls.hidden = !required; destinationKind.required = required; destinationValue.required = required; verificationBox.required = required; };
+    select.addEventListener("change", updateDestinationState); updateDestinationState();
+    const save = node("button", "quiet-button", "Save browser-local decision"); save.type = "button";
+    save.addEventListener("click", async () => {
+      if (!rationale.value.trim()) { rationale.focus(); return; }
+      if (!reviewer.value.trim()) { reviewer.focus(); save.textContent = "Reviewer identity required"; return; }
+      const sourceFingerprint = await sha256(identity.observed);
+      let destination = null; let proof = null;
+      if (preservationDispositions.has(select.value)) {
+        const kind = destinationKind.value; const value = destinationValue.value.trim();
+        if (!kind || !value || !verificationBox.checked) { save.textContent = "Verified concrete destination required"; return; }
+        destination = kind === "pr" && /^\d+$/.test(value) ? { kind, number: Number(value) } : kind === "branch" ? { kind, name: value } : kind === "archive" ? { kind, archive_id: value } : { kind, path: value };
+        if (!meaningfulDestination(destination)) { save.textContent = "Meaningful destination required"; return; }
+        proof = { verified: true, source_fingerprint: sourceFingerprint, destination_fingerprint: await sha256(destination), destination };
+      }
+      const sourceProvenance = await reviewProvenance();
+      state.reviewSchemaVersion = 2;
+      const savedDecision = { object_id: identity.id, kind: identity.kind, fingerprint: sourceFingerprint, source_fingerprint: sourceFingerprint, source_provenance: sourceProvenance, reviewer_id: reviewer.value.trim(), reviewer: reviewer.value.trim(), observed: identity.observed, disposition: select.value, rationale: rationale.value.trim(), reviewed_at: new Date().toISOString(), preservation_destination: destination, preservation_proof: proof, reconciliation: { status: "current", reasons: ["browser_reviewed"] } };
+      Object.defineProperty(savedDecision, "_destinationFingerprintVerified", { value: true, enumerable: false, configurable: true });
+      state.reviews.set(identity.id, savedDecision);
+      save.textContent = "Saved locally";
+    });
+    editor.append(select, reviewer, rationale, destinationControls, save); elements.inspector.append(editor);
+  }
+
+  async function reviewProvenance() {
+    const inventory = state.artifacts.inventory || {};
+    const candidates = state.artifacts.candidates || {};
+    const relations = state.artifacts.relations || {};
+    return { repository_id: inventory.repository?.id || "", inventory_digest: await sha256(inventory), candidate_digest: state.artifacts.candidates ? await sha256(candidates) : await sha256({}), candidate_content_digest: candidates.content_digest || null, relations_digest: state.artifacts.relations ? await sha256(relations) : null };
+  }
+
+  function validDigest(value) { return typeof value === "string" && /^[0-9a-f]{64}$/i.test(value); }
+  async function exportDecision(raw, provenance) {
+    const identity = raw.source_fingerprint || raw.fingerprint;
+    const sourceFingerprint = validDigest(identity) ? identity : await sha256(raw.observed || { object_id: raw.object_id, kind: raw.kind });
+    const legacy = state.reviewSchemaVersion !== 2;
+    const unsafePreservation = !preservationProofSafe(raw);
+    const downgrade = legacy || unsafePreservation;
+    const decision = { ...raw, kind: raw.kind || raw.object_id.split(":", 1)[0], source_fingerprint: sourceFingerprint, fingerprint: sourceFingerprint, source_provenance: provenance, reviewer_id: raw.reviewer_id || raw.reviewer || null, reviewer: raw.reviewer || raw.reviewer_id || null, preservation_destination: raw.preservation_destination || null, preservation_proof: raw.preservation_proof || null };
+    if (downgrade) {
+      decision.disposition = "UNRESOLVED";
+      decision.preservation_destination = null;
+      decision.preservation_proof = null;
+      if (legacy) {
+        decision.reviewer_id = null;
+        decision.reviewer = null;
+        decision.reviewed_at = null;
+      } else {
+        decision.reviewer_id = decision.reviewer_id || decision.reviewer || "browser-local-reviewer";
+        decision.reviewer = decision.reviewer || decision.reviewer_id;
+        decision.reviewed_at = decision.reviewed_at || new Date().toISOString();
+      }
+      decision.rationale = legacy ? "Legacy review imported; v2 proof is required before a current disposition." : "Preservation proof is incomplete or stale; disposition remains unresolved.";
+      decision.reconciliation = { status: legacy ? "historical-limited" : "stale", reasons: [legacy ? "legacy_review_schema_v1" : "preservation_proof_required"] };
+    }
+    return decision;
+  }
+
+  async function exportReview() {
+    const inventory = state.artifacts.inventory; if (!inventory) return;
+    const provenance = await reviewProvenance();
+    const decisions = [];
+    for (const raw of [...state.reviews.values()].sort((a, b) => a.object_id.localeCompare(b.object_id))) decisions.push(await exportDecision(raw, provenance));
+    const documentValue = { kind: "relationship-review", schema_version: 2, repository_id: provenance.repository_id, ...provenance, provenance, reviewer_identity: "browser-local-reviewer", exported_at: new Date().toISOString(), decisions, limitations: [] };
+    const url = URL.createObjectURL(new Blob([JSON.stringify(documentValue, null, 2) + "\n"], { type: "application/json" }));
+    const link = document.createElement("a"); link.href = url; link.download = "review.json"; link.click(); URL.revokeObjectURL(url);
+  }
+
+  function renderCandidateInspector(selected) {
+    const endpoints = selected.candidate.endpoints || {};
+    const a = endpoints.a || {}; const b = endpoints.b || {};
+    const headingKind = selected.relation ? "judgment" : selected.factResolved ? "fact" : "candidate";
+    const headingText = selected.relation ? "JEV JUDGMENT" : selected.factResolved ? "GIT RELATIONSHIP" : "CANDIDATE HYPOTHESIS";
+    elements.inspector.append(node("span", `focus-kicker ${headingKind}`, headingText), node("h2", "", selected.title), node("p", "", selected.relation ? "A typed Jev response is attached to this candidate ID." : selected.factResolved ? "Git proves a structural connection between these immutable tips." : "This pair has deterministic evidence but no loaded Jev response."), node("span", "inspector-label", "IMMUTABLE ENDPOINTS"), fragment(detail("A", `${a.branch || "unknown"} · ${data.shortSha(a.tip)}`), detail("B", `${b.branch || "unknown"} · ${data.shortSha(b.tip)}`), detail("Candidate ID", selected.candidateId)));
+    const evidence = selected.candidate.evidence || {};
+    if (typeof evidence.a_ancestor_of_b === "boolean") {
+      elements.inspector.append(node("span", "inspector-label", "GIT ANCESTRY FACTS"),
+        detail("A ancestor of B", evidence.a_ancestor_of_b ? "yes" : "no"),
+        detail("B ancestor of A", evidence.b_ancestor_of_a ? "yes" : "no"),
+        detail("A commits outside B", String(evidence.a_commits_not_in_b)),
+        detail("B commits outside A", String(evidence.b_commits_not_in_a)));
+    }
+    elements.inspector.append(node("span", "inspector-label", "RELATIONSHIP EVIDENCE"), list([...(selected.candidate.reasons || []), `Shared paths: ${(evidence.shared_paths || []).length}`, `Shared patch IDs: ${(evidence.shared_patch_ids || []).length}`, `Shared subject tokens: ${(evidence.shared_subject_tokens || []).length}`]));
+    if (!selected.relation) {
+      elements.inspector.append(node("div", "conclusion", selected.factResolved ? "Git resolves the structural connection. Semantic labels such as supersession still require review." : "No Jev judgment is loaded. Keep this pair unresolved; the viewer never translates missing data into unrelated."));
+      return;
+    }
+    const answer = selected.answer;
+    const sameIntent = typeof answer.sameIntent === "number" ? percentage(answer.sameIntent) : answer.sameIntent || "not reported";
+    elements.inspector.append(node("span", "inspector-label", "TYPED JEV ANSWER"), fragment(detail("Relationship", answer.choice || "not reported"), detail("Confidence", percentage(answer.confidence)), detail("Same intent", sameIntent)));
+    const dimensions = answer.isV3 ? Object.entries(answer.dimensions || {}).filter(([, value]) => typeof value === "number") : [];
+    if (dimensions.length) {
+      const card = node("div", "answer-card"); card.append(node("small", "", "Independent v3 judgments"));
+      dimensions.forEach(([label, value]) => { const row = node("div", "bar-row"); const track = node("div", "bar-track"); const fill = node("div", "bar-fill"); fill.style.width = `${value * 100}%`; track.append(fill); row.append(node("span", "", label), track, node("b", "", percentage(value))); card.append(row); });
+      elements.inspector.append(card);
+    }
+    const probabilities = Object.entries(answer.probabilities).filter(([, value]) => typeof value === "number");
+    if (probabilities.length) {
+      const card = node("div", "answer-card");
+      card.append(node("small", "", "Reported relationship probabilities"));
+      probabilities.forEach(([label, value]) => {
+        const row = node("div", "bar-row"); const track = node("div", "bar-track"); const fill = node("div", "bar-fill"); fill.style.width = `${Math.min(100, value <= 1 ? value * 100 : value)}%`; track.append(fill); row.append(node("span", "", label), track, node("b", "", percentage(value))); card.append(row);
+      });
+      elements.inspector.append(card);
+    }
+    elements.inspector.append(node("div", "conclusion", "Jev labels this pair only. It does not authorize a disposition or cleanup action."));
+  }
+
+  function relatedCandidates(item) {
+    if (item.kind === "candidate") return [item];
+    if (item.kind === "branch") return state.model.candidates.filter((candidate) => candidate.aNode && candidate.bNode && (candidate.aNode.id === item.id || candidate.bNode.id === item.id));
+    if (item.kind === "worktree") return state.model.candidates.filter((candidate) => candidate.aNode && candidate.bNode && (candidate.aNode.title === item.title || candidate.bNode.title === item.title));
+    return [];
+  }
+
+  function resizeCanvas() {
+    const canvas = elements.graph; const rect = elements.graphWrap.getBoundingClientRect(); const ratio = window.devicePixelRatio || 1;
+    canvas.width = Math.max(1, Math.floor(rect.width * ratio)); canvas.height = Math.max(1, Math.floor(rect.height * ratio)); canvas.style.width = `${rect.width}px`; canvas.style.height = `${rect.height}px`;
+    const context = canvas.getContext("2d"); context.setTransform(ratio, 0, 0, ratio, 0, 0); return { context, width: rect.width, height: rect.height };
+  }
+
+  function drawGraph() {
+    const { context, width, height } = resizeCanvas(); const model = state.model; const selected = state.selected;
+    context.clearRect(0, 0, width, height); state.graphTargets = [];
+    elements.graphEmpty.hidden = Boolean(model.objects.length); elements.graphHint.hidden = !model.objects.length;
+    if (!model.objects.length) { elements.graphCount.textContent = "No local data"; return; }
+    if (!selected) { state.viewMode === "components" ? drawOverview(context, width, height) : drawRelationshipOverview(context, width, height); return; }
+    drawFocus(context, width, height, selected);
+  }
+
+  function drawOverview(context, width, height) {
+    const graph = pagedGraphItems(); const groups = graph.page; const shown = groups.length; const columns = Math.max(3, Math.min(6, Math.ceil(Math.sqrt(Math.max(shown, 1) * (width / Math.max(height, 1)))))); const rows = Math.ceil(shown / columns); const gapX = width / (columns + 1); const gapY = height / (rows + 1);
+    context.fillStyle = "#90a3b9"; context.font = "600 12px system-ui"; context.fillText("Connected groups · facts and hypotheses", 22, 28);
+    groups.forEach((group, index) => {
+      const column = index % columns; const row = Math.floor(index / columns); const x = gapX * (column + 1); const y = gapY * (row + 1) + 15; const radius = Math.max(18, Math.min(54, 13 + Math.sqrt(group.count) * 2.1));
+      context.beginPath(); context.fillStyle = "rgba(139,230,197,.14)"; context.strokeStyle = "#8be6c5"; context.lineWidth = 1.5; context.arc(x, y, radius, 0, Math.PI * 2); context.fill(); context.stroke();
+      context.fillStyle = "#f3f5f8"; context.font = "700 11px system-ui"; context.textAlign = "center"; context.fillText(truncate(group.name, 18), x, y - 2); context.fillStyle = "#91a0b4"; context.font = "600 10px system-ui"; context.fillText(plural(group.count, "branch"), x, y + 14); context.textAlign = "start";
+      state.graphTargets.push({ type: "group", group: group.key, x, y, radius });
+    });
+    elements.graphCount.textContent = `${plural(state.model.counts.objects, "object")} · ${plural(state.model.groups.length, "group")} · graph page ${graph.page.length} of ${graph.items.length}`;
+  }
+
+  function drawRelationshipOverview(context, width, height) {
+    const graph = pagedGraphItems();
+    const endpoints = new Map();
+    graph.page.forEach((candidate) => { if (candidate.aNode) endpoints.set(candidate.aNode.id, candidate.aNode); if (candidate.bNode) endpoints.set(candidate.bNode.id, candidate.bNode); });
+    const nodes = [...endpoints.values()];
+    const center = { x: width / 2, y: height / 2 }; const radius = Math.min(width, height) * .34;
+    nodes.forEach((item, index) => { const angle = Math.PI * 2 * index / Math.max(nodes.length, 1) - Math.PI / 2; item.__graphX = center.x + Math.cos(angle) * radius; item.__graphY = center.y + Math.sin(angle) * radius; });
+    graph.page.forEach((candidate) => { if (!candidate.aNode || !candidate.bNode) return; drawEdge(context, { x: candidate.aNode.__graphX, y: candidate.aNode.__graphY }, { x: candidate.bNode.__graphX, y: candidate.bNode.__graphY }, candidate.relation, candidate.factResolved); });
+    nodes.forEach((item) => drawGraphNode(context, item, item.__graphX, item.__graphY, item.kind));
+    context.fillStyle = "#90a3b9"; context.font = "600 11px system-ui"; context.fillText(state.viewMode === "judgments" ? "Jev judgments · paginated" : "Candidate relationships · paginated", 22, 28);
+    elements.graphCount.textContent = `${graph.page.length} of ${graph.items.length} ${state.viewMode === "judgments" ? "judgments" : "candidates"} on graph page`;
+  }
+
+  function drawFocus(context, width, height, selected) {
+    const allCandidates = relatedCandidates(selected);
+    const center = { x: width * .5, y: height * .5 };
+    const focal = selected.kind === "candidate" ? null : selected;
+    if (selected.kind === "candidate") {
+      elements.graphPageStatus.textContent = "Single candidate"; elements.graphPrev.disabled = true; elements.graphNext.disabled = true;
+      const left = selected.aNode || { title: "Endpoint A", id: "missing-a", kind: "branch" }; const right = selected.bNode || { title: "Endpoint B", id: "missing-b", kind: "branch" };
+      drawEdge(context, { x: width * .25, y: center.y }, { x: width * .75, y: center.y }, selected.relation); drawGraphNode(context, left, width * .25, center.y, "branch"); drawGraphNode(context, right, width * .75, center.y, "branch");
+      elements.graphCount.textContent = `${selected.relation ? "Jev judgment" : "Candidate only"} · joined by candidate ID and tip SHA`;
+      return;
+    }
+    drawGraphNode(context, focal, center.x, center.y, focal.kind, true);
+    const connections = (selected.identicalTips || []).map((other) => ({ other, fact: "Identical tip" }));
+    if (selected.branch) {
+      for (const item of state.model.objects) {
+        if (item.worktree?.branch === selected.title && item.worktree.head === selected.branch.tip) connections.push({ other: item, fact: "Checked out at" });
+        if (selected.branch.merged_into_default && item.branch?.name === state.model.inventory.repository.default_branch) connections.push({ other: item, fact: "Merged into default" });
+      }
+    }
+    for (const candidate of allCandidates) {
+      const other = candidate.aNode?.id === focal.id ? candidate.bNode : candidate.aNode;
+      if (other) connections.push({ other, candidate });
+    }
+    const graphCount = Math.max(1, Math.ceil(connections.length / state.graphPageSize));
+    state.graphPage = Math.min(state.graphPage, graphCount - 1);
+    elements.graphPageStatus.textContent = `Page ${state.graphPage + 1} of ${graphCount}`;
+    elements.graphPrev.disabled = state.graphPage === 0; elements.graphNext.disabled = state.graphPage >= graphCount - 1;
+    const graphStart = state.graphPage * state.graphPageSize;
+    const visible = connections.slice(graphStart, graphStart + state.graphPageSize);
+    const radius = Math.min(width, height) * .34;
+    visible.forEach(({ other, fact, candidate }, index) => {
+      const angle = (Math.PI * 2 * index / Math.max(visible.length, 1)) - Math.PI / 2;
+      const x = center.x + Math.cos(angle) * radius; const y = center.y + Math.sin(angle) * radius;
+      drawEdge(context, center, { x, y }, candidate?.relation, Boolean(fact || candidate?.factResolved));
+      drawGraphNode(context, other, x, y, other.kind);
+      if (candidate) state.graphTargets.push({ type: "candidate", item: candidate, x: (center.x + x) / 2, y: (center.y + y) / 2, radius: 16 });
+    });
+    context.fillStyle = "#90a3b9"; context.font = "600 11px system-ui";
+    context.fillText(`Showing ${visible.length} of ${connections.length} recorded connections`, 20, 28);
+    elements.graphCount.textContent = `${plural(visible.length, "connection")} · graph page ${state.graphPage + 1} · ${connections.length} total`;
+  }
+
+  function drawEdge(context, from, to, relation, fact = false) {
+    context.save(); context.beginPath(); context.moveTo(from.x, from.y); context.lineTo(to.x, to.y); context.lineWidth = relation ? 3 : 2; context.strokeStyle = fact ? "#8aa6bd" : relation ? "#baa9ff" : "#8292a9"; context.setLineDash(fact || relation ? [] : [7, 7]); context.stroke(); context.restore();
+  }
+
+  function drawGraphNode(context, item, x, y, kind, focal = false) {
+    const palette = kind === "stash" ? "#f4c57c" : kind === "worktree" ? "#8ec5ff" : "#8be6c5"; const radius = focal ? 29 : 21;
+    context.beginPath(); context.fillStyle = "#17263a"; context.strokeStyle = palette; context.lineWidth = focal ? 3 : 2; context.arc(x, y, radius, 0, Math.PI * 2); context.fill(); context.stroke(); context.fillStyle = "#f3f5f8"; context.font = focal ? "700 12px system-ui" : "700 10px system-ui"; context.textAlign = "center"; context.fillText(truncate(item.title, focal ? 26 : 16), x, y + 4); context.textAlign = "start";
+    state.graphTargets.push({ type: "item", item, x, y, radius: radius + 8 });
+  }
+
+  function clickGraph(event) {
+    const bounds = elements.graph.getBoundingClientRect(); const x = event.clientX - bounds.left; const y = event.clientY - bounds.top;
+    const target = [...state.graphTargets].reverse().find((item) => Math.hypot(item.x - x, item.y - y) <= item.radius);
+    if (!target) return;
+    if (target.type === "group") { state.group = target.group; state.selected = null; state.query = ""; elements.search.value = ""; renderList(true); renderInspector(); drawGraph(); return; }
+    if (target.item) select(target.item);
+  }
+
+  document.querySelectorAll("input[type=file]").forEach((input) => input.addEventListener("change", () => readFile(input.id.replace("-file", ""), input)));
+  elements.search.addEventListener("input", () => { state.query = elements.search.value; state.group = null; state.page = 0; renderList(true); });
+  elements.virtualList.addEventListener("scroll", () => renderList(false));
+  $("#kind-filters").addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-kind]"); if (!button) return; state.filter = button.dataset.kind; state.page = 0; document.querySelectorAll(".filter").forEach((item) => item.classList.toggle("active", item === button)); renderList(true);
   });
-  graph.append(nodeLayer);
-}
-
-function list(items) {
-  const ul = document.createElement("ul");
-  ul.className = "evidence-list";
-  items.forEach((item) => { const li = document.createElement("li"); li.textContent = item; ul.append(li); });
-  return ul;
-}
-
-function heading(kind, title, description) {
-  const kicker = document.createElement("span");
-  kicker.className = `focus-kicker ${kind}`;
-  kicker.textContent = kind === "fact" ? "GIT FACT" : kind === "plan" ? "REVIEW PLAN" : "JEV QUESTION";
-  const h2 = document.createElement("h2");
-  h2.textContent = title;
-  const p = document.createElement("p");
-  p.textContent = description;
-  inspector.append(kicker, h2, p);
-}
-
-function label(value) {
-  const element = document.createElement("span");
-  element.className = "inspector-label";
-  element.textContent = value;
-  inspector.append(element);
-}
-
-function relationArrow(from, to) {
-  const row = document.createElement("div");
-  row.className = "relation-arrow";
-  const left = document.createElement("span"); left.textContent = from;
-  const arrow = document.createElement("b"); arrow.textContent = "→";
-  const right = document.createElement("span"); right.textContent = to;
-  row.append(left, arrow, right);
-  inspector.append(row);
-}
-
-function answerCard(edge) {
-  const card = document.createElement("div");
-  card.className = "answer-card";
-  const eyebrow = document.createElement("span"); eyebrow.className = "inspector-label"; eyebrow.textContent = "ILLUSTRATIVE TYPED ANSWER";
-  const answer = document.createElement("strong"); answer.textContent = edge.answer;
-  const note = document.createElement("small"); note.textContent = "Synthetic probabilities shown for this design study.";
-  card.append(eyebrow, answer, note);
-  edge.distribution.forEach(([name, probability]) => {
-    const row = document.createElement("div"); row.className = "bar-row";
-    const title = document.createElement("span"); title.textContent = name;
-    const track = document.createElement("div"); track.className = "bar-track";
-    const fill = document.createElement("div"); fill.className = "bar-fill"; fill.style.width = `${probability}%`;
-    const value = document.createElement("b"); value.textContent = `${probability}%`;
-    track.append(fill); row.append(title, track, value); card.append(row);
-  });
-  inspector.append(card);
-}
-
-function conclusion(title, text) {
-  const box = document.createElement("div"); box.className = "conclusion";
-  const strong = document.createElement("strong"); strong.textContent = title;
-  const body = document.createElement("span"); body.textContent = text;
-  box.append(strong, body); inspector.append(box);
-}
-
-function renderInspector() {
-  inspector.replaceChildren();
-  const edge = edges.find((item) => item.id === selected);
-  const node = nodes.find((item) => item.id === selected);
-  focusIndex.textContent = selected ? "SELECTED" : `${String(stage + 1).padStart(2, "0")} / 04`;
-
-  if (edge) {
-    const proposed = edge.type === "proposed";
-    const canJudge = proposed && stage >= 2;
-    heading(proposed ? "" : "fact", proposed ? edge.question : edge.label, proposed ? "A bounded question about one possible link between two branches." : "This edge is established by Git or named repository metadata.");
-    relationArrow(edge.from, edge.to);
-    label("EVIDENCE IN VIEW");
-    inspector.append(list(edge.evidence));
-    if (canJudge) { answerCard(edge); conclusion("Preservation check", edge.implication); }
-    else if (proposed) conclusion("Candidate only", "The matching signals justify a closer look. No model judgment is shown yet.");
-    return;
-  }
-  if (node) {
-    heading(node.kind === "main" || node.kind === "merged" || node.kind === "stash" ? "fact" : "plan", node.title, node.detail);
-    label("INVENTORY RECORD");
-    inspector.append(list([`Kind: ${node.kind}`, `Observed state: ${node.subtitle}`, `Plan label: ${node.tag.toLowerCase()}`]));
-    if (node.id === "auth-old" || node.id === "stash") conclusion("Unique work remains", "This item stays visible in the plan until a maintainer records where its work went.");
-    return;
-  }
-
-  if (stage === 0) {
-    heading("fact", "Start with what Git knows.", "Every object in this small repository is present before we ask Jev anything.");
-    label("IN THIS SNAPSHOT");
-    inspector.append(list(["4 local branches and main", "1 merged pull request", "1 stash containing uncommitted work", "5 factual relationships"]));
-    conclusion("What is still unknown?", "Git alone cannot establish whether auth/v2 supersedes auth/v1 or validator depends on it.");
-  } else if (stage === 1) {
-    heading("", "Find the likely links.", "Deterministic signals narrow the search to two candidate pairs.");
-    label("WHY THESE PAIRS?");
-    inspector.append(list(["Shared task ID and paths: auth/v1 ↔ auth/v2", "Shared interface use: auth/v2 ↔ validator", "One patch equivalent commit, checked directly"]));
-    conclusion("Coverage is explicit", "Candidate generation limits the questions Jev sees. Missing candidates remain a reported uncertainty.");
-  } else if (stage === 2) {
-    const proposed = edges.find((item) => item.id === "supersedes");
-    selected = proposed.id;
-    makeGraph();
-    renderInspector();
-  } else {
-    heading("plan", "Preserve first. Close later.", "The proposed plan keeps every unique piece of work visible for a maintainer.");
-    label("REVIEW QUEUE");
-    inspector.append(list(["auth/v2: remain active", "auth/v1: review 1 unique commit before closure", "stash@{0}: preserve uncommitted work", "validator: review dependency on auth/v2", "telemetry: independent active work"]));
-    conclusion("Human decision required", "No branch or stash is deleted by this visual. A future run must recheck the Git snapshot before any cleanup.");
-  }
-}
-
-function render() {
-  phaseBadge.textContent = stages[stage].badge;
-  count.textContent = `7 objects · 5 facts${stage >= 1 ? " · 2 candidates" : ""}${stage >= 2 ? " · 2 judgments" : ""}`;
-  makeStages();
-  makeGraph();
-  renderInspector();
-}
-
-function setStage(index) {
-  stage = index;
-  selected = index === 2 ? "supersedes" : null;
-  render();
-}
-
-function select(id) {
-  selected = id;
-  makeGraph();
-  renderInspector();
-}
-
-function stopPlayback() {
-  if (timer) clearInterval(timer);
-  timer = null;
-  playLabel.textContent = stage === 3 ? "Replay the analysis" : "Play the analysis";
-  playIcon.textContent = "▶";
-}
-
-playButton.addEventListener("click", () => {
-  if (timer) { stopPlayback(); return; }
-  if (stage === 3) setStage(0);
-  playLabel.textContent = "Pause";
-  playIcon.textContent = "Ⅱ";
-  timer = setInterval(() => {
-    if (stage < 3) setStage(stage + 1);
-    if (stage === 3) stopPlayback();
-  }, 2200);
-});
-
-render();
+  document.querySelector("#view-modes").addEventListener("click", (event) => { const button = event.target.closest("button[data-view]"); if (!button) return; state.viewMode = button.dataset.view; state.page = 0; state.graphPage = 0; state.selected = null; state.group = null; state.filter = "all"; document.querySelectorAll(".view-mode").forEach((item) => { const active = item === button; item.classList.toggle("active", active); item.setAttribute("aria-selected", String(active)); }); document.querySelectorAll(".filter").forEach((item) => item.classList.toggle("active", item.dataset.kind === "all")); renderAll(); });
+  elements.pagePrev.addEventListener("click", () => { state.page -= 1; renderList(true); });
+  elements.pageNext.addEventListener("click", () => { state.page += 1; renderList(true); });
+  elements.graphPrev.addEventListener("click", () => { state.graphPage -= 1; drawGraph(); });
+  elements.graphNext.addEventListener("click", () => { state.graphPage += 1; drawGraph(); });
+  elements.overview.addEventListener("click", () => { state.selected = null; state.group = null; state.query = ""; state.graphPage = 0; elements.search.value = ""; renderList(true); renderInspector(); drawGraph(); });
+  elements.graph.addEventListener("click", clickGraph);
+  $("#export-review").addEventListener("click", exportReview);
+  window.addEventListener("resize", drawGraph);
+  renderAll();
+})();

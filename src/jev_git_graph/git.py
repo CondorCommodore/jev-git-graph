@@ -79,8 +79,23 @@ def status_for(path: Path) -> list[str]:
         check=False,
     )
     if completed.returncode:
-        return ["<unavailable>"]
+        raise JgError(f"unable to inspect worktree status: {path}")
     return completed.stdout.decode("utf-8", "replace").splitlines()
+
+
+def ref_snapshot(runner: GitRunner) -> str:
+    """Capture locally known refs without contacting a remote."""
+    return runner.run("for-each-ref", "--format=%(refname)%1f%(objectname)")
+
+
+def remote_tracking_refs(runner: GitRunner) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
+    for line in runner.run("for-each-ref", "--format=%(refname)%1f%(objectname)", "refs/remotes").splitlines():
+        name, _, tip = line.partition("\x1f")
+        if name.endswith("/HEAD"):
+            continue
+        records.append({"name": name.removeprefix("refs/remotes/"), "tip": tip})
+    return records
 
 
 def local_branches(runner: GitRunner) -> list[dict[str, str]]:
@@ -117,7 +132,10 @@ def merge_base(runner: GitRunner, first: str, second: str) -> str | None:
 def is_ancestor(runner: GitRunner, ancestor: str, descendant: str) -> bool:
     command = ("git", "-C", str(runner.root), "merge-base", "--is-ancestor", ancestor, descendant)
     runner.commands.append(command)
-    return subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode == 0
+    result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    if result.returncode not in (0, 1):
+        raise JgError("unable to inspect commit ancestry")
+    return result.returncode == 0
 
 
 def commits_since(runner: GitRunner, base: str | None, tip: str) -> list[dict[str, str]]:

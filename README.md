@@ -23,11 +23,67 @@ jg relate --repo /path/to/repository --candidates /path/to/private-artifacts/can
 jg plan --repo /path/to/repository --inventory /path/to/private-artifacts/inventory.json --candidates /path/to/private-artifacts/candidates.json --out /path/to/private-artifacts
 ```
 
-`relate` writes only a local preview by default. A live Jev request requires an approved preview digest, `--use-jev`, and `TYPESAFE_API_KEY` in the process environment. It is hard-capped by default at **one request and 8,192 payload bytes**; raising either cap requires an explicit command-line override after reviewing the preview. There are no OpenAI, Codex, Claude, or agent-loop calls in this project. Read the preview before approving it.
+`relate` writes only a local preview by default. A live Jev request requires an approved preview digest, `--use-jev`, and `TYPESAFE_API_KEY` in the process environment. It is hard-capped by default at **one request and 8,192 payload bytes**; raising either cap requires an explicit command-line override after reviewing the preview. The default `--evidence-profile minimal` keeps labels, commit subjects, and path names out of the request. The explicit `review` profile adds preview-visible labels, normalized subjects, and bounded paths when the operator decides that context may leave the machine. There are no OpenAI, Codex, Claude, or agent-loop calls in this project. Read the preview before approving it.
+
+### Large, active repositories
+
+Use a private artifact directory outside every inspected worktree. For a local Home Lab pilot on a MacBook:
+
+```bash
+umask 077
+install -d -m 700 "$HOME/.local/share/jev-git-graph/runs/home-lab"
+RUN_DIR="$(mktemp -d "$HOME/.local/share/jev-git-graph/runs/home-lab/pilot.XXXXXX")"
+PYTHONPATH=src python3 -m jev_git_graph inventory --repo /Users/mikebook/code/home-lab --out "$RUN_DIR"
+PYTHONPATH=src python3 -m jev_git_graph candidates --repo /Users/mikebook/code/home-lab --inventory "$RUN_DIR/inventory.json" --out "$RUN_DIR"
+PYTHONPATH=src python3 -m jev_git_graph plan --repo /Users/mikebook/code/home-lab --inventory "$RUN_DIR/inventory.json" --candidates "$RUN_DIR/candidates.json" --out "$RUN_DIR"
+```
+
+Run the next command only after the previous one succeeds. Inventory records locally known remote-tracking refs without fetching. If refs or worktrees change during collection, or a worktree status is unavailable, inventory exits nonzero and retains an owner-only `inventory.json` and `manifest.json` marked incomplete. Candidate and plan commands reject that snapshot. Candidate generation bounds its pair search and reports truncated coverage; omitted pairs are not evidence of independence. No Jev request occurs in this sequence.
 
 Start with the [project specification](docs/spec.md), including the problem statement, five whys, requirements, and acceptance criteria.
 
-Explore the [interactive visual concept](https://condorcommodore.github.io/jev-git-graph/). It walks through a synthetic repository from Git facts to candidate links, illustrative Jev judgments, and a human review plan. The demo makes no API calls.
+The [local artifact viewer](docs/index.html) starts empty and renders only JSON selected by the operator. It makes no API calls.
+
+## View local artifacts
+
+After any batches finish, run `jg collect --repo PATH --candidates ORIGINAL_CANDIDATES --batch-plan BATCH_DIR/batches.json --out NEW_PRIVATE_DIR`. The combined `relations.json` verifies every response against its batch preview and attempt ledger, reports missing batches and unattempted requests, and loads beside the original inventory and candidates in the viewer. Existing outputs are preserved; choose a new aggregate directory for each update.
+
+Prepare reviewable Jev batches with `jg batches --repo PATH --candidates candidates.json --out NEW_PRIVATE_DIR --batch-size 32`. This creates `batches.json` and separate candidate/preview files for each batch without making API calls. Identical and ancestry-contained tips are recorded as factual comparisons and excluded from this semantic queue. Review each batch preview before executing `relate` with that batch's digest and explicit request/byte limits. To prepare subsequent work, repeat `--previous-relations PATH` for existing checkpoint ledgers; both successful and uncertain attempts are excluded. A new nonempty batch directory is never overwritten.
+
+For exploratory relationships from an already recorded incomplete snapshot, explicitly use `candidates --allow-incomplete`. The resulting coverage retains `inventory_complete: false`; the preservation-plan command still rejects the snapshot. This mode compares recorded commit tips and does not claim that current refs or worktrees are complete.
+
+Candidate selection favors the strongest discovered connection for uncovered branches before filling the remaining global rank. `coverage.branches` accounts for every recorded branch, including branches with no discovered candidate or pairs omitted by the limit. This is discovery coverage, not proof that no other relationship exists.
+
+Live `relate` runs checkpoint each request in the private output directory. Reusing that directory with the same approved preview resumes remaining requests and preserves completed responses. An interrupted, invalid, or failed attempt remains `uncertain` and is not resent automatically, because the API may already have processed it. Successful attempts record model, HTTP status, timestamps, latency, and token usage; aggregate statistics report cost as unavailable unless a versioned pricing basis is supplied. A different preview requires a different output directory. Request limits still apply to the full preview. The checkpoint lock prevents concurrent CLI writers to the same output directory.
+
+Open `docs/index.html` from a local static server, then choose `inventory.json`, `candidates.json`, and `relations.json` from the same run. An optional `review.json` can also be loaded. The viewer reads files selected by the browser only: it does not upload them, fetch a repository, or call Jev. Human dispositions remain browser-local until **Export review.json** downloads a private ledger; pass that file back to `jg plan --review PATH`. It keeps incomplete inventories and candidate pairs without a loaded judgment visibly unresolved.
+
+The viewer has separate **Connected components**, **Candidate relationships**, and **Jev judgments** views. Each view has record pagination, and the graph has its own page controls; a graph page is a presentation slice, not a data limit. The coverage strip reports loaded candidates, judged records, and the authoritative pending-request count from a batch aggregate when available. Candidate discovery before the configured candidate limit is shown separately.
+
+```bash
+cd docs
+python3 -m http.server 8765 --bind 127.0.0.1
+```
+
+Visit `http://127.0.0.1:8765` and use the artifact selectors. Port 8765 avoids the workspace's existing Surface UI service on port 8000. Inventory is useful on its own; candidate, relation, and review files can be added later. The grouped canvas overview and the virtualized explorer remain bounded when a run has thousands of objects. The focused inspector joins branch endpoints by immutable tip SHA and joins Jev responses by candidate ID.
+
+The v3 question contract asks independent, criteria-backed judgments for evidence sufficiency, same intent, partial overlap, both dependency directions, and both supersession directions. These probabilities are review signals, never cleanup permission. The implementation plan and calibration gate are recorded in [docs/2026-09-21-jev-quality-review-ledger-plan.md](docs/2026-09-21-jev-quality-review-ledger-plan.md).
+
+Before a wider v3 run, create a small owner-labeled `relationship-labels` artifact and score it locally. This command performs no network access:
+
+```bash
+PYTHONPATH=src python3 -m jev_git_graph calibrate \
+  --repo /path/to/repo \
+  --labels /private/artifacts/labels.json \
+  --relations /private/artifacts/relations.json \
+  --out /private/artifacts/calibration
+```
+
+For the browser-independent normalization checks, run:
+
+```bash
+node --test tests/test_viewer_data.mjs
+```
 
 ## Design principles
 

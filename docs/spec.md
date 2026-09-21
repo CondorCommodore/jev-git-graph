@@ -168,3 +168,58 @@ Success for a real repo is measurable: the canonical checkout is clean and curre
 - [s1s](https://github.com/cpaczek/s1s) demonstrates a local reference graph and bounded, evidence-backed Jev judgments.
 - [neo4jev](https://github.com/jexp/neo4jev) demonstrates graph navigation over supplied candidate relationships.
 - [TypeSafe agent skills](https://github.com/typesafe-ai/skills) documents typed System One question design.
+
+## 12. Addendum — From relationships to decisions and a clean worktree
+
+Added 2026-09-21.
+
+The end-to-end workflow is **inventory → Git evidence → Jev relationships → human decisions → preservation → cleanup → verification**. This addendum expands the processing flow in §5; it does not expand the first-version mutation authority defined in §3.
+
+The outcome remains the definition in §1: the canonical checkout is on the intended default branch with no uncommitted changes, and every remaining branch, worktree, and stash has a recorded disposition. Keeping active branches is compatible with being clean.
+
+### Workflow and evidence gates
+
+| Stage | Action | Evidence required to advance | Existing specification |
+| --- | --- | --- | --- |
+| 1. Establish the baseline | Refresh refs, branch tips, linked worktrees, staged and unstaged changes, untracked files, and stashes. Write a new inventory outside the repository. | Complete inventory with collection errors resolved. Incomplete snapshots remain exploratory. | §5.1, §7 |
+| 2. Establish exact relationships | Check ancestry, identical tips, unique commits, and patch equivalence. Identify branches already represented in the intended destination. | Recorded Git evidence for each pair; outstanding unique work remains visible. | §4, §5.2 |
+| 3. Find ambiguous relationships | Generate candidates from overlapping paths, subjects, patch IDs, and supplied task or PR identifiers. Track omitted pairs. | Candidate reasons and coverage limits. Missing connections never imply independence. | §5.3 |
+| 4. Use Jev | Preview a bounded batch using the approved evidence profile. Ask about intent, overlap, dependencies, supersession, and evidence sufficiency. Check a small owner-labeled sample before expanding. | Valid responses tied to immutable tips and versioned questions; uncertain or conflicting answers remain unresolved. | §5.4, §6, §8 |
+| 5. Review connected work | Inspect each group, including what each branch uniquely contributes and its attached worktrees. A group may contain several useful branches. | Proposed preservation destinations and explanations for remaining uncertainty. | §5.5–6 |
+| 6. Record decisions | Assign each object a disposition in `review.json`; export it and generate the review plan. | Human decision, rationale, reviewer identity, timestamp, exact tips or fingerprints, and preservation destination where needed. | §4 |
+| 7. Preserve work | Carry out the approved preservation: retain active branches, prepare PRs, consolidate selected changes, or create verified archives. Preserve dirty changes and stashes too. | The destination actually contains the work; relevant checks pass; recovery is possible. | §2, §5.6 |
+| 8. Recheck and clean up | Refresh affected refs and dirty state. Execute only specifically approved removals after preservation is verified. | Targets still match reviewed inputs; changed items return to review. | §5.7, §9.6 |
+| 9. Verify the outcome | Put the canonical checkout on the intended default branch after its changes are preserved. Repeat inventory and reconcile it with the decisions. | Clean status, accounted-for remaining objects, no lost unique work, and explicit unresolved items. | §1, §8 |
+
+### Decisions and follow-through
+
+| Disposition | Meaning and required follow-through |
+| --- | --- |
+| `ACTIVE` | Retain the work and identify its owner and next task. |
+| `PRESERVE_IN_PR` | Prepare or verify the PR and its branch. A PR proposal alone does not prove the work landed. |
+| `PRESERVE_IN_BRANCH` | Retain a named destination branch and verify the required work is there. |
+| `PRESERVE_IN_ARCHIVE` | Create a durable archive and verify recovery before removing the original. |
+| `CLEANUP_CANDIDATE` | Review the preservation proof and approve the exact removal. The disposition itself grants no permission to delete. |
+| `UNRESOLVED` | Retain the work and state what evidence or decision is missing. |
+
+Jev is most useful at stages 4–5: explaining relationships that ancestry cannot settle and directing attention toward likely duplicates or successors. A high supersession probability still leaves the practical question: **where are this branch's unique changes preserved?**
+
+### Execution boundary and implementation gaps
+
+The first version ends at a reviewed plan. As specified in §3, it excludes commits, merges, branch deletion, worktree removal, and stash dropping. Stages 7–9 require a separately authorized execution workflow. The current CLI must not be described as an automatic cleanup tool. Local evidence also does not establish that a checkout is current with a Git remote; that claim requires a separately authorized remote check.
+
+At the time of this addendum, the review implementation records dispositions, rationale, timestamps, and fingerprints, but does not yet enforce all reviewer identity, preservation destination, and preservation proof requirements above. Those gaps must be addressed before an execution handoff relies on the ledger.
+
+Inventory-digest checks can reject an older exported review outright. Carrying unchanged decisions into a refreshed inventory therefore needs deliberate reconciliation: retain the prior decision's provenance, verify the reviewed object inputs, and invalidate changed inputs rather than silently treating all old decisions as current.
+
+### Pilot order and completion
+
+For a busy repository such as the Home Lab pilot:
+
+1. Obtain a complete fresh inventory.
+2. Review integrated branches and identical-tip aliases first.
+3. Use a calibrated Jev batch for ambiguous groups containing unique work.
+4. Record destinations and decisions, then preserve the canonical checkout's uncommitted work through the separately authorized workflow.
+5. Execute approved cleanup in small batches and resnapshot after each.
+
+Finishing every pending Jev request is not a prerequisite for progress. The canonical checkout can be cleaned and straightforward branches closed while explicitly unresolved work is retained. Completion means a clean canonical checkout and a disposition for every remaining object, including documented unresolved items; it does not mean deleting every branch or forcing every relationship to a confident answer.
