@@ -237,6 +237,7 @@
   function reviewStatus(item) {
     const identity = reviewIdentity(item); if (!identity) return "none";
     const prior = state.reviews.get(identity.id); if (!prior) return "none";
+    if (prior.reconciliation?.status === "unreviewed") return "unreviewed";
     if (prior.reconciliation?.status === "stale" || prior.reconciliation?.status === "historical-limited") return "stale";
     if (prior.reconciliation?.status === "current") return "current";
     if (typeof prior.source_fingerprint === "string" && typeof prior.fingerprint === "string" && prior.source_fingerprint === prior.fingerprint) return "current";
@@ -256,10 +257,11 @@
   function renderReviewEditor(item) {
     const identity = reviewIdentity(item); if (!identity) return;
     const prior = state.reviews.get(identity.id);
-    const current = prior && stable(prior.observed) === stable(identity.observed);
+    const status = reviewStatus(item);
+    const current = status === "current";
     const editor = node("div", "review-editor");
     editor.append(node("span", "inspector-label", "HUMAN DISPOSITION"));
-    if (prior) editor.append(node("div", "conclusion", current ? `Current review · ${prior.reviewed_at}` : "Stale review · object inputs changed; save a new decision."));
+    if (prior) editor.append(node("div", "conclusion", current ? `Current review · ${prior.reviewed_at}` : status === "unreviewed" ? "Unreviewed snapshot · record a human disposition." : "Stale review · object inputs changed; save a new decision."));
     const select = document.createElement("select"); dispositions.forEach((value) => { const option = node("option", "", value); option.value = value; select.append(option); }); select.value = current ? prior.disposition : "UNRESOLVED";
     const rationale = document.createElement("textarea"); rationale.placeholder = "Required rationale"; rationale.value = current ? prior.rationale : "";
     const save = node("button", "quiet-button", "Save browser-local decision"); save.type = "button";
