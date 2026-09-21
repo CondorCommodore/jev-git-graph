@@ -66,6 +66,21 @@ class PreservationPlanTests(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "duplicate preservation object"):
             build_preservation_plan(inventory, candidates, relations)
 
+    def test_missing_identity_unknown_decision_and_malformed_candidate_fail_closed(self):
+        inventory, candidates, relations = fixture()
+        missing = copy.deepcopy(inventory)
+        missing["branches"][1].pop("name")
+        with self.assertRaisesRegex(Exception, "identity"):
+            build_preservation_plan(missing, candidates, relations)
+
+        with self.assertRaisesRegex(Exception, "unknown object"):
+            build_preservation_plan(inventory, candidates, relations, {"decisions": [{"object_id": "branch:missing", "disposition": "UNRESOLVED"}]})
+
+        malformed = copy.deepcopy(candidates)
+        malformed["candidates"][0]["endpoints"] = []
+        with self.assertRaisesRegex(Exception, "endpoints"):
+            build_preservation_plan(inventory, malformed, relations)
+
 
 if __name__ == "__main__":
     unittest.main()

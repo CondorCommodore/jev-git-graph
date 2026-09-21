@@ -24,6 +24,13 @@ def _object_index(inventory: dict[str, Any]) -> dict[str, tuple[str, dict[str, A
         for item in _require_list(inventory.get({"branch": "branches", "worktree": "worktrees", "stash": "stashes"}[kind]), f"inventory {kind}s"):
             if not isinstance(item, dict):
                 raise JgError(f"inventory {kind} record must be an object")
+            required = {
+                "branch": ("name", "tip"),
+                "worktree": ("path_id", "head"),
+                "stash": ("reference", "sha"),
+            }[kind]
+            if any(not isinstance(item.get(field), str) or not item[field] for field in required):
+                raise JgError(f"inventory {kind} record lacks identity fields")
             key = object_id(kind, item)
             if key in objects:
                 raise JgError(f"duplicate preservation object: {key}")
@@ -96,6 +103,8 @@ def build_preservation_plan(
                 raise JgError("review decision lacks object_id")
             if decision["object_id"] in decisions:
                 raise JgError(f"duplicate review decision: {decision['object_id']}")
+            if decision["object_id"] not in objects:
+                raise JgError(f"review decision references unknown object: {decision['object_id']}")
             if decision.get("disposition") not in DISPOSITIONS:
                 raise JgError(f"unsupported review disposition: {decision.get('disposition')}")
             decisions[decision["object_id"]] = decision
@@ -120,8 +129,16 @@ def build_preservation_plan(
             suggestions.append(_suggestion("STASH_REVIEW", "stash is retained until a preservation destination is verified"))
 
         for candidate in candidate_list:
+            if not isinstance(candidate, dict):
+                raise JgError("candidate record must be an object")
             endpoints = candidate.get("endpoints", {})
-            endpoint_ids = {object_id("branch", {"name": endpoint.get("branch"), "tip": endpoint.get("tip")}) for endpoint in endpoints.values() if isinstance(endpoint, dict)}
+            if not isinstance(endpoints, dict):
+                raise JgError("candidate endpoints must be an object")
+            endpoint_ids: set[str] = set()
+            for endpoint in endpoints.values():
+                if not isinstance(endpoint, dict) or not isinstance(endpoint.get("branch"), str) or not endpoint["branch"] or not isinstance(endpoint.get("tip"), str) or not endpoint["tip"]:
+                    raise JgError("candidate endpoint lacks branch or tip identity")
+                endpoint_ids.add(object_id("branch", {"name": endpoint["branch"], "tip": endpoint["tip"]}))
             if key not in endpoint_ids:
                 continue
             evidence = candidate.get("evidence", {})
