@@ -400,14 +400,19 @@ def validate_relations(
         elif supplied_candidate_digest != digest(candidates):
             raise JgError("relations were built from a different candidate artifact")
         supplied_inventory_digest = relations.get("inventory_digest")
-        if supplied_inventory_digest is not None and supplied_inventory_digest != digest(inventory):
-            raise JgError("relations were built from a different inventory")
+        if supplied_inventory_digest is not None:
+            if inventory is None:
+                limitations.append("relations_inventory_provenance_unavailable")
+            elif supplied_inventory_digest != digest(inventory):
+                raise JgError("relations were built from a different inventory")
         candidate_by_id = {
             candidate["id"]: candidate for candidate in candidates.get("candidates", [])
         }
     else:
         candidate_by_id = {}
         limitations.append("relation_candidate_provenance_unavailable")
+        if inventory is None:
+            limitations.append("relations_inventory_provenance_unavailable")
 
     root_question_version = relations.get("question_version")
     if root_question_version is None and records:

@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from jev_git_graph.artifacts import candidate_content_digest, validate_artifacts, validate_inventory, validate_relation_response
+from jev_git_graph.artifacts import candidate_content_digest, validate_artifacts, validate_inventory, validate_relation_response, validate_relations
 from jev_git_graph.errors import JgError
 from jev_git_graph.plan import build_plan
 from jev_git_graph.questions import QUESTION_IDS, QUESTION_VERSION
@@ -56,6 +56,12 @@ def make_artifacts() -> tuple[dict, dict, dict]:
 
 
 class ArtifactValidationTests(unittest.TestCase):
+    def test_relations_without_inventory_record_unavailable_inventory_provenance(self):
+        inventory, candidates, relations = make_artifacts()
+        relations["inventory_digest"] = digest(inventory)
+        result = validate_relations(relations, candidates, None)
+        self.assertIn("relations_inventory_provenance_unavailable", result["limitations"])
+
     def test_inventory_rejects_malformed_worktrees_stashes_and_duplicate_identities(self):
         inventory, _candidates, _relations = make_artifacts()
         inventory["worktrees"] = [None]
