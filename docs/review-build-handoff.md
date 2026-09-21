@@ -80,8 +80,12 @@ Observed result: `16` tests passed, `0` failed.
 PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-Observed result: `53` tests passed, `0` failed in `30.882s`. No package
+Observed result: `54` tests passed, `0` failed in `29.823s`. No package
 installation, live Jev request, or network access was required.
+
+The final adversarial plan test also confirms that a valid-looking but incorrect
+64-hex preservation destination fingerprint becomes `UNRESOLVED`/stale rather
+than an executable preservation disposition.
 
 ## Limitations
 
