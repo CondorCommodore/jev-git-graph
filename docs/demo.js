@@ -67,7 +67,7 @@
         state.filter === "reviewed" ? reviewStatus(item) === "current" :
         state.filter === "stale-review" ? reviewStatus(item) === "stale" :
         state.filter === "unresolved" ? item.kind === "candidate" && !item.resolved : item.kind === state.filter);
-      const groupMatch = !state.group || item.group === state.group;
+      const groupMatch = !state.group || item.groupKey === state.group;
       const textMatch = !term || item.searchable.includes(term) || item.title.toLowerCase().includes(term);
       return kindMatch && groupMatch && textMatch;
     }).sort((a, b) => a.kind.localeCompare(b.kind) || a.title.localeCompare(b.title));
@@ -344,7 +344,7 @@
       const column = index % columns; const row = Math.floor(index / columns); const x = gapX * (column + 1); const y = gapY * (row + 1) + 15; const radius = Math.max(18, Math.min(54, 13 + Math.sqrt(group.count) * 2.1));
       context.beginPath(); context.fillStyle = "rgba(139,230,197,.14)"; context.strokeStyle = "#8be6c5"; context.lineWidth = 1.5; context.arc(x, y, radius, 0, Math.PI * 2); context.fill(); context.stroke();
       context.fillStyle = "#f3f5f8"; context.font = "700 11px system-ui"; context.textAlign = "center"; context.fillText(truncate(group.name, 18), x, y - 2); context.fillStyle = "#91a0b4"; context.font = "600 10px system-ui"; context.fillText(plural(group.count, "branch"), x, y + 14); context.textAlign = "start";
-      state.graphTargets.push({ type: "group", group: group.name, x, y, radius });
+      state.graphTargets.push({ type: "group", group: group.key, x, y, radius });
     });
     elements.graphCount.textContent = `${plural(state.model.counts.objects, "object")} · ${plural(state.model.groups.length, "group")} · graph page ${graph.page.length} of ${graph.items.length}`;
   }

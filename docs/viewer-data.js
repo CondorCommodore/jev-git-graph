@@ -26,8 +26,8 @@
     if (kind === "candidates" && !Array.isArray(value.candidates)) return ["candidates.json is missing candidates[]."];
     if (kind === "relations" && !Array.isArray(value.relations)) return ["relations.json is missing relations[]."];
     if (kind === "review") {
-      if (value.kind !== "relationship-review" || value.schema_version !== 1 || !Array.isArray(value.decisions)) return ["review.json has an unsupported schema or is missing decisions[]."];
-      if (value.decisions.some((decision) => !decision || typeof decision.object_id !== "string" || typeof decision.fingerprint !== "string" || typeof decision.rationale !== "string" || typeof decision.reviewed_at !== "string")) return ["review.json contains an invalid decision."];
+      if (value.kind !== "relationship-review" || ![1, 2].includes(value.schema_version) || !Array.isArray(value.decisions)) return ["review.json has an unsupported schema or is missing decisions[]."];
+      if (value.decisions.some((decision) => !decision || typeof decision.object_id !== "string" || typeof decision.rationale !== "string" || typeof decision.disposition !== "string" || (typeof decision.fingerprint !== "string" && typeof decision.source_fingerprint !== "string"))) return ["review.json contains an invalid decision."];
     }
     return [];
   }
@@ -176,7 +176,7 @@
     }
     for (const candidate of candidates) {
       const dimensionValues = Object.entries(candidate.answer?.dimensions || {}).filter(([key, value]) => key !== "evidence_sufficient" && typeof value === "number").map(([, value]) => value);
-      const v3Resolved = candidate.answer?.evidenceSufficient >= .75 && (dimensionValues.some((value) => value >= .75) || (dimensionValues.length && dimensionValues.every((value) => value <= .25)));
+      const v3Resolved = candidate.answer?.evidenceSufficient >= .75 && dimensionValues.some((value) => value >= .75);
       const jevResolved = Boolean(v3Resolved || (candidate.answer?.evidenceSufficient == null && candidate.answer?.choice && !["UNKNOWN", "INSUFFICIENT_EVIDENCE"].includes(candidate.answer.choice)));
       candidate.resolved = Boolean(candidate.aNode && candidate.bNode && (candidate.factResolved || jevResolved));
       candidate.resolutionKind = candidate.factResolved ? "git_fact" : jevResolved ? "jev" : "unresolved";
@@ -194,10 +194,11 @@
     const groups = [];
     for (const members of components.values()) {
       const name = members.length > 1 ? `Connected group ${++componentNumber}` : "No loaded connection";
-      for (const member of members) member.group = name;
-      const existing = groups.find((group) => group.name === name);
+      const key = members.length > 1 ? name : `singleton:${members[0].id}`;
+      for (const member of members) { member.group = name; member.groupKey = key; }
+      const existing = groups.find((group) => group.key === key);
       if (existing) existing.count += members.length;
-      else groups.push({ name, count: members.length });
+      else groups.push({ key, name, count: members.length });
     }
     groups.sort((a, b) => b.count - a.count);
     const unresolved = candidates.filter((candidate) => !candidate.resolved).length;

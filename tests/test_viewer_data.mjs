@@ -144,7 +144,34 @@ test("v3 judgment history supersedes v2 without duplicate quarantine", () => {
   const model = viewer.normalize({ inventory, candidates, relations: history });
   assert.equal(model.counts.evaluated, 1);
   assert.equal(model.candidates[0].relation.question_version, "branch-relationship-v3");
-  assert.equal(model.counts.unresolved, 0);
+  assert.equal(model.counts.unresolved, 1);
+});
+
+test("v3 evidence with no positive relationship dimension stays unresolved", () => {
+  const inconclusive = { repository_id: "repo-local-id", relations: [{
+    candidate_id: "pair-1", judgment_id: "judgment-v3", question_version: "branch-relationship-v3",
+    response: { answers: Object.fromEntries(["evidence_sufficient", "same_intent", "partial_overlap", "a_depends_on_b", "b_depends_on_a", "a_supersedes_b", "b_supersedes_a"].map((key) => [key, { noul: key === "evidence_sufficient" ? .9 : .1 }])) },
+  }] };
+  const model = viewer.normalize({ inventory, candidates, relations: inconclusive });
+  assert.equal(model.counts.evaluated, 1);
+  assert.equal(model.counts.unresolved, 1);
+  assert.equal(model.candidates[0].resolved, false);
+  assert.equal(model.candidates[0].answer.choice, "MULTIDIMENSIONAL");
+});
+
+test("singleton components retain distinct group keys", () => {
+  const model = viewer.normalize({ inventory, candidates });
+  const branchGroups = model.objects.filter((item) => item.kind === "branch");
+  assert.notEqual(branchGroups[0].groupKey, branchGroups[1].groupKey);
+  assert.equal(model.groups.filter((group) => group.name === "No loaded connection").length, 2);
+});
+
+test("accepts schema v2 review artifacts with provenance fields", () => {
+  assert.deepEqual(viewer.validate("review", {
+    kind: "relationship-review", schema_version: 2, repository_id: "repo-local-id",
+    provenance: { inventory_digest: "i", candidate_digest: "c" },
+    decisions: [{ object_id: "branch:feature/alpha", kind: "branch", source_fingerprint: "f", disposition: "ACTIVE", rationale: "keep", reviewed_at: "2026-09-20T00:00:00Z" }],
+  }), []);
 });
 
 test("rejects a relation artifact produced from different candidate content", () => {
