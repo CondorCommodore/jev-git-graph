@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import shutil
 import socket
 import struct
@@ -232,7 +233,7 @@ class CdpWebSocket:
         parsed = urlparse(url)
         if parsed.scheme != "ws" or parsed.hostname != "127.0.0.1" or parsed.port is None:
             raise AssertionError(f"browser probe received a non-loopback DevTools URL: {url}")
-        self.socket = socket.create_connection((parsed.hostname, parsed.port), timeout=5)
+        self.socket = socket.create_connection((parsed.hostname, parsed.port), timeout=30)
         key = __import__("base64").b64encode(os.urandom(16)).decode("ascii")
         self.socket.sendall(
             (
@@ -260,18 +261,20 @@ class CdpWebSocket:
             value += chunk
         return value
 
-    def _send(self, payload: dict) -> None:
-        raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    def _send_frame(self, opcode: int, raw: bytes) -> None:
         mask = os.urandom(4)
         masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(raw))
         length = len(masked)
         if length < 126:
-            header = bytes((0x81, 0x80 | length))
+            header = bytes((0x80 | opcode, 0x80 | length))
         elif length < 65536:
-            header = bytes((0x81, 0xFE)) + struct.pack(">H", length)
+            header = bytes((0x80 | opcode, 0xFE)) + struct.pack(">H", length)
         else:
-            header = bytes((0x81, 0xFF)) + struct.pack(">Q", length)
+            header = bytes((0x80 | opcode, 0xFF)) + struct.pack(">Q", length)
         self.socket.sendall(header + mask + masked)
+
+    def _send(self, payload: dict) -> None:
+        self._send_frame(1, json.dumps(payload, separators=(",", ":")).encode("utf-8"))
 
     def _receive(self) -> tuple[int, bytes]:
         first, second = self._read_exact(2)
@@ -296,7 +299,7 @@ class CdpWebSocket:
         while True:
             opcode, raw = self._receive()
             if opcode == 9:
-                self._send({"id": 0, "method": "", "params": {}})
+                self._send_frame(10, raw)
                 continue
             if opcode == 8:
                 raise AssertionError("browser DevTools WebSocket closed while awaiting a command")
@@ -319,96 +322,92 @@ def local_json(url: str) -> dict | list:
         return json.loads(response.read().decode("utf-8"))
 
 
-def run_browser_probe(browser: Path, inventory: dict, candidates: dict, relations: dict, output: Path) -> str:
-    """Run a real local Chrome DOM probe over the same 3,000-record artifacts."""
+def run_browser_probe(
+    browser: Path,
+    inventory: dict,
+    candidates: dict,
+    relations: dict,
+    review_path: Path,
+    output: Path,
+) -> tuple[str, Path]:
+    """Exercise the production docs/index.html UI through local Chrome CDP."""
 
     browser_dir = output / "browser"
     browser_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    html_path = browser_dir / "l6-browser-fixture.html"
-    payload = json.dumps(
-        {"inventory": inventory, "candidates": candidates, "relations": relations},
-        ensure_ascii=True,
-        separators=(",", ":"),
-    ).replace("<", "\\u003c")
-    viewer_script = (Path(__file__).parents[1] / "docs" / "viewer-data.js").resolve().as_uri()
-    html_path.write_text(
-        f"""<!doctype html>
-<html><head><meta charset="utf-8"><script src={json.dumps(viewer_script)}></script></head>
-<body>
-<div id="candidate-count"></div>
-<div id="page-status"></div>
-<div id="page-one"></div>
-<div id="page-thirty"></div>
-<div id="component-status"></div>
-<script id="artifacts" type="application/json">{payload}</script>
-<script>
-(function () {{
-  const root = document.documentElement;
-  try {{
-    const artifacts = JSON.parse(document.getElementById("artifacts").textContent);
-    const model = globalThis.JevGraphData.normalize(artifacts);
-    const pageSize = 100;
-    const pageCount = Math.ceil(model.candidates.length / pageSize);
-    const page = (number) => model.candidates.slice((number - 1) * pageSize, number * pageSize);
-    const first = page(1);
-    const last = page(pageCount);
-    const connectedGroups = model.groups.filter((group) => group.count > 1);
-    const pageOneText = `Page 1 of ${{pageCount}}: ${{first[0].candidateId}} → ${{first.at(-1).candidateId}}`;
-    const pageThirtyText = `Page ${{pageCount}} of ${{pageCount}}: ${{last[0].candidateId}} → ${{last.at(-1).candidateId}}`;
-    document.getElementById("candidate-count").textContent = `Candidates: ${{model.counts.candidates}}`;
-    document.getElementById("page-status").textContent = `${{pageOneText}}; ${{pageThirtyText}}`;
-    document.getElementById("page-one").innerHTML = `<ol>${{first.map((item) => `<li>${{item.candidateId}}</li>`).join("")}}</ol>`;
-    document.getElementById("page-thirty").innerHTML = `<ol>${{last.map((item) => `<li>${{item.candidateId}}</li>`).join("")}}</ol>`;
-    document.getElementById("component-status").textContent = `Disconnected groups: ${{model.groups.length}}; connected groups: ${{connectedGroups.length}}`;
-    root.dataset.l6Status = model.errors.length === 0 && model.counts.candidates === 3000 && pageCount === 30 && first[0].candidateId === "fact-0000" && last.at(-1).candidateId === "unresolved-0999" && connectedGroups.length >= 2 ? "PASS" : "FAIL";
-    root.dataset.candidateCount = String(model.counts.candidates);
-    root.dataset.pageOne = first[0].candidateId;
-    root.dataset.pageThirty = last.at(-1).candidateId;
-    root.dataset.connectedGroups = String(connectedGroups.length);
-  }} catch (error) {{
-    root.dataset.l6Status = "FAIL";
-    root.dataset.l6Error = String(error);
-  }}
-}})();
-</script>
-</body></html>
-""",
-        encoding="utf-8",
-    )
+    download_dir = browser_dir / "downloads"
+    download_dir.mkdir(mode=0o700, exist_ok=True)
+    downloaded_review = download_dir / "review.json"
+    if downloaded_review.exists():
+        downloaded_review.unlink()
+
     port_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     port_socket.bind(("127.0.0.1", 0))
     port = port_socket.getsockname()[1]
     port_socket.close()
     profile = browser_dir / "profile"
+    docs_index = (Path(__file__).parents[1] / "docs" / "index.html").resolve().as_uri()
     command = (
-        "open",
-        "-na",
-        "Google Chrome" if "Google Chrome" in str(browser) else "Chromium",
-        "--args",
+        str(browser),
         "--headless",
         "--no-sandbox",
-        "--no-startup-window",
-        f"--remote-debugging-port={port}",
-        "--remote-debugging-address=127.0.0.1",
-        f"--user-data-dir={profile}",
-        "--disable-gpu",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--enable-unsafe-swiftshader",
+        "--disable-features=PaintHolding,MediaRouter,Translate,OptimizationHints",
+        "--enable-features=CDPScreenshotNewSurface",
+        "--disable-hang-monitor",
+        "--disable-ipc-flooding-protection",
+        "--disable-renderer-backgrounding",
         "--disable-dev-shm-usage",
-        "--allow-file-access-from-files",
         "--disable-background-networking",
         "--disable-component-update",
         "--disable-sync",
         "--disable-extensions",
         "--disable-breakpad",
         "--disable-crash-reporter",
-        "--no-first-run",
-        "--no-default-browser-check",
         "--no-proxy-server",
+        f"--remote-debugging-port={port}",
+        "--remote-debugging-address=127.0.0.1",
+        f"--user-data-dir={profile}",
+        "about:blank",
     )
     launcher = None
     browser_socket = None
     page_socket = None
+    dom = ""
+
+    def evaluate(expression: str) -> object:
+        result = page_socket.command("Runtime.evaluate", {"expression": expression, "returnByValue": True})
+        return result["result"]["result"].get("value")
+
+    def wait_for(expression: str, predicate, label: str, timeout: float = 45):
+        deadline = time.monotonic() + timeout
+        last = None
+        while time.monotonic() < deadline:
+            last = evaluate(expression)
+            if predicate(last):
+                return last
+            time.sleep(0.1)
+        raise AssertionError(f"production docs UI did not reach {label}; last value: {last!r}")
+
+    def set_file_input(input_id: str, path: Path) -> None:
+        document = page_socket.command("DOM.getDocument")
+        node_id = page_socket.command(
+            "DOM.querySelector",
+            {"nodeId": document["result"]["root"]["nodeId"], "selector": f"#{input_id}"},
+        )["result"]["nodeId"]
+        if not node_id:
+            raise AssertionError(f"production docs UI did not expose #{input_id}")
+        page_socket.command("DOM.setFileInputFiles", {"nodeId": node_id, "files": [str(path.resolve())]})
+
     try:
-        launcher = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        launcher = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
         version_url = f"http://127.0.0.1:{port}/json/version"
         deadline = time.monotonic() + 20
         version = None
@@ -420,7 +419,8 @@ def run_browser_probe(browser: Path, inventory: dict, candidates: dict, relation
                 time.sleep(0.1)
         if not isinstance(version, dict) or not isinstance(version.get("webSocketDebuggerUrl"), str):
             stderr = launcher.stderr.read() if launcher.stderr else ""
-            raise AssertionError(f"installed Chrome/Chromium browser probe did not start on loopback: {browser}\n{stderr[-4000:]}")
+            raise AssertionError(f"installed browser did not start on loopback: {browser}\n{stderr[-4000:]}")
+
         browser_socket = CdpWebSocket(version["webSocketDebuggerUrl"])
         created = browser_socket.command("Target.createTarget", {"url": "about:blank"})
         target_id = created["result"]["targetId"]
@@ -433,62 +433,101 @@ def run_browser_probe(browser: Path, inventory: dict, candidates: dict, relation
                 break
             time.sleep(0.1)
         if not target or not isinstance(target.get("webSocketDebuggerUrl"), str):
-            raise AssertionError("installed Chrome/Chromium browser probe did not expose its local page target")
+            raise AssertionError("installed browser did not expose its local page target")
         page_socket = CdpWebSocket(target["webSocketDebuggerUrl"])
-        page_socket.command("Page.navigate", {"url": html_path.resolve().as_uri()})
-        dom = ""
+        page_socket.socket.settimeout(30)
+        page_socket.command("DOM.enable")
+        page_socket.command("Page.setDownloadBehavior", {"behavior": "allow", "downloadPath": str(download_dir.resolve())})
+        page_socket.command("Page.navigate", {"url": docs_index})
+        wait_for(
+            "document.readyState",
+            lambda value: value == "complete",
+            "docs/index.html to finish loading",
+        )
+
+        for input_id, path in (
+            ("inventory-file", output / "viewer" / "inventory.json"),
+            ("candidates-file", output / "viewer" / "candidates.json"),
+            ("relations-file", output / "viewer" / "relations.json"),
+            ("review-file", review_path),
+        ):
+            set_file_input(input_id, path)
+
+        wait_for(
+            "JSON.stringify({object:document.querySelector('#object-count').textContent,candidates:document.querySelector('#candidate-count').textContent,evaluated:document.querySelector('#evaluated-count').textContent,load:document.querySelector('#load-status').textContent})",
+            lambda value: isinstance(value, str) and '"candidates":"3,000"' in value and '"object":"' in value,
+            "production counts after loading all artifacts",
+        )
+        review_state = wait_for(
+            "JSON.stringify({load:document.querySelector('#load-status').textContent,review:document.querySelector('#review-file-name').textContent})",
+            lambda value: isinstance(value, str) and "review.json" in value and "review" in value.lower(),
+            "production review input to load",
+        )
+        if "review.json" not in str(review_state):
+            raise AssertionError(f"production docs UI did not report review.json loaded: {review_state}")
+
+        evaluate("document.querySelector('#candidates-view').click()")
+        page_one = wait_for(
+            "document.querySelector('#page-status').textContent",
+            lambda value: isinstance(value, str) and value.startswith("Page 1 of 30"),
+            "production candidate page 1 of 30",
+        )
+        for _ in range(29):
+            evaluate("document.querySelector('#page-next').click()")
+        page_thirty = wait_for(
+            "document.querySelector('#page-status').textContent",
+            lambda value: isinstance(value, str) and value.startswith("Page 30 of 30"),
+            "production candidate page 30 of 30",
+        )
+        graph_state = evaluate("document.querySelector('#graph-count').textContent")
+        if not isinstance(graph_state, str) or "3000" not in graph_state:
+            raise AssertionError(f"production graph count did not show all candidates: {graph_state!r}")
+
+        evaluate("document.querySelector('#export-review').click()")
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
-            evaluated = page_socket.command(
-                "Runtime.evaluate",
-                {"expression": "document.documentElement.outerHTML", "returnByValue": True},
-            )
-            dom = evaluated["result"]["result"].get("value", "")
-            if 'data-l6-status="PASS"' in dom or 'data-l6-status="FAIL"' in dom:
+            if downloaded_review.is_file() and downloaded_review.stat().st_size > 0:
                 break
             time.sleep(0.1)
+        if not downloaded_review.is_file() or downloaded_review.stat().st_size == 0:
+            raise AssertionError("production #export-review did not produce downloads/review.json")
+        exported = json.loads(downloaded_review.read_text(encoding="utf-8"))
+        if exported.get("kind") != "relationship-review" or not isinstance(exported.get("decisions"), list):
+            raise AssertionError(f"production export was not a review document: {exported!r}")
+        return f"PASS ({browser}; production DOM; {page_one}; {page_thirty}; graph={graph_state})", downloaded_review
     except (OSError, KeyError, TypeError, ValueError, AssertionError) as exc:
-        raise AssertionError(f"installed Chrome/Chromium browser probe failed: {browser}: {exc}\nDOM tail:\n{dom[-4000:]}") from exc
+        raise AssertionError(f"installed browser production UI probe failed: {browser}: {exc}\nDOM tail:\n{dom[-4000:]}") from exc
     finally:
         if page_socket is not None:
+            try:
+                dom = evaluate("document.documentElement.outerHTML")
+            except Exception:
+                pass
             page_socket.close()
         if browser_socket is not None:
             try:
+                browser_socket.socket.settimeout(5)
                 browser_socket.command("Browser.close")
             except Exception:
                 pass
             browser_socket.close()
         if launcher is not None:
             try:
-                launcher.wait(timeout=5)
+                launcher.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                launcher.terminate()
-                launcher.wait(timeout=5)
+                try:
+                    os.killpg(launcher.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    launcher.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    launcher.poll()
             finally:
                 if launcher.stdout is not None:
                     launcher.stdout.close()
                 if launcher.stderr is not None:
                     launcher.stderr.close()
-    if 'data-l6-status="PASS"' not in dom:
-        raise AssertionError(
-            f"installed Chrome/Chromium browser probe reported FAIL: {browser}\nDOM tail:\n{dom[-4000:]}"
-        )
-    attributes = {}
-    for name in ("data-candidate-count", "data-page-one", "data-page-thirty", "data-connected-groups"):
-        match = re.search(rf'{name}="([^"]+)"', dom)
-        if match is None:
-            raise AssertionError(f"installed Chrome/Chromium browser probe omitted DOM attribute: {name}")
-        attributes[name] = match.group(1)
-    if attributes != {
-        "data-candidate-count": "3000",
-        "data-page-one": "fact-0000",
-        "data-page-thirty": "unresolved-0999",
-        "data-connected-groups": attributes["data-connected-groups"],
-    } or int(attributes["data-connected-groups"]) < 2:
-        raise AssertionError(f"installed Chrome/Chromium browser probe returned unexpected DOM attributes: {attributes}")
-    if "Page 1 of 30" not in dom or "Page 30 of 30" not in dom or "Disconnected groups:" not in dom:
-        raise AssertionError("installed Chrome/Chromium browser probe did not render required DOM evidence")
-    return f"PASS ({browser})"
 
 
 class L6OfflineAcceptanceTests(unittest.TestCase):
@@ -559,13 +598,6 @@ class L6OfflineAcceptanceTests(unittest.TestCase):
             self.assertIn("first=fact-0000", probe.stdout)
             self.assertIn("last=unresolved-0999", probe.stdout)
 
-            browser = find_headless_browser()
-            if browser is None:
-                browser_evidence = "NOT RUN (no Chrome/Chromium binary installed)"
-            else:
-                browser_evidence = run_browser_probe(browser, inventory, candidates, relations, output)
-            print(f"L6 browser probe: {browser_evidence}")
-
             repository_id = inventory["repository"]["id"]
             target_branch = next(item for item in inventory["branches"] if item["name"] == "patch-source")
             source_provenance = {
@@ -616,6 +648,16 @@ class L6OfflineAcceptanceTests(unittest.TestCase):
             self.assertEqual(review, imported_review)
             self.assertEqual("PRESERVE_IN_BRANCH", imported_review["decisions"][0]["disposition"])
 
+            browser = find_headless_browser()
+            if browser is None:
+                browser_evidence = "NOT RUN (no Chrome/Chromium binary installed)"
+                browser_review_path = review_path
+            else:
+                browser_evidence, browser_review_path = run_browser_probe(
+                    browser, inventory, candidates, relations, review_path, output
+                )
+            print(f"L6 browser probe: {browser_evidence}")
+
             unchanged = reconcile_reviews(imported_review, inventory, candidates, relations)
             carried = next(item for item in unchanged["decisions"] if item["object_id"] == "branch:patch-source")
             self.assertEqual("current", carried["reconciliation"]["status"])
@@ -662,7 +704,7 @@ class L6OfflineAcceptanceTests(unittest.TestCase):
                     "--relations",
                     str(relations_path),
                     "--review",
-                    str(review_path),
+                    str(browser_review_path),
                     "--out",
                     str(cli_plan_dir),
                 ),
