@@ -1,3 +1,4 @@
+import copy
 import tempfile
 import unittest
 from pathlib import Path
@@ -53,6 +54,30 @@ class BatchTests(unittest.TestCase):
             self.assertEqual(1, overlapping["counts"]["succeeded"])
             self.assertEqual(1, len(overlapping["relations"]))
             self.assertEqual(1, len(overlapping["attempts"]))
+
+            manifest = read_json(target)
+            first_batch = manifest["batches"][0]
+            conflict_directory = root / "batches-conflict"
+            conflict_directory.mkdir(mode=0o700)
+            conflict_batch = conflict_directory / first_batch["directory"]
+            conflict_batch.mkdir(mode=0o700)
+            for filename in ("candidates.json", "jev-preview.json"):
+                write_json(conflict_batch / filename, read_json(root / "batches" / first_batch["directory"] / filename))
+            conflict_manifest = copy.deepcopy(manifest)
+            conflict_manifest["batches"] = [dict(first_batch, directory=first_batch["directory"])]
+            conflict_manifest_path = conflict_directory / "batches.json"
+            write_json(conflict_manifest_path, conflict_manifest)
+            conflicting_attempt = read_json(root / "batches/batch-0001/relations.json")
+            conflicting_attempt["attempts"][0]["status"] = "uncertain"
+            write_json(conflict_batch / "relations.json", conflicting_attempt)
+            with self.assertRaisesRegex(JgError, "conflicting duplicate request attempt"):
+                collect_batches([target, conflict_manifest_path], root / "candidates.json", root / "combined-conflict-status")
+
+            conflicting_response = read_json(root / "batches/batch-0001/relations.json")
+            conflicting_response["relations"][0]["response"] = {"answers": {"changed": True}}
+            write_json(conflict_batch / "relations.json", conflicting_response)
+            with self.assertRaisesRegex(JgError, "conflicting duplicate relation response"):
+                collect_batches([target, conflict_manifest_path], root / "candidates.json", root / "combined-conflict-response")
             with self.assertRaises(JgError):
                 prepare_batches(root / "candidates.json", root / "batches")
 

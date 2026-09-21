@@ -8,6 +8,15 @@ from .jev import JEV_MODEL, QUESTION_VERSION, build_preview, payload_for_candida
 from .safety import digest, read_json, write_json
 
 
+_TIMING_FIELDS = frozenset({
+    "started_at", "started_at_epoch_ms", "completed_at", "completed_at_epoch_ms", "latency_ms",
+})
+
+
+def _stable_record_digest(record):
+    return digest({key: value for key, value in record.items() if key not in _TIMING_FIELDS})
+
+
 def stratify_pending(candidates, previously_touched=()):
     """Favor untouched branch coverage, then round-robin evidence families."""
     touched = set(previously_touched)
@@ -108,7 +117,7 @@ def collect_batches(manifest_paths, candidates_path, output):
     seen = set()
     attempt_indexes = {}
     planned_requests = set()
-    seen_relations = set()
+    seen_relations = {}
     for manifest_value in manifest_paths:
         manifest_path = Path(manifest_value).resolve()
         manifest = read_json(manifest_path)
@@ -160,10 +169,8 @@ def collect_batches(manifest_paths, candidates_path, output):
                     raise JgError("duplicate or mismatched attempt in batch results")
                 if sha in seen:
                     prior = result["attempts"][attempt_indexes[sha]]
-                    if prior.get("status") != "succeeded" and attempt.get("status") == "succeeded":
-                        result["attempts"][attempt_indexes[sha]] = attempt
-                        successes.add(sha)
-                        successful_candidates.add(candidate_id)
+                    if _stable_record_digest(prior) != _stable_record_digest(attempt):
+                        raise JgError("conflicting duplicate request attempt")
                     continue
                 seen.add(sha)
                 attempt_indexes[sha] = len(result["attempts"])
@@ -179,12 +186,14 @@ def collect_batches(manifest_paths, candidates_path, output):
                 request_sha = relation.get("request_sha256") or judgment_id
                 relation_identity = request_sha or relation_id
                 if relation_identity in seen_relations:
+                    if _stable_record_digest(seen_relations[relation_identity]) != _stable_record_digest(relation):
+                        raise JgError("conflicting duplicate relation response")
                     continue
                 valid_success = judgment_id in successes if judgment_id else candidate_id in successful_candidates
                 if not valid_success or relation_id in response_ids:
                     raise JgError("response has no unique successful attempt")
                 response_ids.add(relation_id)
-                seen_relations.add(relation_identity)
+                seen_relations[relation_identity] = relation
                 result["relations"].append(relation)
             if len(response_ids) != len(successes):
                 raise JgError("successful attempt is missing its response")
