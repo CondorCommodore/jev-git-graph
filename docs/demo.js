@@ -4,7 +4,7 @@
 // or network client. JSON is read only from files chosen by the operator.
 (() => {
   const data = window.JevGraphData;
-  const state = { artifacts: {}, reviews: new Map(), fileErrors: [], model: data.normalize({}), filter: "all", viewMode: "components", query: "", group: null, selected: null, graphTargets: [], page: 0, graphPage: 0, pageSize: 100, graphPageSize: 24 };
+  const state = { artifacts: {}, reviews: new Map(), reviewSchemaVersion: null, fileErrors: [], model: data.normalize({}), filter: "all", viewMode: "components", query: "", group: null, selected: null, graphTargets: [], page: 0, graphPage: 0, pageSize: 100, graphPageSize: 24 };
   const $ = (selector) => document.querySelector(selector);
   const elements = {
     notices: $("#notices"), loadStatus: $("#load-status"), coverageCount: $("#coverage-count"), coverageDetail: $("#coverage-detail"), search: $("#search"), virtualList: $("#virtual-list"), visibleCount: $("#visible-count"), pagePrev: $("#page-prev"), pageNext: $("#page-next"), pageStatus: $("#page-status"), graph: $("#graph"), graphWrap: $("#graph-wrap"), graphEmpty: $("#graph-empty"), graphHint: $("#graph-hint"), graphCount: $("#graph-count"), graphPrev: $("#graph-prev"), graphNext: $("#graph-next"), graphPageStatus: $("#graph-page-status"), inspector: $("#inspector-content"), focusIndex: $("#focus-index"), overview: $("#overview-button"),
@@ -38,7 +38,10 @@
       if (problems.length) throw new Error(problems.join(" "));
       if (kind === "review" && state.artifacts.inventory?.repository?.id && document.repository_id !== state.artifacts.inventory.repository.id) throw new Error("review repository mismatch");
       state.artifacts[kind] = document;
-      if (kind === "review") state.reviews = new Map(document.decisions.map((decision) => [decision.object_id, decision]));
+      if (kind === "review") {
+        state.reviewSchemaVersion = document.schema_version;
+        state.reviews = new Map(document.decisions.map((decision) => [decision.object_id, decision]));
+      }
       $(`#${kind}-file-name`).textContent = file.name;
     } catch (error) {
       state.fileErrors.push(`${kind}.json: ${error instanceof SyntaxError ? "Invalid JSON; previous loaded file retained." : "Could not load this artifact; check its schema and file access."}`);
@@ -234,11 +237,27 @@
     if (item.stash) return { id: `stash:${item.stash.reference}:${item.stash.sha}`, kind: "stash", observed: { kind: "stash", reference: item.stash.reference, sha: item.stash.sha } };
     return null;
   }
+  const preservationDispositions = new Set(["PRESERVE_IN_PR", "PRESERVE_IN_BRANCH", "PRESERVE_IN_ARCHIVE", "CLEANUP_CANDIDATE"]);
+  const destinationFields = { local: ["path", "path_id", "directory_id"], archive: ["archive_id", "path", "path_id"], branch: ["name", "ref"], pr: ["number", "pr_id", "url"] };
+  function meaningfulDestination(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value) || typeof value.kind !== "string") return false;
+    const fields = destinationFields[value.kind.toLowerCase()]; if (!fields) return false;
+    return fields.some((field) => (typeof value[field] === "string" && value[field].trim()) || (field === "number" && Number.isInteger(value[field]) && value[field] > 0));
+  }
+  function preservationProofSafe(decision) {
+    if (!preservationDispositions.has(decision?.disposition)) return true;
+    const destination = decision?.preservation_destination;
+    const proof = decision?.preservation_proof;
+    const source = decision?.source_fingerprint || decision?.fingerprint;
+    return meaningfulDestination(destination) && proof && proof.verified === true && typeof proof.source_fingerprint === "string" && proof.source_fingerprint === source && typeof proof.destination_fingerprint === "string" && stable(proof.destination) === stable(destination);
+  }
   function reviewStatus(item) {
     const identity = reviewIdentity(item); if (!identity) return "none";
     const prior = state.reviews.get(identity.id); if (!prior) return "none";
+    if (state.reviewSchemaVersion !== 2) return "stale";
     if (prior.reconciliation?.status === "unreviewed") return "unreviewed";
     if (prior.reconciliation?.status === "stale" || prior.reconciliation?.status === "historical-limited") return "stale";
+    if (!preservationProofSafe(prior)) return "stale";
     if (prior.reconciliation?.status === "current") return "current";
     if (typeof prior.source_fingerprint === "string" && typeof prior.fingerprint === "string" && prior.source_fingerprint === prior.fingerprint) return "current";
     return stable(prior.observed) === stable(identity.observed) ? "current" : "stale";
@@ -262,20 +281,75 @@
     const editor = node("div", "review-editor");
     editor.append(node("span", "inspector-label", "HUMAN DISPOSITION"));
     if (prior) editor.append(node("div", "conclusion", current ? `Current review · ${prior.reviewed_at}` : status === "unreviewed" ? "Unreviewed snapshot · record a human disposition." : "Stale review · object inputs changed; save a new decision."));
-    const select = document.createElement("select"); dispositions.forEach((value) => { const option = node("option", "", value); option.value = value; select.append(option); }); select.value = current ? prior.disposition : "UNRESOLVED";
+    const select = document.createElement("select"); select.id = "review-disposition"; dispositions.forEach((value) => { const option = node("option", "", value); option.value = value; select.append(option); }); select.value = current ? prior.disposition : "UNRESOLVED";
     const rationale = document.createElement("textarea"); rationale.placeholder = "Required rationale"; rationale.value = current ? prior.rationale : "";
+    const reviewer = document.createElement("input"); reviewer.id = "reviewer-identity"; reviewer.type = "text"; reviewer.placeholder = "Reviewer identity"; reviewer.value = current ? (prior.reviewer_id || prior.reviewer || "") : "browser-local-reviewer";
+    const destinationKind = document.createElement("select"); destinationKind.id = "preservation-destination-kind";
+    [["", "No preservation destination"], ["branch", "Branch"], ["pr", "Pull request"], ["archive", "Archive"], ["local", "Local path"]].forEach(([value, label]) => { const option = node("option", "", label); option.value = value; destinationKind.append(option); });
+    const destinationValue = document.createElement("input"); destinationValue.id = "preservation-destination-value"; destinationValue.type = "text"; destinationValue.placeholder = "Concrete destination name, path, or number";
+    const verification = document.createElement("label"); verification.className = "preservation-verification";
+    const verificationBox = document.createElement("input"); verificationBox.id = "preservation-verified"; verificationBox.type = "checkbox";
+    verification.append(verificationBox, node("span", "", "I verified this destination is concrete and ready."));
+    const destinationControls = node("div", "preservation-controls", destinationKind, destinationValue, verification);
+    const existingDestination = current ? prior.preservation_destination : null;
+    if (meaningfulDestination(existingDestination)) { destinationKind.value = existingDestination.kind; destinationValue.value = String(existingDestination.number || existingDestination.name || existingDestination.ref || existingDestination.archive_id || existingDestination.path || existingDestination.pr_id || existingDestination.url || ""); verificationBox.checked = preservationProofSafe(prior); }
+    const updateDestinationState = () => { const required = preservationDispositions.has(select.value); destinationControls.hidden = !required; destinationKind.required = required; destinationValue.required = required; verificationBox.required = required; };
+    select.addEventListener("change", updateDestinationState); updateDestinationState();
     const save = node("button", "quiet-button", "Save browser-local decision"); save.type = "button";
     save.addEventListener("click", async () => {
       if (!rationale.value.trim()) { rationale.focus(); return; }
-      state.reviews.set(identity.id, { object_id: identity.id, kind: identity.kind, fingerprint: await sha256(identity.observed), observed: identity.observed, disposition: select.value, rationale: rationale.value.trim(), reviewed_at: new Date().toISOString() });
+      if (!reviewer.value.trim()) { reviewer.focus(); save.textContent = "Reviewer identity required"; return; }
+      const sourceFingerprint = await sha256(identity.observed);
+      let destination = null; let proof = null;
+      if (preservationDispositions.has(select.value)) {
+        const kind = destinationKind.value; const value = destinationValue.value.trim();
+        if (!kind || !value || !verificationBox.checked) { save.textContent = "Verified concrete destination required"; return; }
+        destination = kind === "pr" && /^\d+$/.test(value) ? { kind, number: Number(value) } : kind === "branch" ? { kind, name: value } : kind === "archive" ? { kind, archive_id: value } : { kind, path: value };
+        if (!meaningfulDestination(destination)) { save.textContent = "Meaningful destination required"; return; }
+        proof = { verified: true, source_fingerprint: sourceFingerprint, destination_fingerprint: await sha256(destination), destination };
+      }
+      const sourceProvenance = await reviewProvenance();
+      state.reviewSchemaVersion = 2;
+      state.reviews.set(identity.id, { object_id: identity.id, kind: identity.kind, fingerprint: sourceFingerprint, source_fingerprint: sourceFingerprint, source_provenance: sourceProvenance, reviewer_id: reviewer.value.trim(), reviewer: reviewer.value.trim(), observed: identity.observed, disposition: select.value, rationale: rationale.value.trim(), reviewed_at: new Date().toISOString(), preservation_destination: destination, preservation_proof: proof, reconciliation: { status: "current", reasons: ["browser_reviewed"] } });
       save.textContent = "Saved locally";
     });
-    editor.append(select, rationale, save); elements.inspector.append(editor);
+    editor.append(select, reviewer, rationale, destinationControls, save); elements.inspector.append(editor);
+  }
+
+  async function reviewProvenance() {
+    const inventory = state.artifacts.inventory || {};
+    const candidates = state.artifacts.candidates || {};
+    const relations = state.artifacts.relations || {};
+    return { repository_id: inventory.repository?.id || "", inventory_digest: await sha256(inventory), candidate_digest: state.artifacts.candidates ? await sha256(candidates) : await sha256({}), candidate_content_digest: candidates.content_digest || null, relations_digest: state.artifacts.relations ? await sha256(relations) : null };
+  }
+
+  function validDigest(value) { return typeof value === "string" && /^[0-9a-f]{64}$/i.test(value); }
+  async function exportDecision(raw, provenance) {
+    const identity = raw.source_fingerprint || raw.fingerprint;
+    const sourceFingerprint = validDigest(identity) ? identity : await sha256(raw.observed || { object_id: raw.object_id, kind: raw.kind });
+    const legacy = state.reviewSchemaVersion !== 2;
+    const unsafePreservation = !preservationProofSafe(raw);
+    const downgrade = legacy || unsafePreservation;
+    const decision = { ...raw, kind: raw.kind || raw.object_id.split(":", 1)[0], source_fingerprint: sourceFingerprint, fingerprint: sourceFingerprint, source_provenance: provenance, reviewer_id: raw.reviewer_id || raw.reviewer || null, reviewer: raw.reviewer || raw.reviewer_id || null, preservation_destination: raw.preservation_destination || null, preservation_proof: raw.preservation_proof || null };
+    if (downgrade) {
+      decision.disposition = "UNRESOLVED";
+      decision.preservation_destination = null;
+      decision.preservation_proof = null;
+      decision.reviewer_id = null;
+      decision.reviewer = null;
+      decision.reviewed_at = null;
+      decision.rationale = legacy ? "Legacy review imported; v2 proof is required before a current disposition." : "Preservation proof is incomplete or stale; disposition remains unresolved.";
+      decision.reconciliation = { status: legacy ? "historical-limited" : "stale", reasons: [legacy ? "legacy_review_schema_v1" : "preservation_proof_required"] };
+    }
+    return decision;
   }
 
   async function exportReview() {
     const inventory = state.artifacts.inventory; if (!inventory) return;
-    const documentValue = { kind: "relationship-review", schema_version: 1, repository_id: inventory.repository?.id || "", inventory_digest: await sha256(inventory), candidate_digest: state.artifacts.candidates ? await sha256(state.artifacts.candidates) : null, relations_digest: state.artifacts.relations ? await sha256(state.artifacts.relations) : null, exported_at: new Date().toISOString(), decisions: [...state.reviews.values()].sort((a, b) => a.object_id.localeCompare(b.object_id)) };
+    const provenance = await reviewProvenance();
+    const decisions = [];
+    for (const raw of [...state.reviews.values()].sort((a, b) => a.object_id.localeCompare(b.object_id))) decisions.push(await exportDecision(raw, provenance));
+    const documentValue = { kind: "relationship-review", schema_version: 2, repository_id: provenance.repository_id, ...provenance, provenance, reviewer_identity: "browser-local-reviewer", exported_at: new Date().toISOString(), decisions, limitations: [] };
     const url = URL.createObjectURL(new Blob([JSON.stringify(documentValue, null, 2) + "\n"], { type: "application/json" }));
     const link = document.createElement("a"); link.href = url; link.download = "review.json"; link.click(); URL.revokeObjectURL(url);
   }

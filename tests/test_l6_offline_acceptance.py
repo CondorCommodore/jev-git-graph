@@ -499,10 +499,6 @@ def run_browser_probe(
         raise AssertionError(f"installed browser production UI probe failed: {browser}: {exc}\nDOM tail:\n{dom[-4000:]}") from exc
     finally:
         if page_socket is not None:
-            try:
-                dom = evaluate("document.documentElement.outerHTML")
-            except Exception:
-                pass
             page_socket.close()
         if browser_socket is not None:
             try:
@@ -513,16 +509,17 @@ def run_browser_probe(
             browser_socket.close()
         if launcher is not None:
             try:
-                launcher.wait(timeout=10)
+                launcher.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 try:
                     os.killpg(launcher.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-                try:
-                    launcher.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    launcher.poll()
+                deadline = time.monotonic() + 2
+                while launcher.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                if launcher.poll() is None:
+                    launcher.returncode = -signal.SIGKILL
             finally:
                 if launcher.stdout is not None:
                     launcher.stdout.close()
@@ -657,6 +654,21 @@ class L6OfflineAcceptanceTests(unittest.TestCase):
                     browser, inventory, candidates, relations, review_path, output
                 )
             print(f"L6 browser probe: {browser_evidence}")
+            browser_review = read_json(browser_review_path)
+            self.assertEqual("relationship-review", browser_review["kind"])
+            self.assertEqual(2, browser_review["schema_version"])
+            for field in ("repository_id", "inventory_digest", "candidate_digest", "relations_digest", "provenance"):
+                self.assertIn(field, browser_review)
+            self.assertEqual(repository_id, browser_review["repository_id"])
+            validated_browser_review = validate_review_document(browser_review, repository_id)
+            browser_decision = next(item for item in browser_review["decisions"] if item["object_id"] == "branch:patch-source")
+            self.assertIn("source_fingerprint", browser_decision)
+            self.assertIn("reviewer_id", browser_decision)
+            self.assertIn("preservation_destination", browser_decision)
+            self.assertIn("preservation_proof", browser_decision)
+            self.assertEqual("PRESERVE_IN_BRANCH", browser_decision["disposition"])
+            self.assertEqual("current", validated_browser_review["decisions"]["branch:patch-source"].get("reconciliation", {}).get("status", "current"))
+            self.assertTrue(browser_decision["preservation_proof"]["verified"])
 
             unchanged = reconcile_reviews(imported_review, inventory, candidates, relations)
             carried = next(item for item in unchanged["decisions"] if item["object_id"] == "branch:patch-source")
