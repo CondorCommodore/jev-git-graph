@@ -5,11 +5,65 @@ from pathlib import Path
 from unittest.mock import patch
 
 from jev_git_graph.errors import JgError
-from jev_git_graph.jev import JEV_ENDPOINT, checkpoint_lock, execute_preview
+from jev_git_graph.jev import (
+    JEV_ENDPOINT,
+    checkpoint_lock,
+    estimate_cost,
+    execute_preview,
+    parse_pricing,
+    update_ledger_statistics,
+)
 from jev_git_graph.safety import canonical_json, digest, read_json, write_json
 
 
 class CheckpointTests(unittest.TestCase):
+    def test_nonfinite_provider_probability_is_uncertain(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for index, invalid in enumerate((float("nan"), float("inf"), float("-inf"))):
+                with self.subTest(invalid=repr(invalid)):
+                    request = {"state": {"candidate_id": "pair"}, "model": "jev-latest",
+                               "questions": {"test": {"type": "noul", "instructions": "synthetic"}}}
+                    sha = digest([request])
+                    preview = root / f"preview-{index}.json"
+                    checkpoint = root / f"relations-{index}.json"
+                    write_json(preview, {"kind": "jev-preview", "endpoint": JEV_ENDPOINT, "network_performed": False,
+                               "requests": [request], "payload_sha256": sha, "request_count": 1,
+                               "payload_bytes": len(canonical_json([request]))})
+                    with patch.dict(os.environ, {"TYPESAFE_API_KEY": "synthetic-test-only"}):
+                        with self.assertRaises(JgError):
+                            execute_preview(preview, sha, transport=lambda *_: {
+                                "model": "jev-latest", "usage": {"input_tokens": 1, "output_tokens": 1},
+                                "answers": {"test": {"noul": invalid}},
+                            }, checkpoint=checkpoint)
+                    self.assertEqual("response_validation_error", read_json(checkpoint)["attempts"][0]["error_class"])
+
+    def test_historical_missing_timing_is_null_and_pricing_is_provenanced(self):
+        ledger = {"attempts": [{"request_sha256": "a" * 64, "status": "succeeded"}], "relations": []}
+        update_ledger_statistics(ledger)
+        self.assertIsNone(ledger["statistics"]["api_time_ms"])
+        self.assertIsNone(ledger["statistics"]["wall_time_ms"])
+        pricing = parse_pricing({
+            "model": "jev-latest", "source": "local-test-pricing",
+            "input_usd_per_million_tokens": 1.0, "output_usd_per_million_tokens": 2.0,
+        })
+        quote = estimate_cost(ledger, pricing)
+        self.assertTrue(quote["unknown"])
+        self.assertIsNone(quote["estimated_cost_usd"])
+        self.assertEqual("local-test-pricing", quote["pricing_provenance"]["source"])
+
+    def test_pricing_estimate_is_local_and_deterministic(self):
+        ledger = {"attempts": [], "relations": [{"response": {"usage": {"input_tokens": 1000, "output_tokens": 500}}}]}
+        update_ledger_statistics(ledger)
+        quote = estimate_cost(ledger, {
+            "model": "jev-latest", "source": "fixture",
+            "rates": {"input_usd_per_1m": 2.0, "output_usd_per_1m": 4.0},
+        })
+        self.assertEqual(0.004, quote["estimated_cost_usd"])
+        self.assertEqual("fixture", quote["pricing_provenance"]["source"])
+        with self.assertRaisesRegex(JgError, "finite"):
+            parse_pricing({"source": "fixture", "input_usd_per_1m": float("inf"), "output_usd_per_1m": 1.0})
+
     def test_resume_preserves_success_and_never_repeats_uncertain_attempt(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

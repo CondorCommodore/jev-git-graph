@@ -106,6 +106,7 @@ def collect_batches(manifest_paths, candidates_path, output):
               "source_batch_plan_sha256": [], "relations": [], "attempts": [],
               "network_performed": False, "missing_batches": 0, "limitations": []}
     seen = set()
+    attempt_indexes = {}
     planned_requests = set()
     seen_relations = set()
     for manifest_value in manifest_paths:
@@ -155,9 +156,17 @@ def collect_batches(manifest_paths, candidates_path, output):
             for attempt in ledger.get("attempts", []):
                 sha = attempt.get("request_sha256")
                 candidate_id = attempt.get("candidate_id")
-                if sha not in expected or candidate_id != expected[sha] or sha in seen:
+                if sha not in expected or candidate_id != expected[sha]:
                     raise JgError("duplicate or mismatched attempt in batch results")
+                if sha in seen:
+                    prior = result["attempts"][attempt_indexes[sha]]
+                    if prior.get("status") != "succeeded" and attempt.get("status") == "succeeded":
+                        result["attempts"][attempt_indexes[sha]] = attempt
+                        successes.add(sha)
+                        successful_candidates.add(candidate_id)
+                    continue
                 seen.add(sha)
+                attempt_indexes[sha] = len(result["attempts"])
                 result["attempts"].append(attempt)
                 if attempt.get("status") == "succeeded":
                     successes.add(sha)
@@ -167,11 +176,15 @@ def collect_batches(manifest_paths, candidates_path, output):
                 candidate_id = relation.get("candidate_id")
                 judgment_id = relation.get("judgment_id")
                 relation_id = judgment_id or f"legacy:{candidate_id}"
+                request_sha = relation.get("request_sha256") or judgment_id
+                relation_identity = request_sha or relation_id
+                if relation_identity in seen_relations:
+                    continue
                 valid_success = judgment_id in successes if judgment_id else candidate_id in successful_candidates
-                if not valid_success or relation_id in response_ids or relation_id in seen_relations:
+                if not valid_success or relation_id in response_ids:
                     raise JgError("response has no unique successful attempt")
                 response_ids.add(relation_id)
-                seen_relations.add(relation_id)
+                seen_relations.add(relation_identity)
                 result["relations"].append(relation)
             if len(response_ids) != len(successes):
                 raise JgError("successful attempt is missing its response")

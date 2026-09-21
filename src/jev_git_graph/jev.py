@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import tempfile
 import fcntl
@@ -25,6 +26,15 @@ DEFAULT_MAX_JEV_REQUESTS = 1
 DEFAULT_MAX_JEV_PAYLOAD_BYTES = 8_192
 
 
+def _finite_probability(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and 0 <= value <= 1
+    )
+
+
 @contextmanager
 def checkpoint_lock(path: Path):
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -41,7 +51,8 @@ def checkpoint_lock(path: Path):
         os.close(descriptor)
 
 
-def update_ledger_statistics(ledger: dict[str, Any]) -> None:
+def update_ledger_statistics(ledger: dict[str, Any], pricing: Any = None) -> None:
+    _deduplicate_ledger(ledger)
     ledger["counts"] = {
         "attempted": len(ledger["attempts"]),
         "succeeded": sum(item["status"] == "succeeded" for item in ledger["attempts"]),
@@ -51,15 +62,118 @@ def update_ledger_statistics(ledger: dict[str, Any]) -> None:
     durations = [item.get("latency_ms") for item in ledger["attempts"] if isinstance(item.get("latency_ms"), int)]
     starts = [item["started_at_epoch_ms"] for item in ledger["attempts"] if isinstance(item.get("started_at_epoch_ms"), int)]
     completions = [item["completed_at_epoch_ms"] for item in ledger["attempts"] if isinstance(item.get("completed_at_epoch_ms"), int)]
+    input_tokens = [item.get("input_tokens") for item in usage if isinstance(item.get("input_tokens"), int) and not isinstance(item.get("input_tokens"), bool)]
+    output_tokens = [item.get("output_tokens") for item in usage if isinstance(item.get("output_tokens"), int) and not isinstance(item.get("output_tokens"), bool)]
     ledger["statistics"] = {
         "calls": len(ledger["attempts"]),
-        "input_tokens": sum(item.get("input_tokens", 0) for item in usage),
-        "output_tokens": sum(item.get("output_tokens", 0) for item in usage),
-        "api_time_ms": sum(durations),
+        "input_tokens": sum(input_tokens) if input_tokens else None,
+        "output_tokens": sum(output_tokens) if output_tokens else None,
+        "api_time_ms": sum(durations) if durations else None,
         "wall_time_ms": max(completions) - min(starts) if starts and completions else None,
         "estimated_cost_usd": None,
         "pricing_basis": None,
     }
+    if pricing is not None:
+        quote = estimate_cost(ledger, pricing)
+        ledger["statistics"]["estimated_cost_usd"] = quote["estimated_cost_usd"]
+        ledger["statistics"]["pricing_basis"] = quote["pricing_provenance"]
+
+
+def _deduplicate_ledger(ledger: dict[str, Any]) -> None:
+    """Deduplicate overlapping checkpoint records by their request identity."""
+    unique_attempts: list[dict[str, Any]] = []
+    seen_attempts: set[str] = set()
+    for attempt in ledger.get("attempts", []):
+        request_sha = attempt.get("request_sha256") if isinstance(attempt, dict) else None
+        identity = request_sha if isinstance(request_sha, str) else digest(attempt)
+        if identity in seen_attempts:
+            continue
+        seen_attempts.add(identity)
+        unique_attempts.append(attempt)
+    ledger["attempts"] = unique_attempts
+
+    unique_relations: list[dict[str, Any]] = []
+    seen_relations: set[str] = set()
+    for relation in ledger.get("relations", []):
+        if not isinstance(relation, dict):
+            continue
+        identity = relation.get("request_sha256") or relation.get("judgment_id")
+        identity = identity if isinstance(identity, str) else digest(relation)
+        if identity in seen_relations:
+            continue
+        seen_relations.add(identity)
+        unique_relations.append(relation)
+    ledger["relations"] = unique_relations
+
+
+def _pricing_number(value: Any, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        raise JgError(f"{label} must be a finite non-negative number")
+    return float(value)
+
+
+def parse_pricing(pricing: Any) -> dict[str, Any]:
+    """Parse an offline local pricing document and retain its provenance."""
+    raw = pricing
+    if isinstance(pricing, (str, Path)):
+        if isinstance(pricing, str) and pricing.lstrip().startswith("{"):
+            try:
+                raw = json.loads(pricing)
+            except json.JSONDecodeError as exc:
+                raise JgError("pricing JSON is malformed") from exc
+        else:
+            raw = read_json(pricing)
+    if not isinstance(raw, dict):
+        raise JgError("pricing must be a local JSON object")
+    rates = raw.get("rates") if isinstance(raw.get("rates"), dict) else raw
+    input_rate = next((rates.get(key) for key in ("input_usd_per_million_tokens", "input_usd_per_1m", "input_per_million_tokens") if key in rates), None)
+    output_rate = next((rates.get(key) for key in ("output_usd_per_million_tokens", "output_usd_per_1m", "output_per_million_tokens") if key in rates), None)
+    if input_rate is None or output_rate is None:
+        raise JgError("pricing requires input and output rates per million tokens")
+    provenance = raw.get("pricing_provenance") if isinstance(raw.get("pricing_provenance"), dict) else {}
+    source = raw.get("source", raw.get("pricing_source", provenance.get("source")))
+    if not isinstance(source, str) or not source.strip():
+        raise JgError("pricing requires non-empty local source provenance")
+    model = raw.get("model", JEV_MODEL)
+    if not isinstance(model, str) or not model.strip():
+        raise JgError("pricing model must be a non-empty string")
+    pricing_digest = provenance.get("pricing_digest") or digest(raw)
+    return {
+        "kind": "jev-pricing",
+        "schema_version": 1,
+        "model": model,
+        "input_usd_per_million_tokens": _pricing_number(input_rate, "pricing input rate"),
+        "output_usd_per_million_tokens": _pricing_number(output_rate, "pricing output rate"),
+        "pricing_provenance": {"source": source, "pricing_digest": pricing_digest, "model": model},
+    }
+
+
+def estimate_cost(ledger: dict[str, Any], pricing: Any) -> dict[str, Any]:
+    """Estimate local cost without network access; missing usage remains unknown."""
+    parsed = parse_pricing(pricing)
+    statistics = ledger.get("statistics") if isinstance(ledger.get("statistics"), dict) else {}
+    if "input_tokens" not in statistics or "output_tokens" not in statistics:
+        update_ledger_statistics(ledger)
+        statistics = ledger["statistics"]
+    input_tokens = statistics.get("input_tokens")
+    output_tokens = statistics.get("output_tokens")
+    if not isinstance(input_tokens, int) or isinstance(input_tokens, bool) or not isinstance(output_tokens, int) or isinstance(output_tokens, bool):
+        cost = None
+        unknown = True
+    else:
+        cost = (input_tokens * parsed["input_usd_per_million_tokens"] + output_tokens * parsed["output_usd_per_million_tokens"]) / 1_000_000
+        unknown = False
+    return {
+        "estimated_cost_usd": cost,
+        "unknown": unknown,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "pricing_provenance": parsed["pricing_provenance"],
+    }
+
+
+def estimate_cost_usd(ledger: dict[str, Any], pricing: Any) -> float | None:
+    return estimate_cost(ledger, pricing)["estimated_cost_usd"]
 
 
 def save_checkpoint(path: Path, ledger: dict[str, Any]) -> None:
@@ -190,18 +304,18 @@ def validate_response(request: dict[str, Any], response: Any) -> dict[str, Any]:
             raise _ResponseValidationError
         if question.get("type") == "noul":
             value = answer.get("noul")
-            if not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 <= value <= 1:
+            if not _finite_probability(value):
                 raise _ResponseValidationError
         elif question.get("type") == "choice":
             choice = answer.get("choice")
             confidence = answer.get("confidence")
             probabilities = answer.get("probabilities")
             criteria = question.get("criteria", {})
-            if choice not in criteria or not isinstance(confidence, (int, float)) or not 0 <= confidence <= 1:
+            if choice not in criteria or not _finite_probability(confidence):
                 raise _ResponseValidationError
             if not isinstance(probabilities, dict) or set(probabilities) != set(criteria):
                 raise _ResponseValidationError
-            if any(not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 <= value <= 1 for value in probabilities.values()):
+            if any(not _finite_probability(value) for value in probabilities.values()):
                 raise _ResponseValidationError
         else:
             raise _ResponseValidationError
@@ -265,6 +379,7 @@ def execute_preview(
             raise JgError("checkpoint belongs to a different approved preview")
         if not isinstance(ledger.get("attempts"), list):
             raise JgError("checkpoint lacks an attempt ledger; use a new output directory")
+        _deduplicate_ledger(ledger)
     attempted = {item["request_sha256"] for item in ledger["attempts"]}
     for request in preview["requests"]:
         request_digest = digest(request)
@@ -319,9 +434,13 @@ def execute_preview(
         })
         ledger["relations"].append({
             "judgment_id": request_digest,
+            "request_sha256": request_digest,
             "candidate_id": request["state"]["candidate_id"],
             "question_version": preview.get("question_version"),
             "evidence_profile": preview.get("evidence_profile", "minimal"),
+            "started_at": attempt["started_at"],
+            "completed_at": attempt["completed_at"],
+            "completed_at_epoch_ms": attempt["completed_at_epoch_ms"],
             "response": response,
         })
         attempt["status"] = "succeeded"

@@ -49,6 +49,10 @@ class BatchTests(unittest.TestCase):
             self.assertEqual(combined["unattempted_requests"], 3)
             self.assertEqual(combined["missing_batches"], 1)
             self.assertEqual(len(combined["relations"]), 1)
+            overlapping = read_json(collect_batches([target, target], root / "candidates.json", root / "combined-overlap"))
+            self.assertEqual(1, overlapping["counts"]["succeeded"])
+            self.assertEqual(1, len(overlapping["relations"]))
+            self.assertEqual(1, len(overlapping["attempts"]))
             with self.assertRaises(JgError):
                 prepare_batches(root / "candidates.json", root / "batches")
 
