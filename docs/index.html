@@ -4,22 +4,23 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#0b1120">
-    <meta name="description" content="An interactive concept for seeing Git facts, Jev relationship judgments, and a human reviewed cleanup plan.">
-    <title>Jev Git Graph — Interactive concept</title>
+    <meta name="description" content="A local-only viewer for Jev Git Graph inventory, candidate, and relationship artifacts.">
+    <title>Jev Git Graph — Local artifact viewer</title>
     <link rel="icon" href="favicon.svg" type="image/svg+xml">
     <link rel="stylesheet" href="demo.css">
+    <script src="viewer-data.js" defer></script>
     <script src="demo.js" defer></script>
   </head>
   <body>
     <div class="app-shell">
       <header class="topbar">
-        <a class="brand" href="https://github.com/CondorCommodore/jev-git-graph" aria-label="Jev Git Graph on GitHub">
+        <div class="brand" aria-label="Jev Git Graph local artifact viewer">
           <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
           <span>jev<span class="brand-separator">/</span>git graph</span>
-        </a>
+        </div>
         <div class="topbar-right">
-          <span class="topbar-label">INTERACTIVE CONCEPT</span>
-          <a class="github-link" href="https://github.com/CondorCommodore/jev-git-graph/blob/main/docs/spec.md">Read the spec <span aria-hidden="true">↗</span></a>
+          <span class="topbar-label">LOCAL ARTIFACT VIEWER</span>
+          <a class="github-link" href="spec.md">Read the spec <span aria-hidden="true">↗</span></a>
         </div>
       </header>
 
@@ -27,60 +28,111 @@
         <section class="intro" aria-labelledby="page-title">
           <div>
             <p class="eyebrow"><span class="eyebrow-line"></span> SEE THE RELATIONSHIPS</p>
-            <h1 id="page-title">What happened between<br><em>these branches?</em></h1>
-            <p class="intro-copy">Git gives us the facts. Jev helps judge the connections. A person decides what to preserve.</p>
+            <h1 id="page-title">A repository,<br><em>made legible.</em></h1>
+            <p class="intro-copy">Load locally generated JSON to explore Git facts, candidate hypotheses, and bounded Jev judgments. Files stay in this browser.</p>
           </div>
-          <div class="intro-note"><span class="note-dot"></span><span>Synthetic example<br><strong>No live API call</strong></span></div>
+          <div class="intro-note"><span class="note-dot"></span><span>Browser-local loading<br><strong>No upload or API call</strong></span></div>
         </section>
 
-        <section class="workspace" aria-label="Interactive branch relationship demo">
-          <aside class="journey panel" aria-label="Analysis stages">
-            <div class="panel-kicker">THE ANALYSIS</div>
-            <h2>From tangled<br>to understood.</h2>
-            <div id="stage-list" class="stage-list"></div>
-            <div class="journey-footer">
-              <button id="play-button" class="play-button" type="button"><span id="play-icon" aria-hidden="true">▶</span><span id="play-label">Play the analysis</span></button>
-              <p>Choose a step or select any connection in the graph.</p>
+        <section class="load-panel panel" aria-labelledby="load-title">
+          <div class="load-copy">
+            <span class="panel-kicker">LOAD A PRIVATE RUN</span>
+            <h2 id="load-title">Choose JSON artifacts from the same run.</h2>
+            <p id="load-status">Nothing has been loaded. Choose inventory.json first; candidates.json and relations.json are optional and may be loaded afterward.</p>
+          </div>
+          <div class="file-controls" aria-label="Local artifact files">
+            <label class="file-button"><span>01 · Inventory</span><input id="inventory-file" type="file" accept="application/json,.json"><strong id="inventory-file-name">Choose inventory.json</strong></label>
+            <label class="file-button"><span>02 · Candidates</span><input id="candidates-file" type="file" accept="application/json,.json"><strong id="candidates-file-name">Choose candidates.json</strong></label>
+            <label class="file-button"><span>03 · Jev relations</span><input id="relations-file" type="file" accept="application/json,.json"><strong id="relations-file-name">Choose relations.json</strong></label>
+            <label class="file-button"><span>04 · Human review</span><input id="review-file" type="file" accept="application/json,.json"><strong id="review-file-name">Choose review.json</strong></label>
+          </div>
+          <button id="export-review" class="quiet-button" type="button">Export review.json</button>
+        </section>
+
+        <section id="notices" class="notices" aria-live="polite"></section>
+
+        <section class="summary-grid" aria-label="Loaded artifact counts">
+          <article class="summary-card"><span>Repository objects</span><strong id="object-count">—</strong><small id="object-detail">Load inventory</small></article>
+          <article class="summary-card"><span>Git facts</span><strong id="fact-count">—</strong><small id="fact-detail">No inventory</small></article>
+          <article class="summary-card"><span>Candidate pairs</span><strong id="candidate-count">—</strong><small id="candidate-detail">Not loaded</small></article>
+          <article class="summary-card"><span>Jev evaluated</span><strong id="evaluated-count">—</strong><small id="evaluated-detail">Not loaded</small></article>
+          <article class="summary-card amber"><span>Still unresolved</span><strong id="unresolved-count">—</strong><small id="unresolved-detail">No candidate set</small></article>
+        </section>
+
+        <section class="coverage-strip panel" aria-live="polite" aria-label="Relationship coverage">
+          <span class="panel-kicker">FULL DATA COVERAGE</span>
+          <strong id="coverage-count">Load candidates.json to see coverage.</strong>
+          <span id="coverage-detail">Candidate records, Jev judgments, and pending work are counted separately.</span>
+        </section>
+
+        <section class="workspace" aria-label="Repository relationship explorer">
+          <aside class="explorer panel" aria-labelledby="explorer-title">
+            <div class="panel-heading">
+              <div><span class="panel-kicker">EXPLORE</span><h2 id="explorer-title">Objects &amp; pairs</h2></div>
+              <span id="visible-count" class="count-chip">0</span>
+            </div>
+            <label class="search-label" for="search">Search names, SHAs, subjects, or candidate IDs</label>
+            <input id="search" class="search" type="search" autocomplete="off" placeholder="Search loaded data">
+            <div id="view-modes" class="view-modes" role="tablist" aria-label="Relationship views">
+              <button class="view-mode active" id="components-view" type="button" role="tab" aria-selected="true" data-view="components">Connected components</button>
+              <button class="view-mode" id="candidates-view" type="button" role="tab" aria-selected="false" data-view="candidates">Candidate relationships</button>
+              <button class="view-mode" id="judgments-view" type="button" role="tab" aria-selected="false" data-view="judgments">Jev judgments</button>
+            </div>
+            <div id="kind-filters" class="filter-row" aria-label="Filter item types">
+              <button class="filter active" type="button" data-kind="all">All</button>
+              <button class="filter" type="button" data-kind="branch">Branches</button>
+              <button class="filter" type="button" data-kind="worktree">Worktrees</button>
+              <button class="filter" type="button" data-kind="stash">Stashes</button>
+              <button class="filter" type="button" data-kind="candidate">Pairs</button>
+              <button class="filter" type="button" data-kind="unresolved">Unresolved</button>
+              <button class="filter" type="button" data-kind="inactive">Old with work (30d)</button>
+              <button class="filter" type="button" data-kind="integrated">Integrated</button>
+              <button class="filter" type="button" data-kind="unique">Unique work</button>
+              <button class="filter" type="button" data-kind="likely-duplicate">Likely dupes ≥75%</button>
+              <button class="filter" type="button" data-kind="superseded">Superseded</button>
+              <button class="filter" type="button" data-kind="reviewed">Human reviewed</button>
+              <button class="filter" type="button" data-kind="stale-review">Stale review</button>
+            </div>
+            <div id="virtual-list" class="virtual-list" tabindex="0" aria-label="Filtered loaded records"></div>
+            <div class="pagination" aria-label="Record pagination">
+              <button id="page-prev" class="quiet-button" type="button">Previous</button>
+              <span id="page-status">Page 1</span>
+              <button id="page-next" class="quiet-button" type="button">Next</button>
             </div>
           </aside>
 
           <section class="graph-panel panel" aria-labelledby="graph-title">
             <div class="graph-toolbar">
-              <div>
-                <span class="panel-kicker">RELATIONSHIP MAP</span>
-                <h2 id="graph-title">A repository, made legible</h2>
-              </div>
-              <div id="phase-badge" class="phase-badge">01 / 04 · Git inventory</div>
+              <div><span class="panel-kicker">RELATIONSHIP MAP</span><h2 id="graph-title">Grouped overview</h2></div>
+              <button id="overview-button" class="quiet-button" type="button">Overview</button>
             </div>
-            <div class="graph-wrap">
-              <div class="graph-grid" aria-hidden="true"></div>
-              <svg id="graph" viewBox="0 0 960 630" role="img" aria-label="Interactive graph of synthetic Git branches and their relationships"></svg>
-              <div class="graph-hint">Select a node or connection to inspect it <span aria-hidden="true">↗</span></div>
+            <div id="graph-wrap" class="graph-wrap">
+              <canvas id="graph" aria-label="Bounded local relationship graph"></canvas>
+              <div id="graph-empty" class="graph-empty">Load inventory.json to draw a local overview.</div>
+              <div id="graph-hint" class="graph-hint">Select a group, object, or candidate to focus the graph.</div>
             </div>
             <div class="graph-bottom">
-              <div class="legend"><span><i class="legend-line fact"></i> Git fact</span><span><i class="legend-line proposal"></i> Jev judgment</span><span><i class="legend-dot"></i> Work to preserve</span></div>
-              <span id="graph-count" class="graph-count">7 objects · 3 facts</span>
+              <div class="legend"><span><i class="legend-dot branch"></i> Git object</span><span><i class="legend-line fact"></i> Git fact</span><span><i class="legend-line proposal"></i> Candidate</span><span><i class="legend-line judged"></i> Jev judgment</span></div>
+              <div class="graph-pagination"><button id="graph-prev" class="quiet-button" type="button">Previous graph page</button><span id="graph-page-status">Page 1</span><button id="graph-next" class="quiet-button" type="button">Next graph page</button></div>
+              <span id="graph-count" class="graph-count">No local data</span>
             </div>
           </section>
 
           <aside class="inspector panel" aria-labelledby="inspector-title">
-            <div class="inspector-head">
-              <span class="panel-kicker">IN FOCUS</span>
-              <span id="focus-index" class="focus-index">01 / 03</span>
-            </div>
-            <div id="inspector-content"></div>
+            <div class="inspector-head"><span class="panel-kicker">IN FOCUS</span><span id="focus-index" class="focus-index">WAITING</span></div>
+            <div id="inspector-content" class="inspector-content"></div>
           </aside>
         </section>
 
-        <section class="principle-strip" aria-label="How decisions are made">
-          <div><span class="strip-number">01</span><span>Facts from Git remain <strong>verifiable</strong></span></div>
-          <div><span class="strip-number">02</span><span>Jev judgments carry <strong>probabilities</strong></span></div>
-          <div><span class="strip-number">03</span><span>Unique work stays <strong>visible</strong></span></div>
-          <div><span class="strip-number">04</span><span>Cleanup waits for <strong>human review</strong></span></div>
+        <section class="principle-strip" aria-label="Viewer guarantees">
+          <div><span class="strip-number">01</span><span>Files remain <strong>in this browser</strong></span></div>
+          <div><span class="strip-number">02</span><span>Git facts and <strong>Jev judgments differ</strong></span></div>
+          <div><span class="strip-number">03</span><span>Missing results stay <strong>unresolved</strong></span></div>
+          <div><span class="strip-number">04</span><span>Every pair joins by <strong>immutable SHA</strong></span></div>
         </section>
       </main>
 
-      <footer>JEV GIT GRAPH <span>·</span> A visual design study using synthetic data <span>·</span> <a href="https://github.com/CondorCommodore/jev-git-graph">Source on GitHub</a></footer>
+      <footer>JEV GIT GRAPH <span>·</span> Local artifact viewer <span>·</span> Never uploads loaded JSON</footer>
     </div>
   </body>
 </html>
