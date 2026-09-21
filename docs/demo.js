@@ -342,9 +342,15 @@
       decision.disposition = "UNRESOLVED";
       decision.preservation_destination = null;
       decision.preservation_proof = null;
-      decision.reviewer_id = null;
-      decision.reviewer = null;
-      decision.reviewed_at = null;
+      if (legacy) {
+        decision.reviewer_id = null;
+        decision.reviewer = null;
+        decision.reviewed_at = null;
+      } else {
+        decision.reviewer_id = decision.reviewer_id || decision.reviewer || "browser-local-reviewer";
+        decision.reviewer = decision.reviewer || decision.reviewer_id;
+        decision.reviewed_at = decision.reviewed_at || new Date().toISOString();
+      }
       decision.rationale = legacy ? "Legacy review imported; v2 proof is required before a current disposition." : "Preservation proof is incomplete or stale; disposition remains unresolved.";
       decision.reconciliation = { status: legacy ? "historical-limited" : "stale", reasons: [legacy ? "legacy_review_schema_v1" : "preservation_proof_required"] };
     }
