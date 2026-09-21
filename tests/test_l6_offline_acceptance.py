@@ -4,10 +4,15 @@ import copy
 import hashlib
 import json
 import os
+import re
 import shutil
+import socket
+import struct
 import subprocess
 import tempfile
+import time
 import unittest
+import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
@@ -203,6 +208,289 @@ def make_large_artifacts(inventory: dict) -> tuple[dict, dict]:
     return candidates, relations
 
 
+def find_headless_browser() -> Path | None:
+    candidates = [
+        shutil.which(name)
+        for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome")
+    ]
+    candidates.extend(
+        (
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        )
+    )
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file() and os.access(candidate, os.X_OK):
+            return Path(candidate)
+    return None
+
+
+class CdpWebSocket:
+    def __init__(self, url: str) -> None:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        if parsed.scheme != "ws" or parsed.hostname != "127.0.0.1" or parsed.port is None:
+            raise AssertionError(f"browser probe received a non-loopback DevTools URL: {url}")
+        self.socket = socket.create_connection((parsed.hostname, parsed.port), timeout=5)
+        key = __import__("base64").b64encode(os.urandom(16)).decode("ascii")
+        self.socket.sendall(
+            (
+                f"GET {parsed.path} HTTP/1.1\r\n"
+                f"Host: {parsed.hostname}:{parsed.port}\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {key}\r\n"
+                "Sec-WebSocket-Version: 13\r\n\r\n"
+            ).encode("ascii")
+        )
+        response = b""
+        while b"\r\n\r\n" not in response:
+            response += self.socket.recv(4096)
+        if not response.startswith(b"HTTP/1.1 101"):
+            raise AssertionError(f"browser DevTools WebSocket handshake failed: {response[:200]!r}")
+        self.next_id = 1
+
+    def _read_exact(self, size: int) -> bytes:
+        value = b""
+        while len(value) < size:
+            chunk = self.socket.recv(size - len(value))
+            if not chunk:
+                raise AssertionError("browser DevTools WebSocket closed unexpectedly")
+            value += chunk
+        return value
+
+    def _send(self, payload: dict) -> None:
+        raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        mask = os.urandom(4)
+        masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(raw))
+        length = len(masked)
+        if length < 126:
+            header = bytes((0x81, 0x80 | length))
+        elif length < 65536:
+            header = bytes((0x81, 0xFE)) + struct.pack(">H", length)
+        else:
+            header = bytes((0x81, 0xFF)) + struct.pack(">Q", length)
+        self.socket.sendall(header + mask + masked)
+
+    def _receive(self) -> tuple[int, bytes]:
+        first, second = self._read_exact(2)
+        opcode = first & 0x0F
+        length = second & 0x7F
+        if length == 126:
+            length = struct.unpack(">H", self._read_exact(2))[0]
+        elif length == 127:
+            length = struct.unpack(">Q", self._read_exact(8))[0]
+        if second & 0x80:
+            mask = self._read_exact(4)
+            value = self._read_exact(length)
+            value = bytes(byte ^ mask[index % 4] for index, byte in enumerate(value))
+        else:
+            value = self._read_exact(length)
+        return opcode, value
+
+    def command(self, method: str, params: dict | None = None) -> dict:
+        command_id = self.next_id
+        self.next_id += 1
+        self._send({"id": command_id, "method": method, "params": params or {}})
+        while True:
+            opcode, raw = self._receive()
+            if opcode == 9:
+                self._send({"id": 0, "method": "", "params": {}})
+                continue
+            if opcode == 8:
+                raise AssertionError("browser DevTools WebSocket closed while awaiting a command")
+            if opcode != 1:
+                continue
+            message = json.loads(raw)
+            if message.get("id") == command_id:
+                if "error" in message:
+                    raise AssertionError(f"browser DevTools command failed: {message['error']}")
+                return message
+
+    def close(self) -> None:
+        self.socket.close()
+
+
+def local_json(url: str) -> dict | list:
+    if not url.startswith("http://127.0.0.1:"):
+        raise AssertionError(f"browser probe attempted a non-loopback HTTP request: {url}")
+    with urllib.request.urlopen(url, timeout=3) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def run_browser_probe(browser: Path, inventory: dict, candidates: dict, relations: dict, output: Path) -> str:
+    """Run a real local Chrome DOM probe over the same 3,000-record artifacts."""
+
+    browser_dir = output / "browser"
+    browser_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    html_path = browser_dir / "l6-browser-fixture.html"
+    payload = json.dumps(
+        {"inventory": inventory, "candidates": candidates, "relations": relations},
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).replace("<", "\\u003c")
+    viewer_script = (Path(__file__).parents[1] / "docs" / "viewer-data.js").resolve().as_uri()
+    html_path.write_text(
+        f"""<!doctype html>
+<html><head><meta charset="utf-8"><script src={json.dumps(viewer_script)}></script></head>
+<body>
+<div id="candidate-count"></div>
+<div id="page-status"></div>
+<div id="page-one"></div>
+<div id="page-thirty"></div>
+<div id="component-status"></div>
+<script id="artifacts" type="application/json">{payload}</script>
+<script>
+(function () {{
+  const root = document.documentElement;
+  try {{
+    const artifacts = JSON.parse(document.getElementById("artifacts").textContent);
+    const model = globalThis.JevGraphData.normalize(artifacts);
+    const pageSize = 100;
+    const pageCount = Math.ceil(model.candidates.length / pageSize);
+    const page = (number) => model.candidates.slice((number - 1) * pageSize, number * pageSize);
+    const first = page(1);
+    const last = page(pageCount);
+    const connectedGroups = model.groups.filter((group) => group.count > 1);
+    const pageOneText = `Page 1 of ${{pageCount}}: ${{first[0].candidateId}} → ${{first.at(-1).candidateId}}`;
+    const pageThirtyText = `Page ${{pageCount}} of ${{pageCount}}: ${{last[0].candidateId}} → ${{last.at(-1).candidateId}}`;
+    document.getElementById("candidate-count").textContent = `Candidates: ${{model.counts.candidates}}`;
+    document.getElementById("page-status").textContent = `${{pageOneText}}; ${{pageThirtyText}}`;
+    document.getElementById("page-one").innerHTML = `<ol>${{first.map((item) => `<li>${{item.candidateId}}</li>`).join("")}}</ol>`;
+    document.getElementById("page-thirty").innerHTML = `<ol>${{last.map((item) => `<li>${{item.candidateId}}</li>`).join("")}}</ol>`;
+    document.getElementById("component-status").textContent = `Disconnected groups: ${{model.groups.length}}; connected groups: ${{connectedGroups.length}}`;
+    root.dataset.l6Status = model.errors.length === 0 && model.counts.candidates === 3000 && pageCount === 30 && first[0].candidateId === "fact-0000" && last.at(-1).candidateId === "unresolved-0999" && connectedGroups.length >= 2 ? "PASS" : "FAIL";
+    root.dataset.candidateCount = String(model.counts.candidates);
+    root.dataset.pageOne = first[0].candidateId;
+    root.dataset.pageThirty = last.at(-1).candidateId;
+    root.dataset.connectedGroups = String(connectedGroups.length);
+  }} catch (error) {{
+    root.dataset.l6Status = "FAIL";
+    root.dataset.l6Error = String(error);
+  }}
+}})();
+</script>
+</body></html>
+""",
+        encoding="utf-8",
+    )
+    port_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    port_socket.bind(("127.0.0.1", 0))
+    port = port_socket.getsockname()[1]
+    port_socket.close()
+    profile = browser_dir / "profile"
+    command = (
+        "open",
+        "-na",
+        "Google Chrome" if "Google Chrome" in str(browser) else "Chromium",
+        "--args",
+        "--headless",
+        "--no-sandbox",
+        "--no-startup-window",
+        f"--remote-debugging-port={port}",
+        "--remote-debugging-address=127.0.0.1",
+        f"--user-data-dir={profile}",
+        "--disable-gpu",
+        "--disable-dev-shm-usage",
+        "--allow-file-access-from-files",
+        "--disable-background-networking",
+        "--disable-component-update",
+        "--disable-sync",
+        "--disable-extensions",
+        "--disable-breakpad",
+        "--disable-crash-reporter",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--no-proxy-server",
+    )
+    launcher = None
+    browser_socket = None
+    page_socket = None
+    try:
+        launcher = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        version_url = f"http://127.0.0.1:{port}/json/version"
+        deadline = time.monotonic() + 20
+        version = None
+        while time.monotonic() < deadline:
+            try:
+                version = local_json(version_url)
+                break
+            except (OSError, ValueError):
+                time.sleep(0.1)
+        if not isinstance(version, dict) or not isinstance(version.get("webSocketDebuggerUrl"), str):
+            stderr = launcher.stderr.read() if launcher.stderr else ""
+            raise AssertionError(f"installed Chrome/Chromium browser probe did not start on loopback: {browser}\n{stderr[-4000:]}")
+        browser_socket = CdpWebSocket(version["webSocketDebuggerUrl"])
+        created = browser_socket.command("Target.createTarget", {"url": "about:blank"})
+        target_id = created["result"]["targetId"]
+        target = None
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            target_list = local_json(f"http://127.0.0.1:{port}/json/list")
+            target = next((item for item in target_list if item.get("id") == target_id), None)
+            if target and isinstance(target.get("webSocketDebuggerUrl"), str):
+                break
+            time.sleep(0.1)
+        if not target or not isinstance(target.get("webSocketDebuggerUrl"), str):
+            raise AssertionError("installed Chrome/Chromium browser probe did not expose its local page target")
+        page_socket = CdpWebSocket(target["webSocketDebuggerUrl"])
+        page_socket.command("Page.navigate", {"url": html_path.resolve().as_uri()})
+        dom = ""
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            evaluated = page_socket.command(
+                "Runtime.evaluate",
+                {"expression": "document.documentElement.outerHTML", "returnByValue": True},
+            )
+            dom = evaluated["result"]["result"].get("value", "")
+            if 'data-l6-status="PASS"' in dom or 'data-l6-status="FAIL"' in dom:
+                break
+            time.sleep(0.1)
+    except (OSError, KeyError, TypeError, ValueError, AssertionError) as exc:
+        raise AssertionError(f"installed Chrome/Chromium browser probe failed: {browser}: {exc}\nDOM tail:\n{dom[-4000:]}") from exc
+    finally:
+        if page_socket is not None:
+            page_socket.close()
+        if browser_socket is not None:
+            try:
+                browser_socket.command("Browser.close")
+            except Exception:
+                pass
+            browser_socket.close()
+        if launcher is not None:
+            try:
+                launcher.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                launcher.terminate()
+                launcher.wait(timeout=5)
+            finally:
+                if launcher.stdout is not None:
+                    launcher.stdout.close()
+                if launcher.stderr is not None:
+                    launcher.stderr.close()
+    if 'data-l6-status="PASS"' not in dom:
+        raise AssertionError(
+            f"installed Chrome/Chromium browser probe reported FAIL: {browser}\nDOM tail:\n{dom[-4000:]}"
+        )
+    attributes = {}
+    for name in ("data-candidate-count", "data-page-one", "data-page-thirty", "data-connected-groups"):
+        match = re.search(rf'{name}="([^"]+)"', dom)
+        if match is None:
+            raise AssertionError(f"installed Chrome/Chromium browser probe omitted DOM attribute: {name}")
+        attributes[name] = match.group(1)
+    if attributes != {
+        "data-candidate-count": "3000",
+        "data-page-one": "fact-0000",
+        "data-page-thirty": "unresolved-0999",
+        "data-connected-groups": attributes["data-connected-groups"],
+    } or int(attributes["data-connected-groups"]) < 2:
+        raise AssertionError(f"installed Chrome/Chromium browser probe returned unexpected DOM attributes: {attributes}")
+    if "Page 1 of 30" not in dom or "Page 30 of 30" not in dom or "Disconnected groups:" not in dom:
+        raise AssertionError("installed Chrome/Chromium browser probe did not render required DOM evidence")
+    return f"PASS ({browser})"
+
+
 class L6OfflineAcceptanceTests(unittest.TestCase):
     def test_offline_integrated_acceptance_harness(self) -> None:
         node = shutil.which("node")
@@ -270,6 +558,13 @@ class L6OfflineAcceptanceTests(unittest.TestCase):
             self.assertIn("candidates=3000", probe.stdout)
             self.assertIn("first=fact-0000", probe.stdout)
             self.assertIn("last=unresolved-0999", probe.stdout)
+
+            browser = find_headless_browser()
+            if browser is None:
+                browser_evidence = "NOT RUN (no Chrome/Chromium binary installed)"
+            else:
+                browser_evidence = run_browser_probe(browser, inventory, candidates, relations, output)
+            print(f"L6 browser probe: {browser_evidence}")
 
             repository_id = inventory["repository"]["id"]
             target_branch = next(item for item in inventory["branches"] if item["name"] == "patch-source")

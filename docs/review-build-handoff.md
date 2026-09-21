@@ -29,6 +29,15 @@ as current, changes one branch tip and observes a stale decision, builds the
 preservation queue, and invokes `jg plan` with the re-imported decision. The
 CLI plan must report `PRESERVE_IN_BRANCH` and `current` for `patch-source`.
 
+When Chrome or Chromium is installed, the harness also writes a temporary
+`file://` HTML fixture that loads the actual `docs/viewer-data.js` and the same
+3,000-record JSON. It launches the browser with a temporary profile and a
+DevTools endpoint bound to `127.0.0.1`, navigates the fixture, reads the real
+DOM through that loopback endpoint, and asserts the candidate count, page 1,
+page 30, and disconnected-group evidence. If no supported browser is present,
+the test records `NOT RUN`; if one is present and the probe fails, the test
+fails rather than claiming browser coverage.
+
 ## Verification commands and results
 
 Run from the repository root:
@@ -42,9 +51,10 @@ Observed result:
 ```text
 test_offline_integrated_acceptance_harness (...) ... ok
 ----------------------------------------------------------------------
-Ran 1 test in 1.880s
+Ran 1 test in 2.684s
 
 OK
+L6 browser probe: PASS (/Applications/Google Chrome.app/Contents/MacOS/Google Chrome)
 ```
 
 ```text
@@ -65,11 +75,12 @@ installation, live Jev request, or network access was required.
 The inaccessible-worktree case is injected through the existing `status_for`
 boundary because filesystem permission behavior varies by platform and test
 users. The harness verifies the resulting incomplete inventory and diagnostic
-artifact without deleting or changing the worktree. Pagination is exercised by
-the same local page slicing contract used by the viewer; a browser DOM or live
-HTTP server is not started. There is no separate `jg preservation` subcommand
-in this parent; the harness consumes the exported decision through `jg plan`
-and independently verifies `build_preservation_plan`.
+artifact without deleting or changing the worktree. Browser coverage is
+conditional on an installed Chrome/Chromium binary; this environment passed
+with Chrome 153.0.8010.48. The browser probe is a local `file://` fixture and
+does not start the full docs UI or a live HTTP server. There is no separate
+`jg preservation` subcommand in this parent; the harness consumes the exported
+decision through `jg plan` and independently verifies `build_preservation_plan`.
 
 The test asserts fixture bytes and `git show-ref` output are identical before
 and after the run, rejects network-client calls in the Python process, checks
