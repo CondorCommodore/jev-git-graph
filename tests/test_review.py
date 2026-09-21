@@ -86,7 +86,7 @@ def v2_review(inventory: dict, candidates: dict, relations: dict | None) -> dict
         for item in records:
             key = object_id(kind, item)
             fingerprint = object_fingerprint(kind, item)
-            destination = {"kind": "archive", "object_id": key}
+            destination = {"kind": "archive", "archive_id": f"archive:{key}", "repository_id": source["repository_id"]}
             evidence = {"review_signal": key}
             decisions.append({
                 "object_id": key,
@@ -193,14 +193,33 @@ class ReviewReconciliationTests(unittest.TestCase):
             decision["preservation_destination"] = None
             decision["preservation_proof"] = None
             validated = validate_review_document(review, inventory["repository"]["id"])
-            self.assertIn("preservation_destination_missing", validated["limitations"])
+            self.assertIn("preservation_destination_invalid", validated["limitations"])
             self.assertIn("preservation_proof_missing", validated["limitations"])
             result = reconcile_reviews(review, inventory, candidates, relations)
             carried = next(item for item in result["decisions"] if item["object_id"] == decision["object_id"])
             self.assertEqual("stale", carried["reconciliation"]["status"])
-            self.assertIn("preservation_destination_missing", carried["reconciliation"]["reasons"])
+            self.assertIn("preservation_destination_invalid", carried["reconciliation"]["reasons"])
             self.assertIn("preservation_proof_missing", carried["reconciliation"]["reasons"])
             self.assertEqual("not_verified", result["cleanup_readiness"])
+
+    def test_truthy_meaningless_destination_and_incomplete_proof_are_stale(self):
+        inventory, candidates, relations = make_artifacts()
+        for disposition in ("PRESERVE_IN_ARCHIVE", "CLEANUP_CANDIDATE"):
+            review = v2_review(inventory, candidates, relations)
+            decision = review["decisions"][0]
+            decision["disposition"] = disposition
+            decision["preservation_destination"] = {"meaningless": "value"}
+            decision["preservation_proof"] = {"verified": True}
+            validated = validate_review_document(review, inventory["repository"]["id"])
+            self.assertIn("preservation_destination_invalid", validated["limitations"])
+            self.assertIn("preservation_source_fingerprint_missing", validated["limitations"])
+            self.assertIn("preservation_destination_fingerprint_missing", validated["limitations"])
+            result = reconcile_reviews(review, inventory, candidates, relations)
+            carried = next(item for item in result["decisions"] if item["object_id"] == decision["object_id"])
+            self.assertEqual("stale", carried["reconciliation"]["status"])
+            self.assertIn("preservation_destination_invalid", carried["reconciliation"]["reasons"])
+            self.assertIn("preservation_source_fingerprint_missing", carried["reconciliation"]["reasons"])
+            self.assertIn("preservation_destination_fingerprint_missing", carried["reconciliation"]["reasons"])
 
     def test_active_and_unresolved_allow_null_preservation_fields(self):
         inventory, candidates, relations = make_artifacts()

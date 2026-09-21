@@ -27,6 +27,13 @@ PRESERVATION_REQUIRED_DISPOSITIONS = {
     "PRESERVE_IN_ARCHIVE",
     "CLEANUP_CANDIDATE",
 }
+DESTINATION_KINDS = {"local", "archive", "branch", "pr"}
+DESTINATION_ID_FIELDS = {
+    "local": ("path", "path_id", "directory_id"),
+    "archive": ("archive_id", "path", "path_id"),
+    "branch": ("name", "ref"),
+    "pr": ("number", "pr_id", "url"),
+}
 PROVENANCE_FIELDS = (
     "repository_id",
     "inventory_digest",
@@ -156,11 +163,17 @@ def _reviewer_identity(value: Any, label: str) -> str | None:
 
 
 def _meaningful_destination(value: Any) -> bool:
-    if isinstance(value, str):
-        return bool(value.strip())
-    if isinstance(value, (dict, list)):
-        return bool(value)
-    return False
+    if not isinstance(value, dict):
+        return False
+    kind = value.get("kind")
+    if not isinstance(kind, str) or kind.lower() not in DESTINATION_KINDS:
+        return False
+    identity_fields = DESTINATION_ID_FIELDS[kind.lower()]
+    return any(
+        (isinstance(value.get(field), str) and bool(value[field].strip()))
+        or (field == "number" and isinstance(value.get(field), int) and not isinstance(value[field], bool) and value[field] > 0)
+        for field in identity_fields
+    )
 
 
 def _validate_preservation(decision: dict[str, Any], schema_version: int, limitations: list[str]) -> None:
@@ -183,11 +196,22 @@ def _validate_preservation(decision: dict[str, Any], schema_version: int, limita
             raise JgError("review preservation proof destination does not match destination")
     if decision.get("disposition") in PRESERVATION_REQUIRED_DISPOSITIONS:
         if not _meaningful_destination(destination):
-            limitations.append("preservation_destination_missing")
+            limitations.append("preservation_destination_invalid")
         if not isinstance(proof, dict) or not proof:
             limitations.append("preservation_proof_missing")
-        elif proof.get("verified") is not True:
-            limitations.append("preservation_proof_unverified")
+        else:
+            if proof.get("verified") is not True:
+                limitations.append("preservation_proof_unverified")
+            if proof.get("source_fingerprint") is None:
+                limitations.append("preservation_source_fingerprint_missing")
+            elif proof.get("source_fingerprint") != decision.get("source_fingerprint", decision.get("fingerprint")):
+                limitations.append("preservation_proof_stale")
+            if proof.get("destination_fingerprint") is None:
+                limitations.append("preservation_destination_fingerprint_missing")
+            elif _meaningful_destination(destination) and proof.get("destination_fingerprint") != digest(destination):
+                limitations.append("preservation_destination_stale")
+            if proof.get("destination") != destination:
+                limitations.append("preservation_destination_stale")
     elif destination is not None and proof is None:
         limitations.append("preservation_proof_missing")
 
@@ -351,7 +375,7 @@ def _preservation_stale_reasons(decision: dict[str, Any], current_fingerprint: s
     destination = decision.get("preservation_destination")
     proof = decision.get("preservation_proof")
     if requires_preservation and not _meaningful_destination(destination):
-        reasons.append("preservation_destination_missing")
+        reasons.append("preservation_destination_invalid")
     if (requires_preservation and (not isinstance(proof, dict) or not proof)) or (destination is not None and proof is None):
         reasons.append("preservation_proof_missing")
     if isinstance(proof, dict):
@@ -359,11 +383,17 @@ def _preservation_stale_reasons(decision: dict[str, Any], current_fingerprint: s
             reasons.append("preservation_proof_unverified")
         elif proof.get("verified") is False:
             reasons.append("preservation_proof_stale")
-        if proof.get("source_fingerprint") not in (None, current_fingerprint):
+        if requires_preservation and proof.get("source_fingerprint") is None:
+            reasons.append("preservation_source_fingerprint_missing")
+        elif proof.get("source_fingerprint") != current_fingerprint:
             reasons.append("preservation_proof_stale")
-        if proof.get("destination_fingerprint") not in (None, digest(destination)):
+        if requires_preservation and proof.get("destination_fingerprint") is None:
+            reasons.append("preservation_destination_fingerprint_missing")
+        elif proof.get("destination_fingerprint") != digest(destination):
             reasons.append("preservation_destination_stale")
-        if "destination" in proof and proof["destination"] != destination:
+        if requires_preservation and proof.get("destination") != destination:
+            reasons.append("preservation_destination_stale")
+        elif "destination" in proof and proof["destination"] != destination:
             reasons.append("preservation_destination_stale")
     evidence = decision.get("evidence")
     evidence_fingerprint = decision.get("evidence_fingerprint")
