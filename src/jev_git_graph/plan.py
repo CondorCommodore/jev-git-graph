@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from .artifacts import validate_artifacts
 from .errors import JgError
 from .review import object_fingerprint, object_id, validate_review
 from .safety import digest, read_json, write_json, write_private_text
@@ -11,13 +12,14 @@ from .safety import digest, read_json, write_json, write_private_text
 def build_plan(inventory_path: str | Path, candidates_path: str | Path, relations_path: str | Path | None = None, review_path: str | Path | None = None) -> tuple[dict[str, Any], str]:
     inventory = read_json(inventory_path)
     candidates = read_json(candidates_path)
+    relations = read_json(relations_path) if relations_path is not None else None
+    artifact_validation = validate_artifacts(inventory, candidates, relations)
     if inventory.get("repository", {}).get("id") != candidates.get("repository_id"):
         raise JgError("inventory and candidates belong to different repositories")
     if inventory.get("collection", {}).get("complete") is not True:
         raise JgError("inventory is incomplete; cannot build a review plan")
     if candidates.get("inventory_digest") != digest(inventory):
         raise JgError("candidates were built from a different inventory")
-    relations = read_json(relations_path) if relations_path else None
     review = read_json(review_path) if review_path else None
     if relations:
         if relations.get("repository_id") and relations["repository_id"] != candidates.get("repository_id"):
@@ -78,6 +80,9 @@ def build_plan(inventory_path: str | Path, candidates_path: str | Path, relation
         "dispositions": disposition,
         "candidate_count": len(candidates.get("candidates", [])),
         "relation_count": len(relation_by_candidate),
+        "artifact_validation": artifact_validation,
+        "validation_limitations": artifact_validation["limitations"],
+        "cleanup_readiness": artifact_validation["cleanup_readiness"],
     }
     lines = ["# Git relationship review plan", "", "This report proposes no destructive action. Review every unresolved item before any cleanup.", "", "## Dispositions", "", "| Kind | Item | Disposition | Reason |", "| --- | --- | --- | --- |"]
     for item in disposition:
