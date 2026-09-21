@@ -55,7 +55,7 @@ Observed result:
 ```text
 test_offline_integrated_acceptance_harness (...) ... ok
 ----------------------------------------------------------------------
-Ran 1 test in 35.078s
+Ran 1 test in 25.378s
 
 OK
 L6 browser probe: PASS (/Applications/Google Chrome.app/Contents/MacOS/Google Chrome; production DOM; Page 1 of 30 · 1-100 of 3000; Page 30 of 30 · 2901-3000 of 3000; graph=24 of 3000 candidates on graph page)
@@ -71,7 +71,7 @@ Observed result: `16` tests passed, `0` failed.
 PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-Observed result: `53` tests passed, `0` failed in `8.862s`. No package
+Observed result: `53` tests passed, `0` failed in `45.961s`. No package
 installation, live Jev request, or network access was required.
 
 ## Limitations
