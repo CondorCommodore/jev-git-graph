@@ -12,6 +12,33 @@ from jev_git_graph.jev import payload_for_candidate
 
 
 class BatchTests(unittest.TestCase):
+    def test_exactly_preserved_pair_never_enters_jev_preview(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            candidate = {"id": "pair", "endpoints": {
+                "a": {"branch": "a", "tip": "a" * 40},
+                "b": {"branch": "b", "tip": "b" * 40}},
+                "reasons": [], "evidence": {"shared_patch_ids": [], "shared_paths": [],
+                "shared_subject_tokens": [], "a_unique_commit_count": 1,
+                "b_unique_commit_count": 1, "a_merge_base": None, "b_merge_base": None}}
+            source = {"kind": "candidates", "repository_id": "repo", "inventory_digest": "0" * 64,
+                      "candidates": [candidate]}
+            write_json(root / "candidates.json", source)
+            exact = {"kind": "branch-equivalence", "repository_id": "repo", "inventory_digest": "0" * 64,
+                     "branches": [{"name": name, "tip": name * 40,
+                                   "content_verdict": "ALREADY_PRESERVED"} for name in ("a", "b")]}
+            write_json(root / "equivalence.json", exact)
+            result = read_json(prepare_batches(root / "candidates.json", root / "batches", equivalence_path=root / "equivalence.json"))
+            self.assertEqual(0, result["pending_requests"])
+            self.assertEqual(1, result["exactly_preserved_pairs"])
+            self.assertEqual([], result["batches"])
+            exact["branches"][0]["in_scope"] = False
+            write_json(root / "equivalence.json", exact)
+            recent = read_json(prepare_batches(root / "candidates.json", root / "recent-batches", equivalence_path=root / "equivalence.json"))
+            self.assertEqual(0, recent["out_of_scope_pairs"])
+            self.assertEqual(0, recent["exactly_preserved_pairs"])
+            self.assertEqual(1, recent["pending_requests"])
+
     def test_missing_checkpoint_covered_by_another_plan_is_not_missing(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

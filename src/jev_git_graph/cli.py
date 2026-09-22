@@ -1,20 +1,27 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
 from . import __version__
+from . import git
 from .candidates import write_candidates
 from .batches import prepare_batches, collect_batches
 from .calibration import write_calibration
+from .coverage import write_coverage
+from .cleanup import approve_cleanup_plan, execute_cleanup, write_cleanup_plan
+from .code_evidence import approve_code_batch, build_code_evidence, build_transient_preview
 from .decisions import write_decisions
+from .equivalence import write_equivalence
 from .errors import JgError
 from .inventory import protected_worktree_paths, write_inventory
-from .jev import DEFAULT_MAX_JEV_PAYLOAD_BYTES, DEFAULT_MAX_JEV_REQUESTS, EVIDENCE_PROFILES, checkpoint_lock, execute_preview, write_preview
+from .jev import DEFAULT_MAX_JEV_PAYLOAD_BYTES, DEFAULT_MAX_JEV_REQUESTS, EVIDENCE_PROFILES, checkpoint_lock, execute_preview, execute_transient_preview, write_preview
 from .plan import write_plan
+from .residual import analyze_residual
 from .resume import resume_batches
-from .safety import validate_output_path, write_json
+from .safety import canonical_json, opaque_path_id, read_json, validate_output_path, write_json
 from .viewer import serve as serve_viewer
 
 
@@ -46,6 +53,16 @@ def parser() -> argparse.ArgumentParser:
     relate.add_argument("--approved-payload-sha256")
     relate.add_argument("--max-jev-requests", type=int, default=DEFAULT_MAX_JEV_REQUESTS)
     relate.add_argument("--max-jev-payload-bytes", type=int, default=DEFAULT_MAX_JEV_PAYLOAD_BYTES)
+    code_relate = commands.add_parser("code-relate", help="transient opt-in Python excerpt preview or approved Jev request")
+    code_relate.add_argument("--repo", required=True)
+    code_relate.add_argument("--candidates", required=True)
+    code_relate.add_argument("--selection", required=True, help="metadata-only JSON mapping candidate IDs to pinned refs and ranges")
+    code_relate.add_argument("--use-jev", action="store_true")
+    code_relate.add_argument("--approved-payload-sha256")
+    code_relate.add_argument("--approved-batch-sha256")
+    code_relate.add_argument("--max-jev-requests", type=int, default=DEFAULT_MAX_JEV_REQUESTS)
+    code_relate.add_argument("--max-jev-payload-bytes", type=int, default=DEFAULT_MAX_JEV_PAYLOAD_BYTES)
+    code_relate.add_argument("--out", help="private directory for sanitized judgment record, only for live requests")
 
     plan = commands.add_parser("plan", help="render a non-destructive human review plan")
     plan.add_argument("--repo", required=True)
@@ -61,6 +78,7 @@ def parser() -> argparse.ArgumentParser:
     batches.add_argument("--batch-size", type=int, default=32)
     batches.add_argument("--previous-relations", action="append", default=[])
     batches.add_argument("--evidence-profile", choices=EVIDENCE_PROFILES, default="minimal")
+    batches.add_argument("--equivalence", help="skip pairs whose two endpoints are exactly preserved")
     collect = commands.add_parser("collect", help="aggregate verified batch checkpoints for the viewer")
     collect.add_argument("--repo", required=True)
     collect.add_argument("--candidates", required=True)
@@ -77,6 +95,39 @@ def parser() -> argparse.ArgumentParser:
     decisions.add_argument("--candidates", required=True)
     decisions.add_argument("--relations", required=True)
     decisions.add_argument("--out", required=True)
+    decisions.add_argument("--equivalence", help="optional exact local content verdicts")
+    equivalence = commands.add_parser("equivalence", help="compare committed content locally without Jev")
+    equivalence.add_argument("--repo", required=True)
+    equivalence.add_argument("--inventory", required=True)
+    equivalence.add_argument("--out", required=True)
+    equivalence.add_argument("--approved-destination", action="append", default=[], help="non-main local branch approved as a preservation destination")
+    equivalence.add_argument("--ignore-recent-hours", type=float, default=0, help="exclude branches with recent commit or ref activity; missing reflogs are excluded")
+    coverage = commands.add_parser("coverage", help="prove per-path exact content coverage by pinned main")
+    coverage.add_argument("--repo", required=True)
+    coverage.add_argument("--inventory", required=True)
+    coverage.add_argument("--out", required=True)
+    coverage.add_argument("--recent-hours", type=float, default=24)
+    residual = commands.add_parser("residual", help="simulate a pinned branch merge in an independent repository")
+    residual.add_argument("--repo", required=True)
+    residual.add_argument("--coverage", required=True)
+    residual.add_argument("--branch", required=True)
+    residual.add_argument("--out", required=True)
+    cleanup = commands.add_parser("cleanup", help="prepare or inspect guarded local branch cleanup")
+    cleanup_steps = cleanup.add_subparsers(dest="cleanup_command", required=True)
+    cleanup_plan = cleanup_steps.add_parser("plan", help="prepare bounded exact cleanup manifest and recovery bundle")
+    cleanup_plan.add_argument("--repo", required=True)
+    cleanup_plan.add_argument("--coverage", required=True)
+    cleanup_plan.add_argument("--out", required=True)
+    cleanup_plan.add_argument("--max-branches", type=int, default=25)
+    cleanup_approve = cleanup_steps.add_parser("approve", help="record approval of one reviewed cleanup manifest digest")
+    cleanup_approve.add_argument("--repo", required=True)
+    cleanup_approve.add_argument("--plan", required=True)
+    cleanup_approve.add_argument("--approved-digest", required=True)
+    cleanup_approve.add_argument("--out", required=True)
+    cleanup_execute = cleanup_steps.add_parser("execute", help="check approval and lease gate; without an integrated lease, no refs are deleted")
+    cleanup_execute.add_argument("--repo", required=True)
+    cleanup_execute.add_argument("--plan", required=True)
+    cleanup_execute.add_argument("--approved-digest", required=True)
     resume = commands.add_parser("resume", help="resume one approved Jev batch plan, retaining uncertain attempts")
     resume.add_argument("--repo", required=True)
     resume.add_argument("--batch-plan", required=True)
@@ -90,6 +141,7 @@ def parser() -> argparse.ArgumentParser:
     viewer.add_argument("--candidates", required=True)
     viewer.add_argument("--relations", required=True)
     viewer.add_argument("--review")
+    viewer.add_argument("--equivalence")
     viewer.add_argument("--port", type=int, default=8877)
     return root
 
@@ -99,9 +151,86 @@ def _protected_output(repo: str, output: str) -> Path:
 
 
 def run(args: argparse.Namespace) -> str:
+    if args.command == "code-relate":
+        candidates = read_json(args.candidates)
+        root, _common, _runner = git.open_repository(args.repo)
+        if candidates.get("kind") != "candidates" or candidates.get("repository_id") != opaque_path_id(root):
+            raise JgError("candidates artifact belongs to a different local repository")
+        selection = read_json(args.selection)
+        if selection.get("kind") != "jev-code-selection" or not isinstance(selection.get("candidates"), dict):
+            raise JgError("code selection must map candidate IDs to pinned refs and ranges")
+        records = {}
+        for candidate in candidates.get("candidates", []):
+            candidate_id = candidate["id"]
+            chosen = selection["candidates"].get(candidate_id)
+            if not isinstance(chosen, dict) or not chosen.get("source_ref") or not chosen.get("main_ref"):
+                raise JgError(f"code selection lacks pinned refs for {candidate_id}")
+            endpoints = candidate.get("endpoints", {})
+            endpoint_tips = {item.get("tip") for item in endpoints.values() if isinstance(item, dict)}
+            if endpoint_tips != {chosen.get("source_tip"), chosen.get("main_tip")} or len(endpoint_tips) != 2:
+                raise JgError(f"code selection tips do not match candidate endpoints for {candidate_id}")
+            records[candidate_id] = build_code_evidence(
+                args.repo, chosen["source_tip"], chosen["main_tip"], chosen["ranges"],
+                source_ref=chosen["source_ref"], main_ref=chosen["main_ref"])
+        preview = build_transient_preview(candidates, records)
+        approval = approve_code_batch(records.values(), preview["requests"])
+        if not args.use_jev:
+            if args.out:
+                raise JgError("transient code preview cannot be written to an artifact directory")
+            return canonical_json({"preview": preview, "approval": approval}).decode("ascii")
+        if not args.out or not args.approved_payload_sha256 or not args.approved_batch_sha256:
+            raise JgError("live code request requires --out and approved payload and batch digests")
+        if args.approved_payload_sha256 != approval["payload_sha256"] or args.approved_batch_sha256 != approval["approval_sha256"]:
+            raise JgError("approved code request digests do not match current inputs")
+        target = _protected_output(args.repo, args.out)
+        target.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if target.stat().st_mode & 0o077:
+            raise JgError("code response directory must be owner-only")
+        result = execute_transient_preview(
+            preview, args.approved_payload_sha256,
+            approved_code_batch_sha256=args.approved_batch_sha256,
+            code_evidence_repo=args.repo,
+            max_requests=args.max_jev_requests,
+            max_payload_bytes=args.max_jev_payload_bytes)
+        path = target / "code-relations.json"
+        write_json(path, result)
+        return str(path)
+    if args.command == "cleanup":
+        if args.cleanup_command == "plan":
+            return str(write_cleanup_plan(args.repo, args.coverage, args.out, max_branches=args.max_branches))
+        if args.cleanup_command == "approve":
+            plan = read_json(args.plan)
+            if plan.get("plan_digest") != args.approved_digest:
+                raise JgError("approved digest does not match cleanup plan")
+            approved = approve_cleanup_plan(plan, approved_digest=args.approved_digest)
+            target = _protected_output(args.repo, args.out)
+            target.mkdir(mode=0o700, parents=True, exist_ok=True)
+            path = target / "approved-cleanup-plan.json"
+            write_json(path, approved)
+            return str(path)
+        result = execute_cleanup(args.repo, args.plan, approved_digest=args.approved_digest)
+        return json.dumps(result, sort_keys=True)
     if args.command == "decisions":
         destination = _protected_output(args.repo, args.out)
-        return str(write_decisions(args.inventory, args.candidates, args.relations, destination))
+        return str(write_decisions(args.inventory, args.candidates, args.relations, destination, args.equivalence))
+    if args.command == "equivalence":
+        return str(write_equivalence(args.repo, args.inventory, args.out, args.approved_destination, args.ignore_recent_hours))
+    if args.command == "coverage":
+        return str(write_coverage(args.repo, args.inventory, args.out, args.recent_hours))
+    if args.command == "residual":
+        coverage = read_json(args.coverage)
+        if coverage.get("kind") != "branch-coverage":
+            raise JgError("residual requires a coverage artifact")
+        branch = next((item for item in coverage["branches"] if item["name"] == args.branch), None)
+        if branch is None or branch["verdict"] == "UNKNOWN":
+            raise JgError("branch has no valid pinned coverage")
+        target = _protected_output(args.repo, args.out)
+        result = analyze_residual(args.repo, branch["tip"], coverage["main"]["tip"],
+                                  [item["path"] for item in branch["paths"]])
+        target.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = target / "residual.json"
+        write_json(path, result)
+        return str(path)
     if args.command == "resume":
         _protected_output(args.repo, str(Path(args.batch_plan).parent))
         return str(resume_batches(args.batch_plan, args.approved_plan_sha256,
@@ -112,6 +241,8 @@ def run(args: argparse.Namespace) -> str:
         artifacts = {"inventory": Path(args.inventory), "candidates": Path(args.candidates), "relations": Path(args.relations)}
         if args.review:
             artifacts["review"] = Path(args.review)
+        if args.equivalence:
+            artifacts["equivalence"] = Path(args.equivalence)
         serve_viewer(artifacts, args.port)
         return ""
     if args.command == "calibrate":
@@ -122,7 +253,7 @@ def run(args: argparse.Namespace) -> str:
         return str(collect_batches(args.batch_plan, args.candidates, destination))
     if args.command == "batches":
         destination = _protected_output(args.repo, args.out)
-        return str(prepare_batches(args.candidates, destination, args.batch_size, args.previous_relations, args.evidence_profile))
+        return str(prepare_batches(args.candidates, destination, args.batch_size, args.previous_relations, args.evidence_profile, args.equivalence))
     if args.command == "inventory":
         return str(write_inventory(args.repo, args.out))
     if args.command == "candidates":

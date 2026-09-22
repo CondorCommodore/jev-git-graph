@@ -38,11 +38,11 @@ The primary user is a maintainer responsible for a busy Git repository. They nee
 - Inventories refs, worktrees, dirty state, stashes, unique commits, changed paths, and exact patch equivalence.
 - Builds a bounded candidate graph from deterministic signals.
 - Optionally asks Jev typed questions about candidate relationships, with explicit consent to send a previewed payload.
-- Produces a review report and machine-readable evidence. All operations are read-only.
+- Produces a review report and machine-readable evidence. The analysis and review operations are read-only; the separately approved cleanup executor below is an explicit later extension.
 
 ### Outside the first version
 
-- Deleting branches, dropping stashes, removing worktrees, resetting files, force pushing, or merging code.
+- Dropping stashes, removing worktrees, resetting files, force pushing, or merging code. Local branch deletion is available only through the separately approved, lease-gated cleanup extension below.
 - Automatically choosing a canonical branch for unique work.
 - Indexing full source files or sending raw diffs to a model by default.
 - A required graph or relational database. The first graph is in memory and exported as files.
@@ -56,11 +56,11 @@ The first version is safe to point at a private repository because collection, c
 - It does not call GitHub, GitLab, a hosted issue tracker, analytics, telemetry, crash reporting, or an update service.
 - It does not create commits, refs, notes, stashes, worktrees, index entries, files, or directories inside the inspected repository or any linked worktree.
 - It writes artifacts only to an explicit `--out DIR` outside every inspected worktree. It rejects an output path inside an inspected worktree, including through a resolved symlink.
-- It does not read credential files, environment values, Git remote URLs containing credentials, or file contents from the inspected repository.
+- It does not read credential files, environment values, or Git remote URLs containing credentials. File contents are read only under the explicitly selected `code` evidence profile described below, from committed Git blobs and bounded Python ranges.
 
-The only network path is the opt-in Jev adapter. It has no default API key lookup and cannot run until the operator both supplies credentials through their own environment or secret store and passes `--use-jev`. Before one request, `jg relate --preview` renders the exact JSON payload, its byte count, and the destination host. A live call sends only the fields listed in the payload contract below; it never uploads a full repository, raw working-tree diff, source file, credential, or report. There is no OpenAI, Codex, Claude, generic LLM, agent, model-router, or fallback API client in the project.
+The only network path is the opt-in Jev adapter. It has no default API key lookup and cannot run until the operator both supplies credentials through their own environment or secret store and passes `--use-jev`. Before one metadata request, `jg relate --preview` renders the exact JSON payload, its byte count, and the destination host. A live metadata call sends only the fields listed in the payload contract below; it never uploads a full repository, raw working-tree diff, source file, credential, or report. The explicit `code` profile may send only approved bounded committed excerpts through the transient preview flow. There is no OpenAI, Codex, Claude, generic LLM, agent, model-router, or fallback API client in the project.
 
-The default inventory is metadata-only: ref names, object IDs, commit subjects, timestamps, path names, patch IDs, and worktree/stash state. Commit bodies and changed-line excerpts are disabled by default. Their inclusion requires a separate explicit flag and is shown in the Jev preview.
+The default inventory is metadata-only: ref names, object IDs, commit subjects, timestamps, path names, patch IDs, and worktree/stash state. The optional, versioned `code` evidence profile is a narrow exception to the no-file-content rule: it reads only explicitly selected committed Python line ranges from pinned source and main blobs. Sensitive paths and content are denied, scanning errors fail closed, and line, excerpt, and byte limits apply. `jg code-relate` prints the exact request JSON as a transient local preview and never writes that preview or raw excerpts to an artifact. A live request needs both the approved payload digest and batch digest; refs, blobs, ranges, and hashes are revalidated immediately before every send. The persistent response record contains only validated answers, model, usage, status, timings, and digests. Provider raw responses, echoed code, preview bytes, and error bodies are never persisted. Metadata-only remains the default.
 
 ## 4. Core model
 
@@ -207,6 +207,24 @@ Jev is most useful at stages 4–5: explaining relationships that ancestry canno
 ### Execution boundary and implementation gaps
 
 The first version ends at a reviewed plan. As specified in §3, it excludes commits, merges, branch deletion, worktree removal, and stash dropping. Stages 7–9 require a separately authorized execution workflow. The current CLI must not be described as an automatic cleanup tool. Local evidence also does not establish that a checkout is current with a Git remote; that claim requires a separately authorized remote check.
+
+### Local exact-content prepass
+
+`jg coverage` is the strict cleanup evidence. It pins each recorded source tip and the local default-branch tip, walks the source's net-changed paths from its merge base, and compares Git tree entries (blob ID, mode, and deletion) at those two tips. Each path is `EXACT_PRESENT` or `DISTINCT`; incomplete or stale inputs are `UNKNOWN`. Whole-branch `EXACT` requires every changed path to be present exactly. It excludes branches with activity in the prior 24 hours or unverifiable activity by default. Ancestry, patch IDs, and percentages never promote a branch to `EXACT`.
+
+`jg residual` uses an independently restored disposable Git repository to simulate a merge and inspect Python AST definitions. Its conflict and moved-definition observations are advisory, and dynamic references and other file types remain uncertain. It never upgrades coverage. Analysis creates no objects in the inspected repository.
+
+### Separately approved cleanup
+
+`jg cleanup plan` consumes strict coverage only. It selects at most 25 older local refs with whole-branch `EXACT` proof and excludes checked-out refs, dirty or status-unavailable worktrees, stash-linked refs, and recent or unverifiable activity. Before emitting a digest for approval, it creates a self-contained bundle outside the inspected repository and proves every pinned target can be restored in an independent repository. The approval applies to that exact plan digest.
+
+`jg cleanup execute` is a distinct operation. It requires a branch-specific cooperative lease covering known automated worktree creators, fresh exact proof and safety checks, and an atomic compare-and-delete against the expected source SHA and destination SHA. If the lease integration cannot be established, the result is a deletion-ready plan only. The executor never removes remote refs, worktrees, or stashes. Jev judgments do not grant cleanup authority.
+
+This executor is an explicit exception to the first version's read-only operations. The inventory, coverage, residual, review, and Jev-preview paths remain read-only with respect to the inspected repository.
+
+`jg equivalence --repo PATH --inventory inventory.json --out DIR` performs a read-only, Git-only comparison of every recorded local branch against the recorded default branch. Repeat `--approved-destination NAME` to permit a specific other local branch as a preservation destination. The result is `equivalence.json`, bound to the inventory digest and exact tips. It records `ALREADY_PRESERVED`, `UNIQUE_WORK_REMAINS`, or `UNPROVEN` for committed content, separately from worktree occupancy and inventory completeness. Proofs may be identical tips, ancestry, identical Git trees, no net content change from the merge base, or identical blob/mode/deletion state on every path changed by the source branch. Patch-ID overlap and duplicate clusters are only supporting signals. A stale tip or unavailable Git evidence cannot produce a preservation proof. These verdicts never authorize cleanup; checked-out or dirty worktrees remain independent holds. Optional `--equivalence` on `jg decisions`, `jg batches`, and `jg viewer` surfaces these results; batches skip a pair only when both endpoints are exactly preserved.
+
+For an active checkout, `--ignore-recent-hours 24` excludes non-default branches whose tip commit or latest local reflog update falls within the prior 24 hours. Missing commit/reflog activity evidence and branches attached to dirty or status-unavailable worktrees are also excluded, never assumed old. The artifact records the cutoff, observed activity, and per-branch scope reason. Out-of-scope branches are not evaluated for exact content; they remain in optional Jev batch preparation because their semantic relationship is unresolved. This scoped exclusion does not turn an incomplete inventory into a complete one, nor does it relax worktree or deletion gates.
 
 At the time of this addendum, the review implementation records dispositions, rationale, timestamps, and fingerprints, but does not yet enforce all reviewer identity, preservation destination, and preservation proof requirements above. Those gaps must be addressed before an execution handoff relies on the ledger.
 

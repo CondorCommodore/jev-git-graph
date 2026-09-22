@@ -43,6 +43,23 @@ class AutomaticDecisionTests(unittest.TestCase):
         self.assertEqual("HOLD", by_name["merged"]["decision"])
         self.assertIn("incomplete_inventory_blocks_cleanup_candidates", result["limitations"])
 
+    def test_exact_content_does_not_override_worktree_hold(self):
+        inventory, candidates, relations = self.fixture(True)
+        inventory["worktrees"] = [{"branch": "merged", "path_id": "opaque", "status": []}]
+        candidates["inventory_digest"] = digest(inventory)
+        equivalence = {
+            "kind": "branch-equivalence", "repository_id": "repo", "inventory_digest": digest(inventory),
+            "branches": [{"name": item["name"], "tip": item["tip"],
+                          "content_verdict": "ALREADY_PRESERVED", "proof": "ANCESTOR",
+                          "destination": {"branch": "main", "tip": "a" * 40}}
+                         for item in inventory["branches"]],
+        }
+        result = build_decisions(inventory, candidates, relations, equivalence)
+        merged = next(item for item in result["branches"] if item["name"] == "merged")
+        self.assertEqual("RETAIN", merged["decision"])
+        self.assertEqual("ALREADY_PRESERVED", merged["content_verdict"])
+        self.assertEqual("checked_out_in_worktree", merged["reason"])
+
     def test_rejects_mismatched_inventory(self):
         inventory, candidates, relations = self.fixture(True)
         changed = copy.deepcopy(inventory)

@@ -11,7 +11,7 @@ from .errors import JgError
 from .safety import read_json
 
 
-_KINDS = ("inventory", "candidates", "relations", "review")
+_KINDS = ("inventory", "candidates", "relations", "review", "equivalence")
 
 
 def bootstrap(artifacts: dict[str, Path]) -> bytes:

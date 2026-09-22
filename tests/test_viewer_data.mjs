@@ -48,6 +48,17 @@ test("normalizes local artifacts by immutable tip SHA and candidate ID", () => {
   assert.ok(model.warnings.some((message) => message.includes("incomplete")));
 });
 
+test("shows exact content separately from worktree state", () => {
+  const equivalence = { kind: "branch-equivalence", schema_version: 1, repository_id: "repo-local-id", branches: [
+    { name: "feature/alpha", tip: "a".repeat(40), content_verdict: "ALREADY_PRESERVED", proof: "CHANGED_PATHS_IDENTICAL", destination: { branch: "main", tip: "m".repeat(40) }, worktrees: [{ path_id: "opaque-worktree", dirty: true }] },
+  ] };
+  const model = viewer.normalize({ inventory, equivalence });
+  const branch = model.objects.find((item) => item.title === "feature/alpha" && item.kind === "branch");
+  assert.equal(branch.equivalence.content_verdict, "ALREADY_PRESERVED");
+  assert.match(branch.subtitle, /already preserved/);
+  assert.equal(branch.equivalence.worktrees[0].dirty, true);
+});
+
 test("does not create a relationship when endpoint SHA is absent", () => {
   const wrongTip = structuredClone(candidates);
   wrongTip.candidates[0].endpoints.a.tip = "z".repeat(40);

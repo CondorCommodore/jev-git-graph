@@ -42,10 +42,19 @@ def stratify_pending(candidates, previously_touched=()):
     return ordered
 
 
-def prepare_batches(candidates_path, output, size=32, previous=(), evidence_profile="minimal"):
+def prepare_batches(candidates_path, output, size=32, previous=(), evidence_profile="minimal", equivalence_path=None):
     if size < 1 or size > 1000:
         raise JgError("batch size must be between 1 and 1000")
     source = read_json(candidates_path)
+    exact = {}
+    if equivalence_path:
+        equivalence = read_json(equivalence_path)
+        if (equivalence.get("kind") != "branch-equivalence" or
+                equivalence.get("repository_id") != source.get("repository_id") or
+                equivalence.get("inventory_digest") != source.get("inventory_digest")):
+            raise JgError("equivalence artifact does not match candidates")
+        exact = {(item["name"], item["tip"]): item
+                 for item in equivalence["branches"]}
     destination = Path(output)
     # Never overwrite an existing plan or its successful responses.
     if destination.exists() and any(destination.iterdir()):
@@ -62,11 +71,19 @@ def prepare_batches(candidates_path, output, size=32, previous=(), evidence_prof
         attempted.update(item["request_sha256"] for item in ledger["attempts"])
         previously_touched_candidates.update(item.get("candidate_id") for item in ledger["attempts"] if item.get("candidate_id"))
     pending = []
-    skipped_fact = skipped_attempt = 0
+    skipped_fact = skipped_attempt = skipped_exact = 0
     for candidate in source["candidates"]:
         evidence = candidate["evidence"]
         if evidence.get("identical_tips") or evidence.get("a_ancestor_of_b") or evidence.get("b_ancestor_of_a"):
             skipped_fact += 1
+            continue
+        endpoints = candidate["endpoints"]
+        if exact and all(
+            exact.get((endpoint["branch"], endpoint["tip"]), {}).get("content_verdict") == "ALREADY_PRESERVED"
+            and exact.get((endpoint["branch"], endpoint["tip"]), {}).get("in_scope") is not False
+            for endpoint in endpoints.values()
+        ):
+            skipped_exact += 1
             continue
         request_sha = digest(payload_for_candidate(candidate, evidence_profile))
         if request_sha in attempted:
@@ -86,6 +103,9 @@ def prepare_batches(candidates_path, output, size=32, previous=(), evidence_prof
                 "candidate_content_digest": source_content_digest,
                 "candidate_count": len(source["candidates"]), "pending_requests": len(pending),
                 "fact_only_pairs": skipped_fact, "previously_attempted": skipped_attempt,
+                "exactly_preserved_pairs": skipped_exact,
+                "out_of_scope_pairs": 0,
+                "equivalence_digest": digest(equivalence) if equivalence_path else None,
                 "question_version": QUESTION_VERSION, "evidence_profile": evidence_profile,
                 "model": JEV_MODEL,
                 "network_performed": False, "batches": []}
