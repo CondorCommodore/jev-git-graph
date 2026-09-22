@@ -8,10 +8,12 @@ from . import __version__
 from .candidates import write_candidates
 from .batches import prepare_batches, collect_batches
 from .calibration import write_calibration
+from .decisions import write_decisions
 from .errors import JgError
 from .inventory import protected_worktree_paths, write_inventory
 from .jev import DEFAULT_MAX_JEV_PAYLOAD_BYTES, DEFAULT_MAX_JEV_REQUESTS, EVIDENCE_PROFILES, checkpoint_lock, execute_preview, write_preview
 from .plan import write_plan
+from .resume import resume_batches
 from .safety import validate_output_path, write_json
 
 
@@ -68,6 +70,20 @@ def parser() -> argparse.ArgumentParser:
     calibration.add_argument("--labels", required=True)
     calibration.add_argument("--relations", required=True)
     calibration.add_argument("--out", required=True)
+    decisions = commands.add_parser("decisions", help="classify recorded branches from facts and Jev signals without cleanup")
+    decisions.add_argument("--repo", required=True)
+    decisions.add_argument("--inventory", required=True)
+    decisions.add_argument("--candidates", required=True)
+    decisions.add_argument("--relations", required=True)
+    decisions.add_argument("--out", required=True)
+    resume = commands.add_parser("resume", help="resume one approved Jev batch plan, retaining uncertain attempts")
+    resume.add_argument("--repo", required=True)
+    resume.add_argument("--batch-plan", required=True)
+    resume.add_argument("--approved-plan-sha256", required=True)
+    resume.add_argument("--max-jev-requests", type=int, required=True)
+    resume.add_argument("--max-jev-payload-bytes", type=int, required=True)
+    resume.add_argument("--max-total-requests", type=int, required=True)
+    resume.add_argument("--use-jev", action="store_true", required=True)
     return root
 
 
@@ -76,6 +92,15 @@ def _protected_output(repo: str, output: str) -> Path:
 
 
 def run(args: argparse.Namespace) -> str:
+    if args.command == "decisions":
+        destination = _protected_output(args.repo, args.out)
+        return str(write_decisions(args.inventory, args.candidates, args.relations, destination))
+    if args.command == "resume":
+        _protected_output(args.repo, str(Path(args.batch_plan).parent))
+        return str(resume_batches(args.batch_plan, args.approved_plan_sha256,
+                                  max_requests=args.max_jev_requests,
+                                  max_payload_bytes=args.max_jev_payload_bytes,
+                                  max_total_requests=args.max_total_requests))
     if args.command == "calibrate":
         destination = _protected_output(args.repo, args.out)
         return str(write_calibration(args.labels, args.relations, destination))
