@@ -154,6 +154,7 @@ class CleanupTests(unittest.TestCase):
                 lambda name, tip: releases.append((name, tip)) or True,
             )
             with patch("jev_git_graph.cleanup._live_reproof", return_value=None), \
+                 patch("jev_git_graph.cleanup.CREATOR_LEASE_INTEGRATED", True), \
                  patch("jev_git_graph.cleanup.git.local_branches",
                        side_effect=JgError("readback unavailable")):
                 result = execute_cleanup(repo, plan,
@@ -162,6 +163,36 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual("delete_readback_uncertain", result["stopped"])
         self.assertTrue(result["restored"])
         self.assertEqual([("topic", topic_tip)], releases)
+        self.assertEqual(topic_tip, run(repo, "rev-parse", "topic"))
+
+    def test_executor_rejects_approved_plan_from_another_clone(self):
+        repo, topic_tip, main_tip = self.make_repo()
+        coverage = coverage_for(repo, [{"name": "topic", "tip": topic_tip, "main_tip": main_tip,
+                                       "verdict": "EXACT", "reason": None, "last_activity_epoch": 1,
+                                       "paths": [{"path": "topic", "verdict": "EXACT_PRESENT"}]}])
+        with tempfile.TemporaryDirectory() as out:
+            plan = build_old_plan(repo, coverage, bundle_dir=Path(out) / "bundle")
+            approved = approve_cleanup_plan(plan, approved_digest=plan["plan_digest"])
+            clone = Path(out) / "clone"
+            subprocess.run(("git", "clone", "--quiet", "--no-hardlinks", str(repo), str(clone)), check=True)
+            with self.assertRaisesRegex(JgError, "different local repository"):
+                execute_cleanup(clone, approved, approved_digest=approved["plan_digest"])
+
+    def test_failed_lease_release_restores_deleted_fixture_ref(self):
+        repo, topic_tip, main_tip = self.make_repo()
+        coverage = coverage_for(repo, [{"name": "topic", "tip": topic_tip, "main_tip": main_tip,
+                                       "verdict": "EXACT", "reason": None, "last_activity_epoch": 1,
+                                       "paths": [{"path": "topic", "verdict": "EXACT_PRESENT"}]}])
+        with tempfile.TemporaryDirectory() as out:
+            plan = build_old_plan(repo, coverage, bundle_dir=Path(out))
+            approved = approve_cleanup_plan(plan, approved_digest=plan["plan_digest"])
+            lease = CooperativeLease(True, lambda *_: True, lambda *_: False)
+            with patch("jev_git_graph.cleanup.CREATOR_LEASE_INTEGRATED", True), \
+                 patch("jev_git_graph.cleanup._live_reproof", return_value=None):
+                result = execute_cleanup(repo, approved,
+                                         approved_digest=approved["plan_digest"], lease_contract=lease)
+        self.assertEqual("lease_release_failed", result["stopped"])
+        self.assertTrue(result["restored"])
         self.assertEqual(topic_tip, run(repo, "rev-parse", "topic"))
 
     def test_manifest_approval_rejects_tampered_plan(self):

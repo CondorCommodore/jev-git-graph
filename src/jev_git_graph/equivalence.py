@@ -126,12 +126,12 @@ def build_equivalence(repo: str | Path, inventory: dict[str, Any], destinations:
                 try:
                     if tip == dest_tip:
                         proof = "IDENTICAL_TIP"
-                    elif (dest_name == default and branch.get("merged_into_default") is True) or git.is_ancestor(runner, tip, dest_tip):
+                    elif git.is_ancestor(runner, tip, dest_tip):
                         proof = "ANCESTOR"
                     elif tree(tip) == tree(dest_tip):
                         proof = "IDENTICAL_TREE"
                     else:
-                        base = branch.get("merge_base") if dest_name == default else git.merge_base(runner, tip, dest_tip)
+                        base = git.merge_base(runner, tip, dest_tip)
                         if base is None:
                             reason = "no_common_ancestor"
                             continue

@@ -71,19 +71,18 @@ def prepare_batches(candidates_path, output, size=32, previous=(), evidence_prof
         attempted.update(item["request_sha256"] for item in ledger["attempts"])
         previously_touched_candidates.update(item.get("candidate_id") for item in ledger["attempts"] if item.get("candidate_id"))
     pending = []
-    skipped_fact = skipped_attempt = skipped_exact = skipped_scope = 0
+    skipped_fact = skipped_attempt = skipped_exact = 0
     for candidate in source["candidates"]:
         evidence = candidate["evidence"]
         if evidence.get("identical_tips") or evidence.get("a_ancestor_of_b") or evidence.get("b_ancestor_of_a"):
             skipped_fact += 1
             continue
         endpoints = candidate["endpoints"]
-        if exact and any(exact.get((endpoint["branch"], endpoint["tip"]), {}).get("in_scope") is False
-                         for endpoint in endpoints.values()):
-            skipped_scope += 1
-            continue
-        if exact and all(exact.get((endpoint["branch"], endpoint["tip"]), {}).get("content_verdict") == "ALREADY_PRESERVED"
-                         for endpoint in endpoints.values()):
+        if exact and all(
+            exact.get((endpoint["branch"], endpoint["tip"]), {}).get("content_verdict") == "ALREADY_PRESERVED"
+            and exact.get((endpoint["branch"], endpoint["tip"]), {}).get("in_scope") is not False
+            for endpoint in endpoints.values()
+        ):
             skipped_exact += 1
             continue
         request_sha = digest(payload_for_candidate(candidate, evidence_profile))
@@ -105,7 +104,7 @@ def prepare_batches(candidates_path, output, size=32, previous=(), evidence_prof
                 "candidate_count": len(source["candidates"]), "pending_requests": len(pending),
                 "fact_only_pairs": skipped_fact, "previously_attempted": skipped_attempt,
                 "exactly_preserved_pairs": skipped_exact,
-                "out_of_scope_pairs": skipped_scope,
+                "out_of_scope_pairs": 0,
                 "equivalence_digest": digest(equivalence) if equivalence_path else None,
                 "question_version": QUESTION_VERSION, "evidence_profile": evidence_profile,
                 "model": JEV_MODEL,

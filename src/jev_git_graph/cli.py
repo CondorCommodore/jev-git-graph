@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from . import __version__
+from . import git
 from .candidates import write_candidates
 from .batches import prepare_batches, collect_batches
 from .calibration import write_calibration
@@ -20,7 +21,7 @@ from .jev import DEFAULT_MAX_JEV_PAYLOAD_BYTES, DEFAULT_MAX_JEV_REQUESTS, EVIDEN
 from .plan import write_plan
 from .residual import analyze_residual
 from .resume import resume_batches
-from .safety import canonical_json, read_json, validate_output_path, write_json
+from .safety import canonical_json, opaque_path_id, read_json, validate_output_path, write_json
 from .viewer import serve as serve_viewer
 
 
@@ -152,6 +153,9 @@ def _protected_output(repo: str, output: str) -> Path:
 def run(args: argparse.Namespace) -> str:
     if args.command == "code-relate":
         candidates = read_json(args.candidates)
+        root, _common, _runner = git.open_repository(args.repo)
+        if candidates.get("kind") != "candidates" or candidates.get("repository_id") != opaque_path_id(root):
+            raise JgError("candidates artifact belongs to a different local repository")
         selection = read_json(args.selection)
         if selection.get("kind") != "jev-code-selection" or not isinstance(selection.get("candidates"), dict):
             raise JgError("code selection must map candidate IDs to pinned refs and ranges")
@@ -161,6 +165,10 @@ def run(args: argparse.Namespace) -> str:
             chosen = selection["candidates"].get(candidate_id)
             if not isinstance(chosen, dict) or not chosen.get("source_ref") or not chosen.get("main_ref"):
                 raise JgError(f"code selection lacks pinned refs for {candidate_id}")
+            endpoints = candidate.get("endpoints", {})
+            endpoint_tips = {item.get("tip") for item in endpoints.values() if isinstance(item, dict)}
+            if endpoint_tips != {chosen.get("source_tip"), chosen.get("main_tip")} or len(endpoint_tips) != 2:
+                raise JgError(f"code selection tips do not match candidate endpoints for {candidate_id}")
             records[candidate_id] = build_code_evidence(
                 args.repo, chosen["source_tip"], chosen["main_tip"], chosen["ranges"],
                 source_ref=chosen["source_ref"], main_ref=chosen["main_ref"])

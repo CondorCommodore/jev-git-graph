@@ -6,6 +6,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from jev_git_graph.cli import parser, run
+from jev_git_graph.errors import JgError
+from jev_git_graph.safety import opaque_path_id
 
 
 def git(repo, *args):
@@ -36,7 +38,8 @@ class CodeCliTests(unittest.TestCase):
                          "b_unique_commit_count": 0, "a_merge_base": main, "b_merge_base": main}}
             candidates = base / "candidates.json"
             selection = base / "selection.json"
-            candidates.write_text(json.dumps({"candidates": [candidate]}))
+            candidates.write_text(json.dumps({"kind": "candidates", "repository_id": opaque_path_id(repo),
+                                              "candidates": [candidate]}))
             selection.write_text(json.dumps({"kind": "jev-code-selection", "candidates": {"pair": {
                 "source_ref": "refs/heads/feature", "source_tip": feature,
                 "main_ref": "refs/heads/main", "main_tip": main,
@@ -48,6 +51,15 @@ class CodeCliTests(unittest.TestCase):
             self.assertIn("return 2", json.dumps(shown["preview"]))
             self.assertEqual(shown["preview"]["payload_sha256"], shown["approval"]["payload_sha256"])
             self.assertFalse((base / "code-relations.json").exists())
+            document = json.loads(selection.read_text())
+            document["candidates"]["pair"]["source_tip"] = main
+            selection.write_text(json.dumps(document))
+            with self.assertRaisesRegex(JgError, "candidate endpoints"):
+                run(args)
+            candidates.write_text(json.dumps({"kind": "candidates", "repository_id": "wrong",
+                                              "candidates": [candidate]}))
+            with self.assertRaisesRegex(JgError, "different local repository"):
+                run(args)
 
 
 if __name__ == "__main__":

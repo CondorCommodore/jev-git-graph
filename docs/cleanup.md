@@ -56,7 +56,9 @@ The executor never performs remote operations.
 
 The CLI exposes `jg cleanup plan`, `jg cleanup approve`, and `jg cleanup execute`.
 It does not provide a worktree-creator lease adapter, so its execute command
-stops without changing refs. Operators must review the plan, preserve any
+stops without changing refs. The library also hard-gates deletion until known
+worktree creators participate in the lease contract; a caller-supplied callback
+alone cannot enable it. Operators must review the plan, preserve any
 required work, and approve its exact digest. A future integrated coordinator
 must supply the cooperative lease contract before local branch deletion can
 run.

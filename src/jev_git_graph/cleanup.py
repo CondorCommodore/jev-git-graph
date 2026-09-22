@@ -36,8 +36,10 @@ from .safety import digest, opaque_path_id, read_json, validate_output_path, wri
 SCHEMA_VERSION = 1
 MAX_BRANCHES = 25
 COOPERATIVE_LEASE_CONTRACT = "jev-git-graph/cooperative-branch-lease-v1"
-_ZERO_SHA = "0" * 40
-_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+# No automated worktree creator currently participates in this contract.
+# Keep ref deletion unavailable until that integration is implemented and tested.
+CREATOR_LEASE_INTEGRATED = False
+_SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 
 
 @dataclass
@@ -371,6 +373,8 @@ def write_cleanup_plan(repo: str | Path, coverage_path: str | Path, out: str | P
 
 
 def _lease_established(contract: Any) -> bool:
+    if not CREATOR_LEASE_INTEGRATED:
+        return False
     if contract is None or isinstance(contract, Mapping):
         return False
     if getattr(contract, "contract", None) != COOPERATIVE_LEASE_CONTRACT:
@@ -449,7 +453,7 @@ def _atomic_delete(root: Path, name: str, tip: str,
 
 
 def _atomic_restore(root: Path, name: str, tip: str) -> bool:
-    result = _git(root, "update-ref", f"refs/heads/{name}", tip, _ZERO_SHA, check=False)
+    result = _git(root, "update-ref", f"refs/heads/{name}", tip, "0" * len(tip), check=False)
     return result.returncode == 0
 
 
@@ -501,6 +505,8 @@ def execute_cleanup(repo: str | Path, plan: Mapping[str, Any] | str | Path,
     if not bundle_path.is_file() or hashlib.sha256(bundle_path.read_bytes()).hexdigest() != bundle.get("sha256"):
         raise JgError("cleanup bundle is missing or changed")
     root, _common, runner = git.open_repository(repo)
+    if loaded.get("repository_id") != opaque_path_id(root):
+        raise JgError("cleanup plan belongs to a different local repository")
     if (loaded.get("manifest_approved") is not True
             or bundle.get("manifest_approved") is not True):
         raise JgError("cleanup plan manifest is not approved")
@@ -518,6 +524,7 @@ def execute_cleanup(repo: str | Path, plan: Mapping[str, Any] | str | Path,
                     "stopped": "lease_not_acquired", "branch": name,
                     "network_performed": False, "destructive_action_authorized": False}
         acquired = True
+        delete_committed = False
         outcome: dict[str, Any] | None = None
         try:
             reason = _live_reproof(root, candidate, loaded["main"], runner,
@@ -535,6 +542,7 @@ def execute_cleanup(repo: str | Path, plan: Mapping[str, Any] | str | Path,
                            "stopped": "source_delete_race", "branch": name,
                            "network_performed": False, "destructive_action_authorized": False}
             else:
+                delete_committed = True
                 # A normal readback proves absence.  If the normal inventory
                 # read fails, probe the exact ref with a bounded command and
                 # restore only after proving it is absent.
@@ -567,15 +575,24 @@ def execute_cleanup(repo: str | Path, plan: Mapping[str, Any] | str | Path,
                         deleted.append({"name": name, "tip": tip})
         finally:
             if acquired and not _safe_release(lease_contract, name, tip):
+                presence = _ref_presence(root, name) if delete_committed else True
+                restoration_attempted = delete_committed and presence is False
+                restored = _atomic_restore(root, name, tip) if restoration_attempted else False
+                if restored:
+                    deleted = [item for item in deleted if item["name"] != name]
                 if outcome is None:
                     outcome = {"kind": "cleanup-execution", "plan_digest": expected,
                                "deletion_ready": False, "deleted": deleted,
                                "stopped": "lease_release_failed", "branch": name,
+                               "restoration_attempted": restoration_attempted,
+                               "restored": restored,
                                "network_performed": False, "destructive_action_authorized": False}
                 else:
                     outcome = {**outcome, "deletion_ready": False,
                                "stopped": "lease_release_failed",
-                               "lease_release_failed": True}
+                               "lease_release_failed": True,
+                               "restoration_attempted": restoration_attempted,
+                               "restored": restored}
         if outcome is not None:
             return outcome
     return {"kind": "cleanup-execution", "plan_digest": expected,
