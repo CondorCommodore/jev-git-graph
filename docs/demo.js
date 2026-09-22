@@ -66,7 +66,7 @@
   async function loadLoopbackPreset() {
     const preset = window.JevGraphDefaultArtifacts;
     if (!preset || typeof preset !== "object") return;
-    for (const kind of ["inventory", "candidates", "relations", "review"]) {
+    for (const kind of ["inventory", "candidates", "relations", "review", "equivalence"]) {
       const item = preset[kind];
       if (!item || typeof item !== "object") continue;
       try { await applyDocument(kind, item.document, item.name || `${kind}.json`); }
@@ -88,6 +88,7 @@
       const kindMatch = state.filter === "all" ||
         (state.filter === "inactive" ? item.inactiveWithWork :
         state.filter === "integrated" ? item.branch?.merged_into_default === true :
+        state.filter === "exact-preserved" ? item.equivalence?.content_verdict === "ALREADY_PRESERVED" :
         state.filter === "unique" ? item.kind === "branch" && (item.branch?.unique_commits || []).length > 0 :
         state.filter === "likely-duplicate" ? item.likelyDuplicate :
         state.filter === "superseded" ? item.superseded :
@@ -221,6 +222,10 @@
     if (selected.branch) {
       const branch = selected.branch;
       elements.inspector.append(fragment(detail("Tip SHA", data.shortSha(branch.tip)), detail("Merge base", data.shortSha(branch.merge_base)), detail("Unique commits", String((branch.unique_commits || []).length)), detail("Merged into default", branch.merged_into_default ? "yes" : "no"), detail("Changed paths", String((branch.changed_paths || []).length))));
+      if (selected.equivalence) {
+        const exact = selected.equivalence;
+        elements.inspector.append(fragment(detail("Scope", exact.in_scope === false ? `excluded · ${exact.scope_reason}` : "included"), detail("Committed content", exact.content_verdict || "unproven"), detail("Exact proof", exact.proof || "none"), detail("Preserved at", exact.destination ? `${exact.destination.branch} · ${data.shortSha(exact.destination.tip)}` : "not proven"), detail("Worktree in use", (exact.worktrees || []).length ? "yes" : "no")));
+      }
       elements.inspector.append(detail("Tip age at snapshot", selected.ageDays === null ? "unknown" : `${selected.ageDays} days`));
       elements.inspector.append(detail("Identical tips", String(selected.identicalTips.length)));
       elements.inspector.append(detail("Discovery coverage", selected.coverage?.status || "not recorded"));

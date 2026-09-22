@@ -10,18 +10,19 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .errors import JgError
 from .questions import QUESTION_IDS, QUESTION_VERSION, relationship_questions
 from .safety import canonical_json, digest, read_json, write_json
+from .code_evidence import CODE_EVIDENCE_PROFILE, code_evidence_digest, revalidate_code_evidence, sanitize_provider_response, validate_code_evidence
 
 
 JEV_ENDPOINT = "https://api.typesafe.ai/v1/systemone"
 JEV_MODEL = "jev-latest"
-EVIDENCE_PROFILES = ("minimal", "review")
+EVIDENCE_PROFILES = ("minimal", "review", CODE_EVIDENCE_PROFILE)
 DEFAULT_MAX_JEV_REQUESTS = 1
 DEFAULT_MAX_JEV_PAYLOAD_BYTES = 8_192
 
@@ -200,7 +201,11 @@ def _path_hash(path: str) -> str:
     return hashlib.sha256(path.encode("utf-8")).hexdigest()[:20]
 
 
-def payload_for_candidate(candidate: dict[str, Any], evidence_profile: str = "minimal") -> dict[str, Any]:
+def payload_for_candidate(
+    candidate: dict[str, Any],
+    evidence_profile: str = "minimal",
+    code_evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if evidence_profile not in EVIDENCE_PROFILES:
         raise JgError(f"unknown evidence profile: {evidence_profile}")
     endpoints = candidate["endpoints"]
@@ -228,6 +233,12 @@ def payload_for_candidate(candidate: dict[str, Any], evidence_profile: str = "mi
             "task_ids": evidence.get("task_ids", [])[:20],
             "pr_ids": evidence.get("pr_ids", [])[:20],
         })
+    if evidence_profile == CODE_EVIDENCE_PROFILE:
+        approved = code_evidence if code_evidence is not None else candidate.get("code_evidence")
+        if not isinstance(approved, dict):
+            raise JgError("code evidence profile requires an approved code evidence record")
+        validate_code_evidence(approved)
+        state["code_evidence"] = approved
     for field in ("identical_tips", "a_ancestor_of_b", "b_ancestor_of_a", "a_commits_not_in_b", "b_commits_not_in_a"):
         if field in evidence:
             state[field] = evidence[field]
@@ -238,9 +249,20 @@ def payload_for_candidate(candidate: dict[str, Any], evidence_profile: str = "mi
     }
 
 
-def build_preview(candidates: dict[str, Any], evidence_profile: str = "minimal") -> dict[str, Any]:
-    requests = [payload_for_candidate(candidate, evidence_profile) for candidate in candidates.get("candidates", [])]
-    return {
+def build_preview(
+    candidates: dict[str, Any],
+    evidence_profile: str = "minimal",
+    code_evidence_by_candidate: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    requests = [
+        payload_for_candidate(
+            candidate,
+            evidence_profile,
+            (code_evidence_by_candidate or {}).get(candidate.get("id")),
+        )
+        for candidate in candidates.get("candidates", [])
+    ]
+    preview = {
         "kind": "jev-preview",
         "endpoint": JEV_ENDPOINT,
         "repository_id": candidates.get("repository_id"),
@@ -253,9 +275,23 @@ def build_preview(candidates: dict[str, Any], evidence_profile: str = "minimal")
         "payload_bytes": len(canonical_json(requests)),
         "network_performed": False,
     }
+    if evidence_profile == CODE_EVIDENCE_PROFILE:
+        records = [
+            (code_evidence_by_candidate or {}).get(candidate.get("id"), candidate.get("code_evidence"))
+            for candidate in candidates.get("candidates", [])
+        ]
+        digests = [code_evidence_digest(record) for record in records if isinstance(record, dict)]
+        preview.update({
+            "storage": "transient",
+            "no_store": True,
+            "code_evidence_sha256": digests[0] if len(digests) == 1 else digest(sorted(digests)),
+        })
+    return preview
 
 
 def write_preview(candidates_path: str | Path, output: str | Path, evidence_profile: str = "minimal") -> Path:
+    if evidence_profile == CODE_EVIDENCE_PROFILE:
+        raise JgError("code evidence previews are transient and cannot be written to disk")
     candidates = read_json(candidates_path)
     preview = build_preview(candidates, evidence_profile)
     target = Path(output).expanduser().resolve() / "jev-preview.json"
@@ -323,24 +359,38 @@ def validate_response(request: dict[str, Any], response: Any) -> dict[str, Any]:
 
 
 def execute_preview(
-    preview_path: str | Path,
+    preview_path: str | Path | Mapping[str, Any],
     approved_payload_sha256: str,
     max_requests: int = DEFAULT_MAX_JEV_REQUESTS,
     max_payload_bytes: int = DEFAULT_MAX_JEV_PAYLOAD_BYTES,
     transport: Callable[[dict[str, Any], str], dict[str, Any]] = _default_transport,
     checkpoint: Path | None = None,
+    code_evidence_repo: str | Path | None = None,
+    approved_code_evidence_sha256: str | None = None,
+    approved_code_batch_sha256: str | None = None,
 ) -> dict[str, Any]:
     if max_requests < 1:
         raise JgError("--max-jev-requests must be greater than zero")
     if max_payload_bytes < 1:
         raise JgError("--max-jev-payload-bytes must be greater than zero")
-    preview = read_json(preview_path)
+    in_memory_preview = isinstance(preview_path, Mapping)
+    preview = dict(preview_path) if in_memory_preview else read_json(preview_path)
     if preview.get("kind") != "jev-preview":
         raise JgError("approved preview is not a Jev preview artifact")
     if preview.get("endpoint") != JEV_ENDPOINT:
         raise JgError("approved preview has an unexpected destination host")
     if preview.get("network_performed") is not False:
         raise JgError("approved preview is not a local-only preview")
+    evidence_profile = preview.get("evidence_profile", "minimal")
+    if evidence_profile == CODE_EVIDENCE_PROFILE:
+        if not in_memory_preview:
+            raise JgError("code evidence preview must remain in memory and cannot be read from disk")
+        if preview.get("storage") != "transient" or preview.get("no_store") is not True:
+            raise JgError("code evidence preview must be transient and no-store")
+        if code_evidence_repo is None:
+            raise JgError("code evidence live execution requires repository revalidation")
+        if checkpoint is not None:
+            raise JgError("code evidence execution cannot persist a checkpoint containing the preview")
     if preview.get("payload_sha256") != approved_payload_sha256:
         raise JgError("approved payload digest does not match preview; inspect a new preview")
     if digest(preview.get("requests")) != approved_payload_sha256:
@@ -362,6 +412,16 @@ def execute_preview(
             f"approved preview has {payload_bytes} payload bytes; live default permits {max_payload_bytes}. "
             "Use --max-jev-payload-bytes only after reviewing the larger run."
         )
+    if evidence_profile == CODE_EVIDENCE_PROFILE:
+        if not isinstance(preview.get("code_evidence_sha256"), str):
+            raise JgError("code evidence preview lacks its batch evidence digest")
+        expected_batch = digest({
+            "evidence_sha256": preview["code_evidence_sha256"],
+            "payload_sha256": approved_payload_sha256,
+            "request_count": request_count,
+        })
+        if approved_code_batch_sha256 != expected_batch:
+            raise JgError("approved code batch digest does not match preview")
     token = os.environ.get("TYPESAFE_API_KEY")
     if not token:
         raise JgError("--use-jev requires TYPESAFE_API_KEY in the process environment")
@@ -370,7 +430,7 @@ def execute_preview(
         "question_version": preview.get("question_version"), "network_performed": False,
         "repository_id": preview.get("repository_id"),
         "candidate_content_digest": preview.get("candidate_content_digest"),
-        "evidence_profile": preview.get("evidence_profile", "minimal"),
+        "evidence_profile": evidence_profile,
         "relations": [], "attempts": [],
     }
     if checkpoint is not None and checkpoint.exists():
@@ -390,7 +450,7 @@ def execute_preview(
             "request_sha256": request_digest,
             "candidate_id": request["state"]["candidate_id"],
             "question_version": preview.get("question_version"),
-            "evidence_profile": preview.get("evidence_profile", "minimal"),
+            "evidence_profile": evidence_profile,
             "model_requested": request.get("model"),
             "started_at": started.isoformat(),
             "started_at_epoch_ms": int(started.timestamp() * 1000),
@@ -400,6 +460,18 @@ def execute_preview(
         if checkpoint is not None:
             save_checkpoint(checkpoint, ledger)
         attempted.add(request_digest)
+        if evidence_profile == CODE_EVIDENCE_PROFILE:
+            record = request.get("state", {}).get("code_evidence")
+            if not isinstance(record, dict):
+                raise JgError("code evidence request lacks its approved record")
+            # Revalidate after any prior request and immediately before this
+            # transport call, so an approved batch cannot go stale in flight.
+            individual_approval = (
+                approved_code_evidence_sha256
+                if approved_code_evidence_sha256 == record.get("evidence_sha256")
+                else None
+            )
+            revalidate_code_evidence(code_evidence_repo, record, individual_approval)
         ledger["network_performed"] = True
         timer = monotonic()
         try:
@@ -432,19 +504,37 @@ def execute_preview(
             "input_tokens": response["usage"]["input_tokens"],
             "output_tokens": response["usage"]["output_tokens"],
         })
+        recorded_response = (
+            sanitize_provider_response(request, response)
+            if evidence_profile == CODE_EVIDENCE_PROFILE
+            else response
+        )
         ledger["relations"].append({
             "judgment_id": request_digest,
             "request_sha256": request_digest,
             "candidate_id": request["state"]["candidate_id"],
             "question_version": preview.get("question_version"),
-            "evidence_profile": preview.get("evidence_profile", "minimal"),
+            "evidence_profile": evidence_profile,
             "started_at": attempt["started_at"],
             "completed_at": attempt["completed_at"],
             "completed_at_epoch_ms": attempt["completed_at_epoch_ms"],
-            "response": response,
+            "response": recorded_response,
         })
         attempt["status"] = "succeeded"
         if checkpoint is not None:
             save_checkpoint(checkpoint, ledger)
     update_ledger_statistics(ledger)
     return ledger
+
+
+def execute_transient_preview(
+    preview: Mapping[str, Any],
+    approved_payload_sha256: str,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Execute an approved in-memory code preview without an artifact path."""
+    if preview.get("evidence_profile") != CODE_EVIDENCE_PROFILE:
+        raise JgError("transient execution requires the code evidence profile")
+    if "checkpoint" in kwargs and kwargs["checkpoint"] is not None:
+        raise JgError("transient code execution cannot use a checkpoint")
+    return execute_preview(preview, approved_payload_sha256, **kwargs)

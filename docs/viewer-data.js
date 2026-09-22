@@ -25,6 +25,7 @@
     }
     if (kind === "candidates" && !Array.isArray(value.candidates)) return ["candidates.json is missing candidates[]."];
     if (kind === "relations" && !Array.isArray(value.relations)) return ["relations.json is missing relations[]."];
+    if (kind === "equivalence" && (value.kind !== "branch-equivalence" || value.schema_version !== 1 || !Array.isArray(value.branches))) return ["equivalence.json has an unsupported schema or is missing branches[]."];
     if (kind === "review") {
       if (value.kind !== "relationship-review" || ![1, 2].includes(value.schema_version) || !Array.isArray(value.decisions)) return ["review.json has an unsupported schema or is missing decisions[]."];
       if (value.decisions.some((decision) => !decision || typeof decision.object_id !== "string" || typeof decision.rationale !== "string" || typeof decision.disposition !== "string" || (typeof decision.fingerprint !== "string" && typeof decision.source_fingerprint !== "string") || (value.schema_version === 1 && typeof decision.reviewed_at !== "string"))) return ["review.json contains an invalid decision."];
@@ -59,22 +60,28 @@
     const inventory = artifacts.inventory || null;
     const candidatesDocument = artifacts.candidates || null;
     const relationsDocument = artifacts.relations || null;
+    const equivalenceDocument = artifacts.equivalence || null;
     const errors = [];
     const warnings = [];
-    for (const [kind, document] of [["inventory", inventory], ["candidates", candidatesDocument], ["relations", relationsDocument]]) {
+    for (const [kind, document] of [["inventory", inventory], ["candidates", candidatesDocument], ["relations", relationsDocument], ["equivalence", equivalenceDocument]]) {
       if (document) errors.push(...validate(kind, document));
     }
     if (errors.length) return emptyModel(errors, warnings);
+    if (equivalenceDocument && inventory && equivalenceDocument.repository_id !== inventoryObjectId(inventory)) return emptyModel(["equivalence.json belongs to a different repository."], warnings);
 
     const branchByTip = new Map();
     const branchByIdentity = new Map();
     const objects = [];
     const inventoryObject = object(inventory);
+    const equivalence = object(equivalenceDocument);
+    const equivalenceByBranch = new Map(array(equivalence.branches).map((item) => [text(item.name) + ":" + text(item.tip), item]));
     for (const branch of array(inventoryObject.branches)) {
       const item = object(branch);
       const name = text(item.name) || "(unnamed branch)";
       const tip = text(item.tip);
-      const node = { id: `branch:${tip}:${name}`, kind: "branch", title: name, subtitle: `${array(item.unique_commits).length} unique commits · ${shortSha(tip)}`, searchable: [name, tip, item.subject, array(item.changed_paths).join(" ")].join(" ").toLowerCase(), branch: item, group: namespace(name) };
+      const exact = equivalenceByBranch.get(`${name}:${tip}`) || null;
+      const exactLabel = exact?.in_scope === false ? "out of scope · " + text(exact.scope_reason).replaceAll("_", " ") : exact ? text(exact.content_verdict).replaceAll("_", " ").toLowerCase() : "";
+      const node = { id: `branch:${tip}:${name}`, kind: "branch", title: name, subtitle: `${array(item.unique_commits).length} unique commits · ${shortSha(tip)}${exactLabel ? " · " + exactLabel : ""}`, searchable: [name, tip, item.subject, array(item.changed_paths).join(" ")].join(" ").toLowerCase(), branch: item, equivalence: exact, group: namespace(name) };
       objects.push(node);
       branchByIdentity.set(`${tip}:${name}`, node);
       if (tip) {
@@ -215,5 +222,6 @@
   function emptyModel(errors, warnings) {
     return { errors, warnings, inventory: {}, candidatesDocument: {}, relationsDocument: {}, objects: [], candidates: [], groups: [], facts: [], counts: { branches: 0, worktrees: 0, stashes: 0, objects: 0, facts: 0, candidates: 0, candidateCountBeforeLimit: 0, evaluated: 0, pending: 0, factResolved: 0, unresolved: 0, branchesWithCandidates: 0, branchesEvaluated: 0, likelyDuplicates: 0, superseded: 0 } };
   }
+  function inventoryObjectId(inventory) { return text(object(object(inventory).repository).id); }
   return { answerSummary, normalize, shortSha, validate };
 });

@@ -46,6 +46,7 @@
             <label class="file-button"><span>02 · Candidates</span><input id="candidates-file" type="file" accept="application/json,.json"><strong id="candidates-file-name">Choose candidates.json</strong></label>
             <label class="file-button"><span>03 · Jev relations</span><input id="relations-file" type="file" accept="application/json,.json"><strong id="relations-file-name">Choose relations.json</strong></label>
             <label class="file-button"><span>04 · Human review</span><input id="review-file" type="file" accept="application/json,.json"><strong id="review-file-name">Choose review.json</strong></label>
+            <label class="file-button"><span>05 · Exact content</span><input id="equivalence-file" type="file" accept="application/json,.json"><strong id="equivalence-file-name">Choose equivalence.json</strong></label>
           </div>
           <button id="export-review" class="quiet-button" type="button">Export review.json</button>
         </section>
@@ -88,6 +89,7 @@
               <button class="filter" type="button" data-kind="unresolved">Unresolved</button>
               <button class="filter" type="button" data-kind="inactive">Old with work (30d)</button>
               <button class="filter" type="button" data-kind="integrated">Integrated</button>
+              <button class="filter" type="button" data-kind="exact-preserved">Exact preserved</button>
               <button class="filter" type="button" data-kind="unique">Unique work</button>
               <button class="filter" type="button" data-kind="likely-duplicate">Likely dupes ≥75%</button>
               <button class="filter" type="button" data-kind="superseded">Superseded</button>

@@ -2,13 +2,13 @@
 
 Find the relationships among Git branches, commits, worktrees, stashes, and pull requests so a maintainer can return a repository to a clean, understood state without losing work.
 
-The project begins as a **read-only local CLI**. Git provides the facts and an in-memory graph. Jev answers small, typed questions about relationships that Git ancestry alone cannot establish. A maintainer reviews the resulting preservation and cleanup plan. The first version does not execute that plan.
+The default workflow is a **read-only local CLI**. Git provides the facts and an in-memory graph. Jev answers small, typed questions about relationships that Git ancestry alone cannot establish. A maintainer reviews the resulting preservation and cleanup plan. A separate, digest-approved executor has strict recovery and lease gates; without an integrated lease it leaves refs intact.
 
 ## Use with a private repository
 
 Point the tool at any local repository with `--repo PATH`. The default workflow stays on the machine: it does not contact Git remotes or hosted services, and it writes reports only to an output directory outside the inspected repository. That means it can inspect a private repository without publishing its inventory, history, worktree state, or report.
 
-Jev use is separate and opt-in. Before a live request, the tool shows the exact payload it would send. The default payload excludes source files, raw diffs, stash contents, credentials, repository paths, and remote URLs. The full contract is in the [specification](docs/spec.md#local-only-contract).
+Jev use is separate and opt-in. Before a live request, the tool shows the exact payload it would send. The default payload excludes source files, raw diffs, stash contents, credentials, repository paths, and remote URLs. An explicit `code` profile can send bounded, approved committed Python excerpts through a transient preview. The full contract is in the [specification](docs/spec.md#local-only-contract).
 
 ## Run it
 
@@ -18,12 +18,19 @@ The initial CLI has no runtime dependency beyond Python and Git. Install it into
 python -m pip install -e .
 
 jg inventory --repo /path/to/repository --out /path/to/private-artifacts
+jg coverage --repo /path/to/repository --inventory /path/to/private-artifacts/inventory.json --out /path/to/private-artifacts
 jg candidates --repo /path/to/repository --inventory /path/to/private-artifacts/inventory.json --out /path/to/private-artifacts
 jg relate --repo /path/to/repository --candidates /path/to/private-artifacts/candidates.json --preview --out /path/to/private-artifacts
 jg plan --repo /path/to/repository --inventory /path/to/private-artifacts/inventory.json --candidates /path/to/private-artifacts/candidates.json --out /path/to/private-artifacts
 ```
 
+`coverage.json` records exact source/main blob, mode, and deletion comparisons for each local branch. Branches active within 24 hours or lacking activity evidence remain `UNKNOWN`. `jg residual --repo PATH --coverage COVERAGE --branch NAME --out PRIVATE_DIR` can simulate a merge and propose Python definition moves in an independent disposable repository; those suggestions never establish exact preservation.
+
+`jg cleanup plan --repo PATH --coverage COVERAGE --out PRIVATE_DIR` prepares at most 25 strict `EXACT` local refs and verifies a recovery bundle in an independent repository. Review the resulting `cleanup-plan.json` and its `plan_digest`. `jg cleanup approve --repo PATH --plan PLAN --approved-digest SHA256 --out NEW_PRIVATE_DIR` records approval of that exact manifest and emits a new approved digest. `jg cleanup execute --repo PATH --plan APPROVED_PLAN --approved-digest NEW_SHA256` checks the lease gate; the CLI has no worktree-creator lease integration and therefore leaves refs intact. See [guarded cleanup](docs/cleanup.md).
+
 `relate` writes only a local preview by default. A live Jev request requires an approved preview digest, `--use-jev`, and `TYPESAFE_API_KEY` in the process environment. It is hard-capped by default at **one request and 8,192 payload bytes**; raising either cap requires an explicit command-line override after reviewing the preview. The default `--evidence-profile minimal` keeps labels, commit subjects, and path names out of the request. The explicit `review` profile adds preview-visible labels, normalized subjects, and bounded paths when the operator decides that context may leave the machine. There are no OpenAI, Codex, Claude, or agent-loop calls in this project. Read the preview before approving it.
+
+For committed Python excerpts, create a metadata-only selection JSON with `kind: "jev-code-selection"` and `candidates` keyed by candidate ID. Each entry names `source_ref`, `main_ref`, their pinned `source_tip` and `main_tip`, and `ranges` containing `path`, `start_line`, and `end_line`. Run `jg code-relate --repo PATH --candidates CANDIDATES --selection SELECTION` to print the exact request bytes and approval digests to the terminal without saving raw code. A live request repeats that command with `--use-jev --approved-payload-sha256 SHA --approved-batch-sha256 SHA --out PRIVATE_DIR`; it rechecks pins before each send and writes only validated response fields. The default request and byte caps still apply.
 
 ### Large, active repositories
 

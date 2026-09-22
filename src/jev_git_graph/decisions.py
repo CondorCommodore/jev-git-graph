@@ -29,7 +29,7 @@ def _signal(response: dict[str, Any]) -> str | None:
     return None
 
 
-def build_decisions(inventory: dict[str, Any], candidates: dict[str, Any], relations: dict[str, Any]) -> dict[str, Any]:
+def build_decisions(inventory: dict[str, Any], candidates: dict[str, Any], relations: dict[str, Any], equivalence: dict[str, Any] | None = None) -> dict[str, Any]:
     """Classify all recorded branches; never authorize a destructive action."""
     if inventory.get("kind") != "inventory" or not isinstance(inventory.get("branches"), list):
         raise JgError("invalid inventory for automatic decisions")
@@ -39,6 +39,17 @@ def build_decisions(inventory: dict[str, Any], candidates: dict[str, Any], relat
     if candidates.get("repository_id") != inventory.get("repository", {}).get("id"):
         raise JgError("candidate artifact belongs to a different repository")
     relation_info = validate_relations(relations, candidates)
+    if equivalence is not None:
+        if (equivalence.get("kind") != "branch-equivalence" or
+                equivalence.get("inventory_digest") != digest(inventory) or
+                equivalence.get("repository_id") != inventory["repository"]["id"]):
+            raise JgError("equivalence artifact does not match inventory")
+    content_by_name = {item["name"]: item for item in equivalence["branches"]} if equivalence else {}
+    if equivalence is not None:
+        expected_tips = {item["name"]: item["tip"] for item in inventory["branches"]}
+        if (len(content_by_name) != len(equivalence["branches"]) or
+                {name: item.get("tip") for name, item in content_by_name.items()} != expected_tips):
+            raise JgError("equivalence branch tips do not match inventory")
     complete = inventory.get("collection", {}).get("complete") is True
     candidate_by_id = {item["id"]: item for item in candidates["candidates"]}
     signals: dict[str, list[dict[str, str]]] = defaultdict(list)
@@ -70,6 +81,11 @@ def build_decisions(inventory: dict[str, Any], candidates: dict[str, Any], relat
             decision, reason = "HOLD", "integration_unproven"
         records.append({
             "name": name, "tip": branch["tip"], "decision": decision, "reason": reason,
+            "content_verdict": content_by_name.get(name, {}).get("content_verdict"),
+            "content_proof": content_by_name.get(name, {}).get("proof"),
+            "content_destination": content_by_name.get(name, {}).get("destination"),
+            "equivalence_in_scope": content_by_name.get(name, {}).get("in_scope"),
+            "equivalence_scope_reason": content_by_name.get(name, {}).get("scope_reason"),
             "triage": "RELATED_HOLD" if decision == "HOLD" and signals.get(name) else
                       "EVIDENCE_HOLD" if decision == "HOLD" else "FACT_DECISION",
             "jev_signals": signals.get(name, []), "destructive_action_authorized": False,
@@ -80,6 +96,7 @@ def build_decisions(inventory: dict[str, Any], candidates: dict[str, Any], relat
         "repository_id": inventory["repository"]["id"],
         "inventory_digest": digest(inventory), "candidate_digest": digest(candidates),
         "relations_digest": digest(relations), "inventory_complete": complete,
+        "equivalence_digest": digest(equivalence) if equivalence else None,
         "candidate_coverage_complete": not candidates.get("coverage", {}).get("truncated", False),
         "candidate_count": len(candidates["candidates"]),
         "relation_count": len(relations["relations"]),
@@ -90,8 +107,10 @@ def build_decisions(inventory: dict[str, Any], candidates: dict[str, Any], relat
     }
 
 
-def write_decisions(inventory_path: str | Path, candidates_path: str | Path, relations_path: str | Path, output: str | Path) -> Path:
-    result = build_decisions(read_json(inventory_path), read_json(candidates_path), read_json(relations_path))
+def write_decisions(inventory_path: str | Path, candidates_path: str | Path, relations_path: str | Path, output: str | Path,
+                    equivalence_path: str | Path | None = None) -> Path:
+    result = build_decisions(read_json(inventory_path), read_json(candidates_path), read_json(relations_path),
+                             read_json(equivalence_path) if equivalence_path else None)
     target = Path(output) / "decisions.json"
     write_json(target, result)
     return target
