@@ -1,7 +1,7 @@
 "use strict";
 
-// This viewer deliberately has no fetch(), XMLHttpRequest, WebSocket, storage,
-// or network client. JSON is read only from files chosen by the operator.
+// This viewer has no fetch(), XMLHttpRequest, WebSocket, storage, or network
+// client. JSON comes from operator-selected files or an explicit loopback preset.
 (() => {
   const data = window.JevGraphData;
   const state = { artifacts: {}, reviews: new Map(), reviewSchemaVersion: null, fileErrors: [], model: data.normalize({}), filter: "all", viewMode: "components", query: "", group: null, selected: null, graphTargets: [], page: 0, graphPage: 0, pageSize: 100, graphPageSize: 24 };
@@ -31,28 +31,47 @@
   async function readFile(kind, input) {
     const file = input.files && input.files[0];
     if (!file) return;
-    state.fileErrors = state.fileErrors.filter((error) => !error.startsWith(`${kind}.json:`));
     try {
-      const document = JSON.parse(await file.text());
-      const problems = data.validate(kind, document);
-      if (problems.length) throw new Error(problems.join(" "));
-      if (kind === "review" && state.artifacts.inventory?.repository?.id && document.repository_id !== state.artifacts.inventory.repository.id) throw new Error("review repository mismatch");
-      state.artifacts[kind] = document;
-      if (kind === "review") {
-        state.reviewSchemaVersion = document.schema_version;
-        for (const decision of document.decisions) {
-          const proof = decision?.preservation_proof;
-          const verified = !preservationDispositions.has(decision?.disposition) || Boolean(proof && await sha256(proof.destination) === proof.destination_fingerprint);
-          Object.defineProperty(decision, "_destinationFingerprintVerified", { value: verified, enumerable: false, configurable: true });
-        }
-        state.reviews = new Map(document.decisions.map((decision) => [decision.object_id, decision]));
-      }
-      $(`#${kind}-file-name`).textContent = file.name;
+      await applyDocument(kind, JSON.parse(await file.text()), file.name);
     } catch (error) {
-      state.fileErrors.push(`${kind}.json: ${error instanceof SyntaxError ? "Invalid JSON; previous loaded file retained." : "Could not load this artifact; check its schema and file access."}`);
+      addFileError(kind, error);
       input.value = "";
     }
     rebuild();
+  }
+
+  function addFileError(kind, error) {
+    state.fileErrors = state.fileErrors.filter((message) => !message.startsWith(`${kind}.json:`));
+    state.fileErrors.push(`${kind}.json: ${error instanceof SyntaxError ? "Invalid JSON; previous loaded file retained." : "Could not load this artifact; check its schema and file access."}`);
+  }
+
+  async function applyDocument(kind, document, name) {
+    state.fileErrors = state.fileErrors.filter((message) => !message.startsWith(`${kind}.json:`));
+    const problems = data.validate(kind, document);
+    if (problems.length) throw new Error(problems.join(" "));
+    if (kind === "review" && state.artifacts.inventory?.repository?.id && document.repository_id !== state.artifacts.inventory.repository.id) throw new Error("review repository mismatch");
+    state.artifacts[kind] = document;
+    if (kind === "review") {
+      state.reviewSchemaVersion = document.schema_version;
+      for (const decision of document.decisions) {
+        const proof = decision?.preservation_proof;
+        const verified = !preservationDispositions.has(decision?.disposition) || Boolean(proof && await sha256(proof.destination) === proof.destination_fingerprint);
+        Object.defineProperty(decision, "_destinationFingerprintVerified", { value: verified, enumerable: false, configurable: true });
+      }
+      state.reviews = new Map(document.decisions.map((decision) => [decision.object_id, decision]));
+    }
+    $(`#${kind}-file-name`).textContent = name;
+  }
+
+  async function loadLoopbackPreset() {
+    const preset = window.JevGraphDefaultArtifacts;
+    if (!preset || typeof preset !== "object") return;
+    for (const kind of ["inventory", "candidates", "relations", "review"]) {
+      const item = preset[kind];
+      if (!item || typeof item !== "object") continue;
+      try { await applyDocument(kind, item.document, item.name || `${kind}.json`); }
+      catch (error) { addFileError(kind, error); }
+    }
   }
 
   function rebuild() {
@@ -529,5 +548,5 @@
   elements.graph.addEventListener("click", clickGraph);
   $("#export-review").addEventListener("click", exportReview);
   window.addEventListener("resize", drawGraph);
-  renderAll();
+  loadLoopbackPreset().finally(rebuild);
 })();

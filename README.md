@@ -62,6 +62,8 @@ Live `relate` runs checkpoint each request in the private output directory. Reus
 
 Open `docs/index.html` from a local static server, then choose `inventory.json`, `candidates.json`, and `relations.json` from the same run. An optional `review.json` can also be loaded. The viewer reads files selected by the browser only: it does not upload them, fetch a repository, or call Jev. Human dispositions remain browser-local until **Export review.json** downloads a private ledger; pass that file back to `jg plan --review PATH`. It keeps incomplete inventories and candidate pairs without a loaded judgment visibly unresolved.
 
+For an operator's current run, `jg viewer --inventory INVENTORY --candidates CANDIDATES --relations RELATIONS --port 8877` starts a loopback-only page at `http://127.0.0.1:8877`. It serves that exact artifact set as a no-store browser preset, so refreshing the page restores the same files. Artifact paths are never sent to the browser or written into the page. Stop the local viewer process to clear the preset.
+
 The viewer has separate **Connected components**, **Candidate relationships**, and **Jev judgments** views. Each view has record pagination, and the graph has its own page controls; a graph page is a presentation slice, not a data limit. The coverage strip reports loaded candidates, judged records, and the authoritative pending-request count from a batch aggregate when available. Candidate discovery before the configured candidate limit is shown separately.
 
 ```bash
