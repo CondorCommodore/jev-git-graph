@@ -15,6 +15,7 @@ from .jev import DEFAULT_MAX_JEV_PAYLOAD_BYTES, DEFAULT_MAX_JEV_REQUESTS, EVIDEN
 from .plan import write_plan
 from .resume import resume_batches
 from .safety import validate_output_path, write_json
+from .viewer import serve as serve_viewer
 
 
 def parser() -> argparse.ArgumentParser:
@@ -84,6 +85,12 @@ def parser() -> argparse.ArgumentParser:
     resume.add_argument("--max-jev-payload-bytes", type=int, required=True)
     resume.add_argument("--max-total-requests", type=int, required=True)
     resume.add_argument("--use-jev", action="store_true", required=True)
+    viewer = commands.add_parser("viewer", help="serve one explicit local artifact set on loopback")
+    viewer.add_argument("--inventory", required=True)
+    viewer.add_argument("--candidates", required=True)
+    viewer.add_argument("--relations", required=True)
+    viewer.add_argument("--review")
+    viewer.add_argument("--port", type=int, default=8877)
     return root
 
 
@@ -101,6 +108,12 @@ def run(args: argparse.Namespace) -> str:
                                   max_requests=args.max_jev_requests,
                                   max_payload_bytes=args.max_jev_payload_bytes,
                                   max_total_requests=args.max_total_requests))
+    if args.command == "viewer":
+        artifacts = {"inventory": Path(args.inventory), "candidates": Path(args.candidates), "relations": Path(args.relations)}
+        if args.review:
+            artifacts["review"] = Path(args.review)
+        serve_viewer(artifacts, args.port)
+        return ""
     if args.command == "calibrate":
         destination = _protected_output(args.repo, args.out)
         return str(write_calibration(args.labels, args.relations, destination))
