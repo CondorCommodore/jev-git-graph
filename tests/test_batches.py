@@ -1,4 +1,5 @@
 import copy
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +12,35 @@ from jev_git_graph.jev import payload_for_candidate
 
 
 class BatchTests(unittest.TestCase):
+    def test_missing_checkpoint_covered_by_another_plan_is_not_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            candidate = {"id": "pair", "endpoints": {
+                "a": {"branch": "a", "tip": "a" * 40},
+                "b": {"branch": "b", "tip": "b" * 40}},
+                "reasons": [], "evidence": {"shared_patch_ids": [], "shared_paths": [],
+                "shared_subject_tokens": [], "a_unique_commit_count": 1,
+                "b_unique_commit_count": 1, "a_merge_base": None, "b_merge_base": None}}
+            source = {"kind": "candidates", "schema_version": 1, "repository_id": "repo",
+                      "inventory_digest": "0" * 64, "candidates": [candidate]}
+            write_json(root / "candidates.json", source)
+            plan_path = prepare_batches(root / "candidates.json", root / "completed", 1)
+            preview = read_json(root / "completed/batch-0001/jev-preview.json")
+            request_sha = digest(preview["requests"][0])
+            write_json(root / "completed/batch-0001/relations.json", {
+                "source_preview_sha256": preview["payload_sha256"], "network_performed": True,
+                "attempts": [{"request_sha256": request_sha, "candidate_id": "pair", "status": "succeeded"}],
+                "relations": [{"candidate_id": "pair", "response": {"answers": {}}}],
+            })
+            shadow = root / "missing"
+            shutil.copytree(root / "completed", shadow)
+            (shadow / "batch-0001/relations.json").unlink()
+            result = read_json(collect_batches(
+                [shadow / "batches.json", plan_path], root / "candidates.json", root / "combined"
+            ))
+            self.assertEqual(0, result["missing_batches"])
+            self.assertEqual(0, result["unattempted_requests"])
+
     def test_partitions_and_skips_attempts_and_facts_without_overwriting(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

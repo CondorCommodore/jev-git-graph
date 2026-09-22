@@ -118,6 +118,7 @@ def collect_batches(manifest_paths, candidates_path, output):
     attempt_indexes = {}
     planned_requests = set()
     seen_relations = {}
+    missing_batch_requests = []
     for manifest_value in manifest_paths:
         manifest_path = Path(manifest_value).resolve()
         manifest = read_json(manifest_path)
@@ -155,7 +156,7 @@ def collect_batches(manifest_paths, candidates_path, output):
             planned_requests.update(expected)
             checkpoint = directory / "relations.json"
             if not checkpoint.exists():
-                result["missing_batches"] += 1
+                missing_batch_requests.append(set(expected))
                 continue
             ledger = read_json(checkpoint)
             if ledger.get("source_preview_sha256") != batch["payload_sha256"]:
@@ -199,6 +200,7 @@ def collect_batches(manifest_paths, candidates_path, output):
                 raise JgError("successful attempt is missing its response")
             result["network_performed"] |= bool(ledger.get("network_performed"))
     result["unattempted_requests"] = len(planned_requests - seen)
+    result["missing_batches"] = sum(bool(requests - seen) for requests in missing_batch_requests)
     destination = Path(output)
     destination.mkdir(mode=0o700, parents=True, exist_ok=True)
     if destination.stat().st_mode & 0o077:
