@@ -550,7 +550,7 @@ def execute_cleanup(repo: str | Path, plan: Mapping[str, Any] | str | Path,
                     live_after = {item["name"]: item["tip"] for item in git.local_branches(runner)}
                 except JgError:
                     presence = _ref_presence(root, name)
-                    if presence is False:
+                    if presence is not True:
                         restored = _atomic_restore(root, name, tip)
                         outcome = {"kind": "cleanup-execution", "plan_digest": expected,
                                    "deletion_ready": False, "deleted": deleted,
@@ -576,7 +576,7 @@ def execute_cleanup(repo: str | Path, plan: Mapping[str, Any] | str | Path,
         finally:
             if acquired and not _safe_release(lease_contract, name, tip):
                 presence = _ref_presence(root, name) if delete_committed else True
-                restoration_attempted = delete_committed and presence is False
+                restoration_attempted = delete_committed and presence is not True
                 restored = _atomic_restore(root, name, tip) if restoration_attempted else False
                 if restored:
                     deleted = [item for item in deleted if item["name"] != name]

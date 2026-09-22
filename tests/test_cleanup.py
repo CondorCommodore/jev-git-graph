@@ -188,10 +188,12 @@ class CleanupTests(unittest.TestCase):
             approved = approve_cleanup_plan(plan, approved_digest=plan["plan_digest"])
             lease = CooperativeLease(True, lambda *_: True, lambda *_: False)
             with patch("jev_git_graph.cleanup.CREATOR_LEASE_INTEGRATED", True), \
-                 patch("jev_git_graph.cleanup._live_reproof", return_value=None):
+                 patch("jev_git_graph.cleanup._live_reproof", return_value=None), \
+                 patch("jev_git_graph.cleanup._ref_presence", return_value=None):
                 result = execute_cleanup(repo, approved,
                                          approved_digest=approved["plan_digest"], lease_contract=lease)
         self.assertEqual("lease_release_failed", result["stopped"])
+        self.assertTrue(result["restoration_attempted"])
         self.assertTrue(result["restored"])
         self.assertEqual(topic_tip, run(repo, "rev-parse", "topic"))
 
