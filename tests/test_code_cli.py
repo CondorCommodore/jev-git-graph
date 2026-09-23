@@ -52,6 +52,26 @@ class CodeCliTests(unittest.TestCase):
             self.assertEqual(shown["preview"]["payload_sha256"], shown["approval"]["payload_sha256"])
             self.assertFalse((base / "code-relations.json").exists())
             document = json.loads(selection.read_text())
+            document["candidates"]["pair"].pop("source_ref")
+            document["candidates"]["pair"].pop("main_ref")
+            document["candidates"]["pair"]["snapshot_mode"] = "pinned_commits"
+            selection.write_text(json.dumps(document))
+            with patch("urllib.request.urlopen", side_effect=AssertionError("network")):
+                before_move = json.loads(run(args))
+            git(repo, "switch", "-q", "main")
+            (repo / "unit.py").write_text("def result():\n    return 3\n")
+            git(repo, "commit", "-qam", "main moved")
+            with patch("urllib.request.urlopen", side_effect=AssertionError("network")):
+                pinned = json.loads(run(args))
+            self.assertEqual(pinned["preview"]["payload_sha256"], before_move["preview"]["payload_sha256"])
+            document["candidates"]["pair"].pop("snapshot_mode")
+            document["candidates"]["pair"].update({"source_ref": "refs/heads/feature", "main_ref": "refs/heads/main"})
+            selection.write_text(json.dumps(document))
+            with self.assertRaisesRegex(JgError, "main ref moved"):
+                run(args)
+            document["candidates"]["pair"].pop("source_ref")
+            document["candidates"]["pair"].pop("main_ref")
+            document["candidates"]["pair"]["snapshot_mode"] = "pinned_commits"
             document["candidates"]["pair"]["source_tip"] = main
             selection.write_text(json.dumps(document))
             with self.assertRaisesRegex(JgError, "candidate endpoints"):
