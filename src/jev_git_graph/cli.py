@@ -23,8 +23,85 @@ from .residual import analyze_residual
 from .snapshot import load_snapshot, write_snapshot
 from .contributions import write_contributions
 from .groups import write_groups
+from .outcomes import write_outcomes
+from .study import write_study
+from .snapshot import load_snapshot
+
+
+def _build_group_presence_preview(args):
+    """Rebuild an approved presence payload without persisting request text."""
+    snapshot, object_repo = load_snapshot(args.snapshot)
+    contributions = read_json(args.contributions)
+    groups = read_json(args.groups)
+    if (snapshot.get("snapshot_digest") != contributions.get("snapshot_digest") or
+            contributions.get("contributions_digest") != groups.get("contributions_digest") or
+            snapshot.get("snapshot_digest") != groups.get("snapshot_digest")):
+        raise JgError("snapshot, contributions, and groups pins do not match")
+    if args.evidence_ranges:
+        range_manifest = read_json(args.evidence_ranges)
+        expected = {
+            "snapshot_digest": snapshot["snapshot_digest"],
+            "contributions_digest": contributions["contributions_digest"],
+            "groups_digest": groups["groups_digest"],
+        }
+        if (range_manifest.get("kind") != "branch-presence-range-manifest" or
+                range_manifest.get("schema_version") != 1 or
+                any(range_manifest.get(key) != value for key, value in expected.items()) or
+                not isinstance(range_manifest.get("ranges"), list)):
+            raise JgError("evidence range manifest is invalid or belongs to different pinned artifacts")
+    else:
+        range_manifest = {
+            "kind": "branch-presence-range-manifest", "schema_version": 1,
+            "snapshot_digest": snapshot["snapshot_digest"],
+            "contributions_digest": contributions["contributions_digest"],
+            "groups_digest": groups["groups_digest"], "ranges": [],
+        }
+    model_settings = read_json(args.model_settings) if args.model_settings else None
+    units = {unit["id"]: unit for unit in contributions.get("units", [])}
+    evidence_by_contribution = {}
+    for item in range_manifest["ranges"]:
+        if not isinstance(item, dict) or item.get("contribution_id") not in units:
+            raise JgError("evidence range manifest refers to an unknown contribution")
+        unit = units[item["contribution_id"]]
+        if item.get("source_tip") != unit.get("source_tip") or item.get("destination_tip") != unit.get("main_tip"):
+            raise JgError("evidence ranges do not match pinned contribution endpoints")
+        evidence_by_contribution[item["contribution_id"]] = build_two_sided_evidence(
+            object_repo, item["source_tip"], item["destination_tip"], item.get("ranges"))
+    plan = build_group_requests(
+        contributions, groups, evidence_by_contribution,
+        max_groups=args.max_groups, max_request_bytes=args.max_request_bytes,
+        model_settings=model_settings, estimated_input_tokens=args.estimated_input_tokens,
+        max_provider_tokens=args.max_provider_tokens)
+    preview = approved_presence_preview(plan)
+    replay = {
+        "kind": "branch-presence-approved-manifest", "schema_version": 1,
+        "snapshot_digest": snapshot["snapshot_digest"],
+        "contributions_digest": contributions["contributions_digest"],
+        "groups_digest": groups["groups_digest"],
+        "range_manifest_digest": digest(range_manifest),
+        "model_settings": model_settings,
+        "model_settings_digest": preview["model_settings_digest"],
+        "request_budgets": preview["request_budgets"],
+        "request_count": preview["request_count"], "payload_bytes": preview["payload_bytes"],
+        "payload_sha256": preview["payload_sha256"], "plan_digest": preview["plan_digest"],
+        "approval_sha256": preview["approval_sha256"],
+    }
+    replay["manifest_digest"] = digest(replay)
+    return object_repo, range_manifest, replay, preview
+from .group_requests import (
+    approved_presence_preview,
+    build_group_requests,
+    build_two_sided_evidence,
+)
+from .presence import (
+    execute_presence_preview,
+    import_control_answers,
+    import_synthetic_answers,
+    reconcile_presence,
+)
+from .presence_calibration import build_presence_calibration
 from .resume import resume_batches
-from .safety import canonical_json, opaque_path_id, read_json, validate_output_path, write_json
+from .safety import canonical_json, digest, opaque_path_id, read_json, validate_output_path, write_json
 from .viewer import serve as serve_viewer
 
 
@@ -54,6 +131,59 @@ def parser() -> argparse.ArgumentParser:
     groups.add_argument("--out", required=True)
     groups.add_argument("--max-units", type=int, default=24)
     groups.add_argument("--max-edges", type=int, default=1000)
+
+    group_relate = commands.add_parser("group-relate", help="plan or explicitly execute bounded branch-presence requests")
+    group_relate.add_argument("--snapshot", required=True)
+    group_relate.add_argument("--contributions", required=True)
+    group_relate.add_argument("--groups", required=True)
+    group_relate.add_argument("--evidence-ranges")
+    group_relate.add_argument("--model-settings")
+    group_relate.add_argument("--out", required=True)
+    group_relate.add_argument("--max-groups", type=int, default=32)
+    group_relate.add_argument("--max-request-bytes", type=int, default=64000)
+    group_relate.add_argument("--estimated-input-tokens", type=int)
+    group_relate.add_argument("--max-provider-tokens", type=int)
+    group_relate.add_argument("--execute", action="store_true")
+    group_relate.add_argument("--approved-payload-sha256")
+    group_relate.add_argument("--approved-approval-sha256")
+    group_relate.add_argument("--max-workers", type=int, default=2)
+    group_relate.add_argument("--checkpoint")
+    group_relate.add_argument("--answers")
+    group_relate.add_argument("--answer-origin", choices=("synthetic", "control"))
+
+    presence_reconcile = commands.add_parser("presence-reconcile", help="reconcile presence answers against pinned groups")
+    presence_reconcile.add_argument("--contributions", required=True)
+    presence_reconcile.add_argument("--groups", required=True)
+    presence_reconcile.add_argument("--answers", required=True)
+    presence_reconcile.add_argument("--out", required=True)
+
+    presence_calibrate = commands.add_parser("presence-calibrate", help="compare reviewed presence labels with Jev and control results")
+    presence_calibrate.add_argument("--labels", required=True)
+    presence_calibrate.add_argument("--jev", required=True)
+    presence_calibrate.add_argument("--control", required=True)
+    presence_calibrate.add_argument("--jev-metadata")
+    presence_calibrate.add_argument("--control-metadata")
+    presence_calibrate.add_argument("--out", required=True)
+
+    study = commands.add_parser("study", help="select a bounded, family-stratified review study")
+    study.add_argument("--repo", required=True)
+    study.add_argument("--contributions", required=True)
+    study.add_argument("--groups", required=True)
+    study.add_argument("--out", required=True)
+    study.add_argument("--count", type=int, default=32)
+    study.add_argument("--max-per-family", type=int, default=4)
+    study.add_argument("--exclude-branch", action="append", default=[])
+    study.add_argument("--project-goals", default="")
+
+    outcomes = commands.add_parser("outcomes", help="account for every object and render preservation tasks and review page")
+    outcomes.add_argument("--repo", required=True)
+    outcomes.add_argument("--inventory", required=True)
+    outcomes.add_argument("--snapshot", required=True)
+    outcomes.add_argument("--contributions", required=True)
+    outcomes.add_argument("--presence")
+    outcomes.add_argument("--coverage")
+    outcomes.add_argument("--review")
+    outcomes.add_argument("--out", required=True)
 
     candidates = commands.add_parser("candidates", help="build bounded deterministic relationship candidates")
     candidates.add_argument("--repo", required=True)
@@ -172,6 +302,87 @@ def _protected_output(repo: str, output: str) -> Path:
 
 
 def run(args: argparse.Namespace) -> str:
+    if args.command == "group-relate":
+        if args.execute and args.answers:
+            raise JgError("choose either approved Jev execution or answer import")
+        if bool(args.answers) != bool(args.answer_origin):
+            raise JgError("answer import requires both --answers and --answer-origin")
+        if args.execute and (not args.approved_payload_sha256 or not args.approved_approval_sha256):
+            raise JgError("group presence execution requires approved payload and approval digests")
+        if args.execute and (args.estimated_input_tokens is None or args.max_provider_tokens is None):
+            raise JgError("group presence execution requires explicit input and provider token budgets")
+        object_repo, range_manifest, replay, preview = _build_group_presence_preview(args)
+        if args.execute and not preview["request_budgets"].get("token_budget_established"):
+            raise JgError("provider token budget could not be established")
+        if args.execute and (args.approved_payload_sha256 != replay["payload_sha256"] or
+                             args.approved_approval_sha256 != replay["approval_sha256"]):
+            raise JgError("approved presence digests do not match the rebuilt request")
+        target = validate_output_path(args.out, [object_repo])
+        target.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if target.stat().st_mode & 0o077:
+            raise JgError("presence output directory must be owner-only")
+        replay_path = target / "approved-presence-manifest.json"
+        ranges_path = target / "presence-ranges.json"
+        if replay_path.exists():
+            previous = read_json(replay_path)
+            if previous != replay:
+                raise JgError("rebuilt presence request differs from the approved manifest")
+        elif args.execute or args.answers:
+            raise JgError("preview and persist the approved manifest before execution or answer import")
+        else:
+            write_json(replay_path, replay)
+            write_json(ranges_path, range_manifest)
+        if args.execute:
+            checkpoint = validate_output_path(args.checkpoint, [object_repo]) if args.checkpoint else None
+            result = execute_presence_preview(
+                preview, args.approved_payload_sha256,
+                approved_approval_sha256=args.approved_approval_sha256,
+                max_workers=args.max_workers, checkpoint=checkpoint,
+                code_evidence_repo=object_repo)
+            response_path = target / "presence-execution.json"
+            write_json(response_path, result)
+            return str(response_path)
+        if args.answers:
+            response_import = read_json(args.answers)
+            if (response_import.get("kind") != "branch-presence-response-import" or
+                    response_import.get("schema_version") != 1 or
+                    not isinstance(response_import.get("answers"), list)):
+                raise JgError("presence response import has an unsupported schema")
+            importer = import_synthetic_answers if args.answer_origin == "synthetic" else import_control_answers
+            result = importer(preview, response_import["answers"])
+            response_path = target / f"presence-{args.answer_origin}-answers.json"
+            write_json(response_path, result)
+            return str(response_path)
+        return str(replay_path)
+    if args.command == "presence-reconcile":
+        result = reconcile_presence(
+            read_json(args.contributions), read_json(args.groups), read_json(args.answers))
+        write_json(args.out, result)
+        return args.out
+    if args.command == "presence-calibrate":
+        result = build_presence_calibration(
+            read_json(args.labels), read_json(args.jev), read_json(args.control),
+            jev_metadata=read_json(args.jev_metadata) if args.jev_metadata else None,
+            control_metadata=read_json(args.control_metadata) if args.control_metadata else None,
+        )
+        write_json(args.out, result)
+        return args.out
+    if args.command == "study":
+        contributions = read_json(args.contributions)
+        root, common, _runner = git.open_repository(args.repo)
+        if contributions.get("repository_id") != opaque_path_id(root):
+            raise JgError("contributions belong to a different local repository")
+        target = validate_output_path(args.out, [*protected_worktree_paths(args.repo), common])
+        return str(write_study(args.contributions, args.groups, target, args.count,
+                               args.max_per_family, args.exclude_branch, args.project_goals))
+    if args.command == "outcomes":
+        inventory = read_json(args.inventory)
+        root, common, _runner = git.open_repository(args.repo)
+        if inventory.get("repository", {}).get("id") != opaque_path_id(root):
+            raise JgError("inventory belongs to a different local repository")
+        target = validate_output_path(args.out, [*protected_worktree_paths(args.repo), common])
+        return str(write_outcomes(args.inventory, args.snapshot, args.contributions, target,
+                                  args.presence, args.coverage, args.review))
     if args.command == "groups":
         contributions = read_json(args.contributions)
         root, common, _runner = git.open_repository(args.repo)

@@ -7,6 +7,7 @@ from typing import Any
 from .errors import JgError
 from .review import DISPOSITIONS, object_fingerprint, object_id
 from .safety import digest
+from .decisions import _signal
 
 
 LIKELY_TRUE = 0.75
@@ -46,6 +47,8 @@ def _semantic_suggestions(candidate: dict[str, Any], relation: dict[str, Any]) -
     response = relation.get("response")
     answers = response.get("answers") if isinstance(response, dict) else None
     if not isinstance(answers, dict):
+        return []
+    if _signal(response) is None:
         return []
     suggestions: list[dict[str, Any]] = []
     candidate_id = candidate.get("id", "")
