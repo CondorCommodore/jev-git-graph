@@ -81,7 +81,6 @@ _REQUIRED_LAUNCHD_SELECTORS = {
     "com.mikebook.all-health-controller": "code/.runtime/releases/home-lab/stable",
     "com.mikebook.all-health-coord-wake-consumer": "code/.runtime/releases/home-lab/stable",
     "com.mikebook.merge-safe-prs-loop": "code/.runtime/releases/home-lab/stable",
-    "com.mikebook.deploy-sync": "code/.runtime/home-lab",
     "com.mikebook.pr-convergence-wake-consumer": "code/.runtime/releases/home-lab/stable",
     "com.mikebook.pr-convergence-wake-producer": "code/.runtime/releases/home-lab/stable",
     "com.mikebook.wip-convergence-loop": "code/.runtime/releases/home-lab/stable",
@@ -91,6 +90,20 @@ _REQUIRED_LAUNCHD_SELECTORS = {
     "com.condor.autonomy-drain-loop.claude": "code/home-lab",
     "com.tradeengine.coord-wake-codex": "code/home-lab",
     "com.mikebook.ahc-inventory-alarm": "code/.runtime/home-lab",
+}
+_REQUIRED_LAUNCHD_PATHS = {
+    "com.mikebook.all-health-controller": ("launchd/start-all-health-controller.sh", "scripts/all_health_controller.py", "runtime"),
+    "com.mikebook.all-health-coord-wake-consumer": ("launchd/start-all-health-coord-wake-consumer.sh", "scripts/coord_wake_consumer.py", "runtime"),
+    "com.mikebook.merge-safe-prs-loop": ("launchd/start-merge-safe-prs-loop.sh", "scripts/merge-safe-prs-loop.sh", "runtime"),
+    "com.mikebook.pr-convergence-wake-consumer": ("launchd/start-pr-convergence-wake-consumer.sh", "scripts/merge_safe_pr_wake_consumer.py", "runtime"),
+    "com.mikebook.pr-convergence-wake-producer": ("launchd/start-pr-convergence-wake-producer.sh", "scripts/merge_safe_pr_wake_producer.py", "runtime"),
+    "com.mikebook.wip-convergence-loop": ("scripts/wip_convergence_entrypoint.py", "scripts/wip_convergence_entrypoint.py", "canonical"),
+    "com.mikebook.train-construction": ("launchd/start-train-construction.sh", "scripts/train_construction_driver.py", "runtime"),
+    "com.mikebook.pr-repair-loop": ("launchd/start-pr-repair-loop.sh", "scripts/pr_repair_loop.py", "canonical"),
+    "com.condor.autonomy-drain-loop.codex": ("launchd/start-autonomy-drain-loop.sh", "scripts/autonomy_drain_loop.py", "canonical"),
+    "com.condor.autonomy-drain-loop.claude": ("launchd/start-autonomy-drain-loop.sh", "scripts/autonomy_drain_loop.py", "canonical"),
+    "com.tradeengine.coord-wake-codex": ("watcher/coord-wake.sh", "watcher/coord-wake.sh", "canonical"),
+    "com.mikebook.ahc-inventory-alarm": ("launchd/start-ahc-inventory-alarm.sh", "scripts/ahc_inventory_alarm.py", "runtime"),
 }
 DISPOSABLE_FIXTURE_ROOT = Path.home() / ".local/state/jev-git-graph/disposable-fixtures"
 
@@ -235,17 +248,24 @@ def _verify_loaded_runtime_jobs(home: Path, runtime_roots: tuple[Path, ...]) -> 
         root = expected_roots[selector]
         args = plist.get("ProgramArguments")
         wd = plist.get("WorkingDirectory")
-        def under_root(value: Any) -> bool:
-            if not isinstance(value, str) or not Path(value).is_absolute():
-                return False
-            try:
-                Path(value).resolve(strict=False).relative_to(root)
-                return True
-            except ValueError:
-                return False
-        if (plist.get("Label") != label or not isinstance(args, list)
-                or not any(under_root(arg) for arg in args)
-                or (isinstance(wd, str) and ".runtime/" in wd and Path(wd).resolve(strict=False) != root)):
+        launcher_rel, process_rel, cwd_scope = _REQUIRED_LAUNCHD_PATHS[label]
+        launcher_root = root
+        expected_launcher = (launcher_root / launcher_rel).resolve(strict=False)
+        configured_launcher = False
+        if isinstance(args, list):
+            command_tokens: list[str] = []
+            for arg in args:
+                if isinstance(arg, str):
+                    command_tokens.extend(shlex.split(arg))
+            for token in command_tokens:
+                token_path = Path(token)
+                candidate = token_path if token_path.is_absolute() else (
+                    launcher_root / token_path)
+                if candidate.resolve(strict=False) == expected_launcher:
+                    configured_launcher = True
+                    break
+        if (plist.get("Label") != label or not isinstance(args, list) or not configured_launcher
+                or (cwd_scope == "runtime" and isinstance(wd, str) and wd and Path(wd).resolve(strict=False) != root)):
             raise JgError(f"creator runtime launchd entrypoint targets an unverified tree: {label}")
         check = subprocess.run(["launchctl", "print", f"gui/{uid}/{label}"],
                                capture_output=True, text=True, check=False, timeout=10)
@@ -266,19 +286,19 @@ def _verify_loaded_runtime_jobs(home: Path, runtime_roots: tuple[Path, ...]) -> 
                         if line.startswith("n/") and cwd_result.returncode == 0), None)
             cwd_path = Path(cwd).resolve(strict=False) if cwd else None
             argv = shlex.split(process.stdout) if process.returncode == 0 else []
+            expected_process = (root / process_rel).resolve(strict=False)
             executable_evidence = False
-            absolute_entrypoint_evidence = False
             for token in argv:
                 token_path = Path(token)
                 candidate = token_path if token_path.is_absolute() else ((cwd_path / token_path) if cwd_path else Path("/nonexistent"))
-                if candidate.is_file() and under_root(str(candidate)):
+                if candidate.is_file() and candidate.resolve(strict=False) == expected_process:
                     executable_evidence = True
-                    if token_path.is_absolute():
-                        absolute_entrypoint_evidence = True
-            cwd_entrypoint_evidence = bool(cwd_path and under_root(str(cwd_path)) and executable_evidence)
-            if not (cwd_entrypoint_evidence or absolute_entrypoint_evidence):
+            expected_cwd = root if cwd_scope == "runtime" else runtime_roots[-1]
+            if not (cwd_path and cwd_path == expected_cwd and executable_evidence):
                 raise JgError(f"runtime_adoption_unverified: creator process is not running from the reviewed tree: {label}")
         jobs.append((label, str(plist_path.resolve()), str(root)))
+    if any(label == "com.mikebook.train-construction" for label, _plist, _root in jobs):
+        raise JgError("creator_runtime_inventory_incomplete: train-construction checks out mutable origin/main into a separate runtime")
     return tuple(jobs)
 
 
