@@ -32,6 +32,8 @@ class CheckpointTests(unittest.TestCase):
         self.assertNotIn("secret-test-token", " ".join(arguments))
         self.assertEqual(run.call_args.kwargs["input"], canonical_json({"state": "sample"}))
         self.assertEqual(len(run.call_args.kwargs["pass_fds"]), 1)
+        self.assertNotIn("TYPESAFE_API_KEY", run.call_args.kwargs["env"])
+        self.assertNotIn("OP_SESSION", run.call_args.kwargs["env"])
 
     def test_default_transport_does_not_return_provider_error_body(self):
         completed = subprocess.CompletedProcess([], 0, b'{"secret":"must-not-appear"}\n403')
