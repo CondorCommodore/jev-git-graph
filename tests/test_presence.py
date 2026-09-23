@@ -1,0 +1,167 @@
+from __future__ import annotations
+
+import subprocess
+
+import pytest
+
+from jev_git_graph.errors import JgError
+from jev_git_graph.group_requests import (
+    approved_presence_preview,
+    build_group_requests,
+    build_two_sided_evidence,
+    revalidate_two_sided_evidence,
+)
+from jev_git_graph.groups import build_groups
+from jev_git_graph.presence import (
+    import_synthetic_answers,
+    reconcile_presence,
+    validate_outcome_presence,
+)
+from jev_git_graph.presence_calibration import build_presence_calibration
+from jev_git_graph.safety import digest
+
+
+def _artifact():
+    contribution = {
+        "kind": "contributions", "schema_version": 1, "repository_id": "fixture",
+        "snapshot_digest": "a" * 64, "main": {"name": "main", "tip": "b" * 40},
+        "branches": [{"name": "feature/task", "tip": "c" * 40, "eligible": True,
+                       "unit_ids": ["cu-1"], "exclusion_reasons": []}],
+        "units": [{"id": "cu-1", "source_tip": "c" * 40, "main_tip": "b" * 40,
+                    "path": "src.py", "source_blob": "d" * 40, "kind": "python_definition",
+                    "name": "work", "range": {"start_line": 1, "end_line": 2},
+                    "source": {"branch": "feature/task", "path": "src.py", "blob": "d" * 40},
+                    "destination_ids": ["du-1"], "limitations": []}],
+        "destination_units": [{"id": "du-1", "path": "dst.py", "blob": "e" * 40,
+                               "mode": "100644", "kind": "python_definition",
+                               "name": "work", "range": {"start_line": 1, "end_line": 2}}],
+        "edges": [], "paths": [], "limitations": [],
+    }
+    contribution["contributions_digest"] = digest(contribution)
+    groups = build_groups(contribution)
+    return contribution, groups
+
+
+def _response(request, presence="PRESENT", sufficient=0.95, delta=0.05):
+    answers = {}
+    for qid, question in request["questions"].items():
+        if question["type"] == "noul":
+            value = sufficient if qid.endswith(":evidence_sufficient") else delta
+            answers[qid] = {"noul": value}
+        else:
+            answers[qid] = {
+                "choice": presence, "confidence": 0.9,
+                "probabilities": {choice: 0.9 if choice == presence else 0.1 / 3
+                                  for choice in ("PRESENT", "PARTIAL", "ABSENT", "UNKNOWN")},
+            }
+    return {"model": "offline-fixture", "usage": {"input_tokens": 11, "output_tokens": 5},
+            "answers": answers}
+
+
+def _synthetic_result(contributions, groups, plan, choices):
+    preview = approved_presence_preview(plan)
+    records = [{"request_sha256": digest(request), "response": _response(request, **choice)}
+               for request, choice in zip(preview["requests"], choices)]
+    artifact = import_synthetic_answers(preview, records)
+    return preview, reconcile_presence(contributions, groups, artifact)
+
+
+def test_synthetic_answers_are_advisory_and_origin_cannot_be_overridden():
+    contributions, groups = _artifact()
+    plan = build_group_requests(contributions, groups)
+    preview, result = _synthetic_result(contributions, groups, plan, [{}])
+
+    if groups["groups"][0]["context_complete"]:
+        assert result["contributions"][0]["disposition"] == "LIKELY_PRESERVED"
+    else:
+        assert result["contributions"][0]["disposition"] == "UNRESOLVED"
+        assert "group_context_incomplete" in result["contributions"][0]["reasons"]
+    assert result["contributions"][0]["routing_scope"] == "advisory_only"
+    assert validate_outcome_presence(result, contributions) == {}
+    with pytest.raises(JgError, match="origin override"):
+        reconcile_presence(contributions, groups,
+                           import_synthetic_answers(preview, [{"request_sha256": digest(preview["requests"][0]),
+                                                              "response": _response(preview["requests"][0])}]),
+                           origin="jev")
+
+
+def test_overlapping_contradiction_and_incomplete_group_remain_unresolved():
+    contributions, groups = _artifact()
+    duplicate = dict(groups["groups"][0])
+    duplicate["id"] = "grp-second"
+    groups["groups"] = [*groups["groups"], duplicate]
+    groups.pop("groups_digest")
+    groups["groups_digest"] = digest(groups)
+    plan = build_group_requests(contributions, groups)
+    _, contradicted = _synthetic_result(contributions, groups, plan,
+        [{}, {"presence": "ABSENT", "delta": 0.95}])
+    row = contradicted["contributions"][0]
+    assert row["disposition"] == "UNRESOLVED"
+    assert "overlapping_answers_contradict" in row["reasons"]
+
+    contributions, groups = _artifact()
+    groups["groups"][0]["context_complete"] = False
+    groups["groups_digest"] = digest({key: value for key, value in groups.items() if key != "groups_digest"})
+    plan = build_group_requests(contributions, groups)
+    _, incomplete = _synthetic_result(contributions, groups, plan, [{}])
+    assert incomplete["contributions"][0]["disposition"] == "UNRESOLVED"
+    assert "group_context_incomplete" in incomplete["contributions"][0]["reasons"]
+
+
+def test_calibration_excludes_unreviewed_labels_and_uses_matched_cases():
+    contributions, groups = _artifact()
+    plan = build_group_requests(contributions, groups)
+    _, result = _synthetic_result(contributions, groups, plan, [{}])
+    # Calibration consumes matched outputs from both arms; synthetic fixture
+    # answers remain labelled as offline prediction data, never owner truth.
+    labels = {"kind": "branch-presence-owner-labels", "schema_version": 1,
+              "snapshot_digest": contributions["snapshot_digest"],
+              "contributions_digest": contributions["contributions_digest"],
+              "groups_digest": groups["groups_digest"], "accepted_by": "owner",
+              "label_source": "owner_review", "blinded": True,
+              "labels": [{"contribution_id": "cu-1", "family_id": "family-1",
+                          "reviewed": True, "disposition": "LIKELY_PRESERVED"},
+                         {"contribution_id": "cu-unreviewed", "family_id": "family-2",
+                          "reviewed": False, "disposition": None}]}
+    jev_result = {**result, "origin": "jev"}
+    jev_result.pop("presence_digest")
+    jev_result["presence_digest"] = digest(jev_result)
+    control_result = {**result, "origin": "control"}
+    control_result.pop("presence_digest")
+    control_result["presence_digest"] = digest(control_result)
+    calibration = build_presence_calibration(labels, jev_result, control_result)
+    assert calibration["labels"]["unreviewed_excluded"] == 1
+    assert calibration["matched_contribution_ids"] == ["cu-1"]
+    assert calibration["arms"]["jev"]["incorrect_preservation_claims"] == 0
+
+
+def _git(repo, *args):
+    return subprocess.run(["git", "-C", str(repo), *args], check=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout.strip()
+
+
+def test_two_sided_evidence_is_pinned_to_distinct_source_and_destination_paths(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "test@example.invalid")
+    _git(repo, "config", "user.name", "Test")
+    (repo / "destination.py").write_text("def work():\n    return 2\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "destination")
+    destination_tip = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "-qb", "feature")
+    (repo / "source.py").write_text("def work():\n    return 3\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "source")
+    source_tip = _git(repo, "rev-parse", "HEAD")
+
+    evidence = build_two_sided_evidence(repo, source_tip, destination_tip, [{
+        "evidence_id": "ev-1", "source_path": "source.py",
+        "source_range": {"start_line": 1, "end_line": 2},
+        "destination_path": "destination.py",
+        "destination_range": {"start_line": 1, "end_line": 2},
+    }])
+    assert evidence["records"][0]["source"]["path"] == "source.py"
+    assert evidence["records"][0]["destination"]["path"] == "destination.py"
+    assert revalidate_two_sided_evidence(repo, evidence) == evidence
