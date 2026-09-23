@@ -11,6 +11,27 @@ from test_snapshot import make_repo, git
 
 
 class SnapshotCliTests(unittest.TestCase):
+    def test_python_limitations_and_aliases_reach_groups(self):
+        with tempfile.TemporaryDirectory(dir='/private/tmp') as tmp:
+            root = Path(tmp)
+            repo, _, _, _ = make_repo(root)
+            git(repo, 'switch', 'topic')
+            (repo / 'broken.py').write_text('def broken(:\n')
+            git(repo, 'add', '.')
+            git(repo, 'commit', '-qm', 'unparsed Python')
+            git(repo, 'branch', 'topic-alias')
+            git(repo, 'switch', 'main')
+            def call(*args):
+                return Path(run(parser().parse_args(list(args))))
+            inv = call('inventory', '--repo', str(repo), '--out', str(root / 'inventory'))
+            with patch('jev_git_graph.snapshot._activity', return_value=1):
+                snap = call('snapshot', '--repo', str(repo), '--inventory', str(inv), '--out', str(root / 'snapshot'))
+            contributions = call('contributions', '--repo', str(repo), '--snapshot', str(snap), '--out', str(root / 'contributions.json'))
+            groups = call('groups', '--repo', str(repo), '--contributions', str(contributions), '--out', str(root / 'groups'))
+            artifact = json.loads(groups.read_text())
+            self.assertEqual(artifact['coverage']['grouped_source_units'], 4)
+            self.assertTrue(all(not group['context_complete'] for group in artifact['groups']))
+
     def test_chain_uses_fixed_objects_and_writes_no_source_files(self):
         with tempfile.TemporaryDirectory(dir='/private/tmp') as tmp:
             root = Path(tmp)
