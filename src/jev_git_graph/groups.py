@@ -236,7 +236,11 @@ def build_groups(contributions: dict[str, Any], max_units: int = 24, max_edges: 
             omitted[signal_type] += len(ids) - len(allowed)
         omitted[signal_type] += max(0, possible - pairs_added)
 
-    known_source_edges = [edge for edge in contributions["edges"] if edge["source_id"] in eligible_ids]
+    known_source_edges = [
+        edge for edge in contributions["edges"]
+        if edge["source_id"] in eligible_ids
+        or (edge["destination_id"] in units and edge["destination_id"] in eligible_ids)
+    ]
     # Input edge IDs may be absent; synthesize a stable identifier while
     # preserving every supplied field verbatim.
     normalized_input_edges = []
@@ -283,36 +287,100 @@ def build_groups(contributions: dict[str, Any], max_units: int = 24, max_edges: 
         for offset in range(0, len(component), max_units):
             partitions.append(component[offset:offset + max_units])
     groups = []
-    for index, partition in enumerate(partitions):
-        part_set = set(partition)
-        internal_edges = [edge for edge in all_edges if edge["source_id"] in part_set and edge["destination_id"] in part_set]
-        boundary_edges = [edge for edge in all_edges if edge["source_id"] in part_set and edge["destination_id"] in units and edge["destination_id"] not in part_set]
-        # Include destination edges only where their source belongs to this group.
+    group_index_by_unit = {
+        unit_id: group_index
+        for group_index, partition in enumerate(partitions)
+        for unit_id in partition
+    }
+    for partition in partitions:
         destination_ids = sorted({dest_id for unit_id in partition for dest_id in units[unit_id].get("destination_ids", [])})
-        for edge in normalized_input_edges:
-            if edge["source_id"] in part_set and edge["destination_id"] in destinations and edge not in internal_edges:
-                internal_edges.append(edge)
-                if edge["destination_id"] not in destination_ids:
-                    destination_ids.append(edge["destination_id"])
-        internal_edges.sort(key=lambda edge: edge["id"])
-        boundary_edges.sort(key=lambda edge: edge["id"])
         limitations = sorted({limitation for unit_id in partition for limitation in units[unit_id].get("limitations", [])})
+        limitations.extend(contributions.get("limitations", []))
         if any(unit_id in metadata_unknown_ids for unit_id in partition):
             limitations.append("candidate_metadata_missing")
-        if boundary_edges:
-            limitations.append("partition_has_known_cross_group_edges")
         if omitted:
             limitations.append("candidate_discovery_truncated")
-        group_payload = {"unit_ids": partition, "destination_ids": destination_ids}
         groups.append({
-            "id": "grp-" + digest(group_payload)[:24],
+            "id": "grp-" + digest({"unit_ids": partition, "destination_ids": destination_ids})[:24],
             "unit_ids": partition,
             "destination_ids": destination_ids,
-            "edges": internal_edges,
-            "boundary_edges": boundary_edges,
+            "edges": [],
+            "boundary_edges": [],
             "limitations": sorted(set(limitations)),
-            "context_complete": not boundary_edges and not omitted,
+            "context_complete": not limitations,
         })
+
+    # Emit edges under a second, artifact-wide budget. A cross-partition edge
+    # costs two records because both endpoint groups need the boundary ID.
+    # Edges are admitted atomically so context is never complete on only one
+    # side of a known boundary.
+    output_edge_count = 0
+    output_budget_omitted: dict[str, int] = defaultdict(int)
+    excluded_neighbor_edges: list[dict[str, Any]] = []
+    for edge in all_edges:
+        source = edge["source_id"]
+        target = edge["destination_id"]
+        if target in units:
+            source_is_grouped = source in group_index_by_unit
+            target_is_grouped = target in group_index_by_unit
+            if source_is_grouped and not target_is_grouped:
+                source_group = group_index_by_unit[source]
+                excluded_neighbor = {
+                    **edge,
+                    "boundary_status": "excluded_neighbor",
+                    "excluded_target_branch": unit_branches[target],
+                    "exclusion_reasons": excluded_branches.get(unit_branches[target], ["excluded_reason_unspecified"]),
+                }
+                excluded_neighbor_edges.append(excluded_neighbor)
+                placements = [(source_group, "boundary_edges", excluded_neighbor)]
+            elif not source_is_grouped and target_is_grouped:
+                target_group = group_index_by_unit[target]
+                excluded_neighbor = {
+                    **edge,
+                    "boundary_status": "excluded_neighbor",
+                    "excluded_source_branch": unit_branches[source],
+                    "exclusion_reasons": excluded_branches.get(unit_branches[source], ["excluded_reason_unspecified"]),
+                }
+                excluded_neighbor_edges.append(excluded_neighbor)
+                placements = [(target_group, "boundary_edges", excluded_neighbor)]
+            elif not source_is_grouped and not target_is_grouped:
+                continue
+            else:
+                source_group = group_index_by_unit[source]
+                target_group = group_index_by_unit[target]
+                placements = ([(source_group, "edges", edge)] if source_group == target_group else [
+                    (source_group, "boundary_edges", edge), (target_group, "boundary_edges", edge)
+                ])
+        elif target in destinations:
+            if source not in group_index_by_unit:
+                continue
+            source_group = group_index_by_unit[source]
+            placements = [(source_group, "edges", edge)]
+            if target not in groups[source_group]["destination_ids"]:
+                groups[source_group]["destination_ids"].append(target)
+        else:
+            # Validation rejects this, but retain the fail-closed boundary.
+            raise JgError(f"edge refers to unknown destination id: {target}")
+        if output_edge_count + len(placements) > max_edges:
+            output_budget_omitted[edge.get("kind", "unknown")] += 1
+            continue
+        output_edge_count += len(placements)
+        for group_index, field, placed_edge in placements:
+            groups[group_index][field].append(placed_edge)
+
+    for group in groups:
+        group["destination_ids"] = sorted(set(group["destination_ids"]))
+        group["id"] = "grp-" + digest({"unit_ids": group["unit_ids"], "destination_ids": group["destination_ids"]})[:24]
+        group["edges"].sort(key=lambda edge: edge["id"])
+        group["boundary_edges"].sort(key=lambda edge: edge["id"])
+        if group["boundary_edges"]:
+            group["limitations"].append("partition_has_known_cross_group_edges")
+        if any(edge.get("boundary_status") == "excluded_neighbor" for edge in group["boundary_edges"]):
+            group["limitations"].append("excluded_neighbor_edges_present")
+        if output_budget_omitted:
+            group["limitations"].append("edge_output_budget_exhausted")
+        group["limitations"] = sorted(set(group["limitations"]))
+        group["context_complete"] = not group["limitations"]
 
     coverage = {
         "eligible_source_units": len(eligible_ids),
@@ -324,11 +392,15 @@ def build_groups(contributions: dict[str, Any], max_units: int = 24, max_edges: 
         "eligible_branches_without_units": sorted(name for name in eligible_branches if name not in set(unit_branches.values())),
         "candidate_edges_discovered": len(candidate_edges),
         "input_edges_considered": len(normalized_input_edges),
+        "excluded_neighbor_edge_ids": sorted(edge["id"] for edge in excluded_neighbor_edges),
+        "excluded_neighbor_edge_count": len(excluded_neighbor_edges),
         "omitted_candidates_by_type": dict(sorted(omitted.items())),
-        "unresolved_candidate_count": sum(omitted.values()),
+        "omitted_output_edges_by_type": dict(sorted(output_budget_omitted.items())),
+        "unresolved_candidate_count": sum(omitted.values()) + sum(output_budget_omitted.values()),
+        "output_edges_emitted": output_edge_count,
         "max_units": max_units,
         "max_edges": max_edges,
-        "truncated": bool(omitted) or bool(globally_omitted_edges),
+        "truncated": bool(omitted) or bool(output_budget_omitted),
     }
     result = {
         "kind": "contribution-groups",
@@ -350,5 +422,7 @@ def write_groups(contributions_path: str | Path, out: str | Path, max_units: int
     output_dir = Path(out).expanduser().resolve()
     output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     target = output_dir / "groups.json"
+    if target.exists():
+        raise JgError(f"groups artifact already exists: {target}")
     write_json(target, result)
     return target
