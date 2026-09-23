@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import builtins
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import hashlib
 import json
@@ -17,8 +18,8 @@ from .safety import digest, write_json
 from .analysis_cache import BlobAnalysisCache, checkpoint_key, load_checkpoint, save_checkpoint
 
 
-CONTRIBUTIONS_SCHEMA_VERSION = 1
-EXTRACTOR_VERSION = "python-ast-v1"
+CONTRIBUTIONS_SCHEMA_VERSION = 2
+EXTRACTOR_VERSION = "python-ast-references-v2"
 _OID = re.compile(r"\A[0-9a-f]{40,64}\Z")
 _PROCESS_CONTEXT: tuple[Path, str, dict[str, list[str]], BlobAnalysisCache] | None = None
 
@@ -82,6 +83,30 @@ def _definitions(text: str) -> list[dict[str, Any]]:
 
 def _definitions_from_tree(tree: ast.Module) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
+    module_imports = []
+    module_bindings: set[str] = set()
+    for statement in tree.body:
+        if isinstance(statement, ast.Import):
+            for item in statement.names:
+                binding = item.asname or item.name.split(".", 1)[0]
+                module_imports.append({"kind": "module", "module": item.name,
+                                       "symbol": None,
+                                       "binding": binding})
+                module_bindings.add(binding)
+        elif isinstance(statement, ast.ImportFrom):
+            for item in statement.names:
+                binding = item.asname or item.name
+                module_imports.append({"kind": "from", "module": statement.module or "",
+                                       "level": statement.level, "symbol": item.name,
+                                       "binding": binding})
+                module_bindings.add(binding)
+        elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            module_bindings.add(statement.name)
+        elif isinstance(statement, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+            targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+            for target in targets:
+                module_bindings.update(child.id for child in ast.walk(target)
+                                       if isinstance(child, ast.Name))
 
     def visit(body: Iterable[ast.stmt], parents: tuple[str, ...] = ()) -> None:
         for node in body:
@@ -90,15 +115,120 @@ def _definitions_from_tree(tree: ast.Module) -> list[dict[str, Any]]:
             name = ".".join((*parents, node.name))
             decorators = getattr(node, "decorator_list", ())
             start = min([node.lineno, *(d.lineno for d in decorators)])
+            references, dynamic = _static_references(node)
             result.append({
                 "name": name,
                 "range": {"start_line": start, "end_line": node.end_lineno or node.lineno},
                 "ast_fingerprint": _fingerprint(node),
+                "static_references": references,
+                "dynamic_reference_observations": dynamic,
+                "module_imports": module_imports,
+                "module_bindings": sorted(module_bindings),
             })
             visit(node.body, (*parents, node.name))
 
     visit(tree.body)
     return result
+
+
+def _static_references(node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) -> tuple[list[str], list[str]]:
+    """Extract bounded syntactic references without claiming full resolution.
+
+    Only same-module names can later become dependency edges. Attribute and
+    computed calls remain explicit unresolved observations; this deliberately
+    avoids treating absent edges as proof that a contribution is dependency-free.
+    """
+    bound: set[str] = set()
+    references: set[str] = set()
+    dynamic: set[str] = set()
+
+    class Visitor(ast.NodeVisitor):
+        def visit_FunctionDef(self, child):
+            if child is node:
+                for item in child.body:
+                    self.visit(item)
+            else:
+                bound.add(child.name)
+                dynamic.add("nested_scope_unanalyzed")
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_ClassDef(self, child):
+            if child is node:
+                for item in child.body:
+                    self.visit(item)
+            else:
+                bound.add(child.name)
+                dynamic.add("nested_scope_unanalyzed")
+
+        def visit_Lambda(self, child):
+            dynamic.add("nested_scope_unanalyzed")
+
+        def visit_ListComp(self, child):
+            dynamic.add("comprehension_scope_unanalyzed")
+
+        visit_SetComp = visit_ListComp
+        visit_DictComp = visit_ListComp
+        visit_GeneratorExp = visit_ListComp
+
+        def visit_arg(self, child):
+            bound.add(child.arg)
+
+        def visit_Name(self, child):
+            if isinstance(child.ctx, ast.Load):
+                references.add(child.id)
+            elif isinstance(child.ctx, (ast.Store, ast.Del)):
+                bound.add(child.id)
+
+        def visit_Attribute(self, child):
+            dynamic.add("attribute_reference")
+            self.generic_visit(child)
+
+        def visit_Call(self, child):
+            func = child.func
+            if isinstance(func, ast.Attribute):
+                dynamic.add("attribute_call_unresolved")
+            elif isinstance(func, (ast.Subscript, ast.Call, ast.Lambda)):
+                dynamic.add("computed_callable")
+            elif isinstance(func, ast.Name) and func.id in {
+                "eval", "exec", "globals", "locals", "vars", "getattr",
+                "setattr", "delattr", "__import__", "super",
+            }:
+                dynamic.add(f"dynamic_builtin_call:{func.id}")
+            self.generic_visit(child)
+
+        def visit_Import(self, child):
+            dynamic.add("function_local_import")
+
+        def visit_ImportFrom(self, child):
+            dynamic.add("function_local_import")
+
+    visitor = Visitor()
+    expressions = list(node.decorator_list)
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        expressions.extend(node.args.defaults)
+        expressions.extend(item for item in node.args.kw_defaults if item is not None)
+        expressions.extend(item.annotation for item in
+                           node.args.posonlyargs + node.args.args + node.args.kwonlyargs
+                           if item.annotation is not None)
+        expressions.append(node.returns)
+    else:
+        expressions.extend(node.bases)
+        expressions.extend(keyword.value for keyword in node.keywords)
+    for expression in expressions:
+        if expression is not None:
+            visitor.visit(expression)
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        for argument in node.args.posonlyargs + node.args.args + node.args.kwonlyargs:
+            bound.add(argument.arg)
+        if node.args.vararg:
+            bound.add(node.args.vararg.arg)
+        if node.args.kwarg:
+            bound.add(node.args.kwarg.arg)
+    for item in node.body:
+        visitor.visit(item)
+    references.difference_update(bound)
+    return sorted(references), sorted(dynamic)
 
 
 def _identity(prefix: str, value: dict[str, Any]) -> str:
@@ -237,6 +367,12 @@ def _analyze_branch(repo: Path, branch: dict[str, Any], main_tip: str,
                                     "main_blob": main_entry["blob"] if main_entry and main_entry["kind"] == "blob" else None,
                                     "mode": source_entry["mode"], "kind": "python_definition", "name": definition["name"],
                                     "range": definition["range"], "ast_fingerprint": definition["ast_fingerprint"],
+                                    "static_references": definition.get("static_references", []),
+                                    "dynamic_reference_observations": definition.get("dynamic_reference_observations", []),
+                                    "module_imports": definition.get("module_imports", []),
+                                    "module_bindings": definition.get("module_bindings", []),
+                                    "dependency_context_status": "unknown",
+                                    "dependency_context_limitations": ["module_imports_and_dynamic_resolution_not_exhaustive"],
                                     "destination_ids": list(candidates), "limitations": unit_limitations,
                                     "source": {"branch": name, "path": path, "kind": "python_definition",
                                                "name": definition["name"], "blob": source_entry["blob"],
@@ -262,6 +398,9 @@ def _analyze_branch(repo: Path, branch: dict[str, Any], main_tip: str,
                             "main_blob": main_entry["blob"] if main_entry and main_entry["kind"] == "blob" else None,
                             "mode": source_entry["mode"] if source_entry else None, "kind": "file", "name": None,
                             "range": None, "destination_ids": [], "limitations": [fallback_reason],
+                            "static_references": [], "dynamic_reference_observations": [],
+                            "dependency_context_status": "unknown",
+                            "dependency_context_limitations": ["file_level_dependencies_not_extracted"],
                             "source": {"branch": name, "path": path, "kind": "file", "name": None,
                                        "blob": source_entry["blob"] if source_entry else None,
                                        "ast_fingerprint": None}})
@@ -374,8 +513,156 @@ def build_contributions(snapshot: dict, object_repo: Path, *, workers: int | Non
         units.extend(result["units"])
         edges.extend(result["edges"])
         limitations.extend(result["limitations"])
+    # Resolve only direct same-module name references to a unique immutable
+    # source/destination definition. These are syntactic dependency candidates,
+    # not proof of behavioral necessity; every unit retains UNKNOWN dependency
+    # completeness because imports, attributes, reflection and dynamic calls
+    # are not exhaustively modeled by this extractor.
+    source_symbols: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    destination_symbols: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for unit in units:
+        if unit.get("kind") != "python_definition" or not isinstance(unit.get("name"), str):
+            continue
+        leaf = unit["name"].rsplit(".", 1)[-1]
+        source_symbols.setdefault((unit["branch"], unit["path"], leaf), []).append(unit)
+    for unit in destinations:
+        if unit.get("kind") == "python_definition" and isinstance(unit.get("name"), str):
+            leaf = unit["name"].rsplit(".", 1)[-1]
+            destination_symbols.setdefault((unit["path"], leaf), []).append(unit)
+
+    def imported_module_paths(unit: dict[str, Any], record: dict[str, Any]) -> list[str]:
+        module = record.get("module", "")
+        if not isinstance(module, str):
+            return []
+        module_parts = [part for part in module.split(".") if part]
+        path_parts = Path(unit["path"]).parts[:-1]
+        level = record.get("level", 0)
+        if isinstance(level, int) and level > 0:
+            prefix = path_parts[:max(0, len(path_parts) - level + 1)]
+            stem = "/".join((*prefix, *module_parts))
+            candidates = [f"{stem}.py", f"{stem}/__init__.py"]
+        else:
+            stem = "/".join(module_parts)
+            candidates = [f"{stem}.py", f"{stem}/__init__.py",
+                          f"src/{stem}.py", f"src/{stem}/__init__.py"]
+        return candidates
+
+    def reference_targets(unit: dict[str, Any], reference: str) -> list[dict[str, Any]]:
+        imports = [item for item in unit.get("module_imports", [])
+                   if item.get("binding") == reference]
+        if imports:
+            targets = []
+            unresolved_import = False
+            for imported in imports:
+                if imported.get("kind") != "from" or imported.get("symbol") == "*":
+                    unresolved_import = True
+                    continue
+                for path in imported_module_paths(unit, imported):
+                    branch = unit.get("branch")
+                    if branch:
+                        targets.extend(source_symbols.get((branch, path, imported["symbol"]), []))
+                    if not targets:
+                        targets.extend(destination_symbols.get((path, imported["symbol"]), []))
+            if targets:
+                unique = {item["id"]: item for item in targets}
+                return list(unique.values())
+            if unresolved_import or imports:
+                return []
+        branch = unit.get("branch")
+        candidates = ([candidate for candidate in source_symbols.get(
+            (branch, unit["path"], reference), []) if candidate["id"] != unit["id"]]
+            if branch else [])
+        if len(candidates) != 1:
+            candidates = destination_symbols.get((unit["path"], reference), []) if not candidates else candidates
+        return candidates
+
+    resolved_dependencies = 0
+    unresolved_reference_observations = 0
+    def analyze_static_dependencies(unit: dict[str, Any], *, emit_edges: bool) -> tuple[str, list[str], int]:
+        edge_count_before = len(edges)
+        unresolved = []
+        resolved_reference_count = 0
+        for reference in unit.get("static_references", []):
+            if reference == unit.get("name", "").rsplit(".", 1)[-1]:
+                resolved_reference_count += 1
+                continue
+            candidates = reference_targets(unit, reference)
+            if len(candidates) == 1:
+                target = candidates[0]
+                if emit_edges and target["id"] != unit["id"]:
+                    edges.append({"source_id": unit["id"], "destination_id": target["id"],
+                                  "type": "dependency", "provenance": "static_ast_symbol_reference",
+                                  "reference_name": reference})
+                resolved_reference_count += 1
+            else:
+                imported_binding = any(item.get("binding") == reference
+                                       for item in unit.get("module_imports", []))
+                if reference in dir(builtins) and not imported_binding and reference not in unit.get("module_bindings", []):
+                    resolved_reference_count += 1
+                else:
+                    unresolved.append(reference)
+        dynamic = unit.get("dynamic_reference_observations", [])
+        dependency_status = "complete" if not unresolved and not dynamic else "unknown"
+        unit["dependency_observations"] = {
+            "resolved_same_module_reference_count": resolved_reference_count,
+            "unresolved_reference_count": len(unresolved) + len(dynamic),
+            "unresolved_reference_samples": unresolved[:12],
+            "dynamic_reference_observations": dynamic,
+            "status": dependency_status,
+        }
+        if unresolved or dynamic:
+            limitations = ["unresolved_or_dynamic_references"]
+        else:
+            limitations = []
+        return dependency_status, limitations, len(edges) - edge_count_before
+
+    for unit in destinations:
+        if unit.get("kind") == "python_definition":
+            status, limitations_for_unit, _resolved = analyze_static_dependencies(unit, emit_edges=False)
+            unit["dependency_context_status"] = status
+            unit["dependency_context_limitations"] = limitations_for_unit
+    destination_by_id = {unit["id"]: unit for unit in destinations}
+    for unit in units:
+        if unit.get("kind") != "python_definition":
+            continue
+        source_status, limitations_for_unit, resolved_count = analyze_static_dependencies(unit, emit_edges=True)
+        resolved_dependencies += resolved_count
+        candidates = [destination_by_id[item] for item in unit.get("destination_ids", [])
+                      if item in destination_by_id]
+        limitations_for_unit = list(limitations_for_unit)
+        if not candidates:
+            limitations_for_unit.append("destination_dependency_context_unavailable")
+        elif any(item.get("dependency_context_status") != "complete" for item in candidates):
+            limitations_for_unit.append("destination_dependency_context_incomplete")
+        dependency_status = ("complete" if source_status == "complete" and candidates
+                             and not any(item in limitations_for_unit
+                                         for item in ("destination_dependency_context_unavailable",
+                                                      "destination_dependency_context_incomplete"))
+                             else "unknown")
+        unit["source_dependency_context_status"] = source_status
+        unit["dependency_context_status"] = dependency_status
+        unit["dependency_context_limitations"] = sorted(set(limitations_for_unit))
+        unresolved_reference_observations += unit["dependency_observations"]["unresolved_reference_count"]
+    unresolved_destination_reference_observations = sum(
+        unit.get("dependency_observations", {}).get("unresolved_reference_count", 0)
+        for unit in destinations if unit.get("kind") == "python_definition")
+    dependency_summary = {
+        "kind": "static-python-reference-candidates",
+        "schema_version": 1,
+        "status": "partial_unknown",
+        "resolved_static_candidate_edges": resolved_dependencies,
+        "source_unresolved_reference_observations": unresolved_reference_observations,
+        "destination_unresolved_reference_observations": unresolved_destination_reference_observations,
+        "source_context_status_counts": dict(Counter(unit.get("dependency_context_status", "unknown")
+                                                       for unit in units)),
+        "destination_context_status_counts": dict(Counter(unit.get("dependency_context_status", "unknown")
+                                                            for unit in destinations)),
+        "limitations": ["cross_module_import_resolution_partial",
+                        "attribute_and_reflection_resolution_not_exhaustive",
+                        "local_name_binding_not_proven"],
+    }
     limitations = sorted(set(limitations))
-    result = {"kind": "contributions", "schema_version": CONTRIBUTIONS_SCHEMA_VERSION, "snapshot_digest": snapshot.get("snapshot_digest"), "repository_id": snapshot.get("repository_id"), "main": main, "branches": output_branches, "units": units, "destination_units": destinations, "paths": paths, "edges": edges, "limitations": limitations}
+    result = {"kind": "contributions", "schema_version": CONTRIBUTIONS_SCHEMA_VERSION, "snapshot_digest": snapshot.get("snapshot_digest"), "repository_id": snapshot.get("repository_id"), "main": main, "branches": output_branches, "units": units, "destination_units": destinations, "paths": paths, "edges": edges, "dependency_extraction": dependency_summary, "limitations": limitations}
     result["contributions_digest"] = digest(result)
     return result
 

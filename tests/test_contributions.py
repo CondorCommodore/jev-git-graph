@@ -113,8 +113,83 @@ def test_ast_ambiguity_keeps_every_candidate(tmp_path: Path) -> None:
     result = build_contributions(snapshot, repo)
     unit = next(unit for unit in result["units"] if unit["kind"] == "python_definition")
     assert len(unit["destination_ids"]) == 2
+    assert unit["source_dependency_context_status"] == "complete"
+    assert unit["dependency_context_status"] == "complete"
     assert result["branches"][0]["eligible"] is True
     assert result["branches"][0]["exclusion_reasons"] == []
+
+
+def test_static_same_module_references_are_explicit_and_incomplete_references_abstain(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    (repo / "src.py").write_text(
+        "def len(value):\n    return value\n\ndef run(value):\n    return value\n",
+        encoding="utf-8")
+    base = commit(repo, "base")
+    git(repo, "checkout", "-q", "-b", "source")
+    (repo / "src.py").write_text(
+        "def len(value):\n    return value\n\ndef run(value):\n    return len(value)\n",
+        encoding="utf-8")
+    source_tip = commit(repo, "source")
+    snapshot = {"kind": "git-snapshot", "schema_version": 1, "snapshot_digest": "s",
+                "repository_id": "r", "main": {"name": "main", "tip": base},
+                "branches": [{"name": "source", "tip": source_tip, "merge_base": base,
+                              "eligible": True, "exclusion_reasons": []}]}
+    result = build_contributions(snapshot, repo)
+    caller = next(unit for unit in result["units"] if unit.get("name") == "run")
+    helper = next(unit for unit in result["destination_units"] if unit.get("name") == "len")
+    dependency = next(edge for edge in result["edges"] if edge.get("type") == "dependency")
+    assert dependency["source_id"] == caller["id"]
+    assert dependency["destination_id"] == helper["id"]
+    assert dependency["provenance"] == "static_ast_symbol_reference"
+    assert caller["source_dependency_context_status"] == "complete"
+    assert caller["dependency_context_status"] == "unknown"
+    assert "destination_dependency_context_unavailable" in caller["dependency_context_limitations"]
+    assert result["dependency_extraction"]["status"] == "partial_unknown"
+
+
+def test_attribute_calls_keep_dependency_context_unknown(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    (repo / "src.py").write_text("def run(value):\n    return value\n", encoding="utf-8")
+    base = commit(repo, "base")
+    git(repo, "checkout", "-q", "-b", "source")
+    (repo / "src.py").write_text("def run(value):\n    return value.process()\n", encoding="utf-8")
+    source_tip = commit(repo, "source")
+    snapshot = {"kind": "git-snapshot", "schema_version": 1, "snapshot_digest": "s",
+                "repository_id": "r", "main": {"name": "main", "tip": base},
+                "branches": [{"name": "source", "tip": source_tip, "merge_base": base,
+                              "eligible": True, "exclusion_reasons": []}]}
+    result = build_contributions(snapshot, repo)
+    unit = next(unit for unit in result["units"] if unit.get("name") == "run")
+    assert unit["dependency_context_status"] == "unknown"
+    assert "attribute_call_unresolved" in unit["dynamic_reference_observations"]
+
+
+def test_nested_dynamic_references_cannot_be_shadowed_by_nested_bindings(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    (repo / "src.py").write_text("def run():\n    return 1\n", encoding="utf-8")
+    base = commit(repo, "base")
+    git(repo, "checkout", "-q", "-b", "source")
+    (repo / "src.py").write_text(
+        "def run():\n"
+        "    def inner(module, name):\n"
+        "        return getattr(module, name)\n"
+        "    return inner(object(), 'work')\n",
+        encoding="utf-8")
+    source_tip = commit(repo, "source")
+    snapshot = {"kind": "git-snapshot", "schema_version": 1, "snapshot_digest": "s",
+                "repository_id": "r", "main": {"name": "main", "tip": base},
+                "branches": [{"name": "source", "tip": source_tip, "merge_base": base,
+                              "eligible": True, "exclusion_reasons": []}]}
+    result = build_contributions(snapshot, repo)
+    unit = next(unit for unit in result["units"] if unit.get("name") == "run")
+    assert unit["dependency_context_status"] == "unknown"
+    assert "nested_scope_unanalyzed" in unit["dynamic_reference_observations"]
 
 
 def test_removal_and_comment_only_change_always_have_file_units(tmp_path: Path) -> None:

@@ -161,7 +161,7 @@ class TestGroups(unittest.TestCase):
             "type": "structural_match", "provenance": "ast_fingerprint",
         }]
         result = build_groups(contribution_artifact(branches, units, destinations, edges), max_edges=1)
-        self.assertEqual(result["schema_version"], 2)
+        self.assertEqual(result["schema_version"], 3)
         self.assertEqual([edge["kind"] for edge in result["groups"][0]["edges"]], ["structural_match"])
         self.assertEqual(result["groups"][0]["omitted_edges_by_type"], {"same_branch": 1})
 

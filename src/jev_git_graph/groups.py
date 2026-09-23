@@ -14,8 +14,7 @@ from .errors import JgError
 from .safety import digest, read_json, write_json
 
 
-_CONTRIBUTIONS_SCHEMA_VERSION = 1
-_GROUPS_SCHEMA_VERSION = 2
+_GROUPS_SCHEMA_VERSION = 3
 _CONTEXT_GAP_LIMITATIONS = {
     "candidate_metadata_missing",
     "candidate_discovery_truncated",
@@ -56,7 +55,7 @@ def _unit_branch(unit: dict[str, Any]) -> str:
 def _validate(contributions: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
     if not isinstance(contributions, dict):
         raise JgError("contributions artifact must be an object")
-    if contributions.get("kind") != "contributions" or contributions.get("schema_version") != _CONTRIBUTIONS_SCHEMA_VERSION:
+    if contributions.get("kind") != "contributions" or contributions.get("schema_version") not in {1, 2}:
         raise JgError("contributions artifact has an unsupported kind or schema")
     repository_id = _require_text(contributions.get("repository_id"), "repository_id")
     _digest_text(contributions.get("snapshot_digest"), "snapshot_digest")
@@ -255,6 +254,7 @@ def build_groups(contributions: dict[str, Any], max_units: int = 24, max_edges: 
 
     edge_priority = {
         "ancestry": 0,
+        "dependency": 1,
         "dependency_candidate": 1,
         "structural_match": 2,
         "ast_fingerprint": 3,

@@ -29,7 +29,7 @@ def build_study(contributions: dict, groups: dict, count: int = 32,
             by_unit[uid] = group
     path_exact = {(p["branch"], p["path"]): p["exact"] for p in contributions["paths"]}
     excluded = set(excluded_branches or [])
-    buckets: dict[str, deque] = defaultdict(deque)
+    buckets: dict[tuple[str, str], deque] = defaultdict(deque)
     for uid, unit in sorted(units.items()):
         if unit["branch"] in excluded or uid not in by_unit:
             continue
@@ -44,40 +44,69 @@ def build_study(contributions: dict, groups: dict, count: int = 32,
             stratum = "structural_candidate_distinct_path"
         else:
             stratum = "no_structural_destination"
-        buckets[stratum].append(unit)
+        # Group incompleteness records cross-partition similarity signals and
+        # is intentionally wider than the context needed for one contribution.
+        # A contribution has scoped context when its pinned source unit exists
+        # and every known destination candidate resolves to a destination row.
+        # Units with no destination candidate remain in an explicit uncertainty
+        # stratum for review; they are never presented as globally complete.
+        candidate_ids = unit.get("destination_ids", [])
+        context_stratum = ("comparison_candidates_available"
+                           if candidate_ids and all(candidate_id in destinations for candidate_id in candidate_ids)
+                           else "uncertainty_no_destination_candidate")
+        buckets[(context_stratum, stratum)].append(unit)
     # Fixed round-robin across evidence strata, capped by task-family labels.
     # Signals select review cases; they never supply reference answers.
     family_counts, selected, seen_behaviors = Counter(), [], set()
-    while len(selected) < count:
-        progressed = False
-        for stratum in sorted(buckets):
-            while buckets[stratum]:
-                unit = buckets[stratum].popleft()
-                family = _family(unit["branch"]) or unit["branch"]
-                behavior = (unit.get("source_blob"), unit.get("ast_fingerprint"), unit.get("name"), unit["path"])
-                if family_counts[family] >= max_per_family or behavior in seen_behaviors:
-                    continue
-                group = by_unit[unit["id"]]
-                selected.append({"contribution_id": unit["id"], "family": family, "selection_stratum": stratum,
-                                 "source": {k: unit.get(k) for k in ("branch", "source_tip", "path", "source_blob", "mode", "kind", "name", "range")},
-                                 "destination_candidates": [destinations[d] for d in unit.get("destination_ids", [])],
-                                 "group_id": group["id"], "neighbor_ids": [u for u in group["unit_ids"] if u != unit["id"]],
-                                 "boundary_edges": group.get("boundary_edges", []),
-                                 "limitations": group.get("limitations", []), "reference_label_status": "UNREVIEWED"})
-                family_counts[family] += 1
-                seen_behaviors.add(behavior)
-                progressed = True
+    def take(context_stratum: str, target: int) -> None:
+        picked = 0
+        strata = [key for key in sorted(buckets) if key[0] == context_stratum]
+        while picked < target and len(selected) < count:
+            progressed = False
+            for key in strata:
+                while buckets[key]:
+                    unit = buckets[key].popleft()
+                    family = _family(unit["branch"]) or unit["branch"]
+                    behavior = (unit.get("source_blob"), unit.get("ast_fingerprint"), unit.get("name"), unit["path"])
+                    if family_counts[family] >= max_per_family or behavior in seen_behaviors:
+                        continue
+                    group = by_unit[unit["id"]]
+                    selected.append({"contribution_id": unit["id"], "family": family,
+                                     "selection_stratum": key[1], "context_stratum": context_stratum,
+                                     "source": {k: unit.get(k) for k in ("branch", "source_tip", "path", "source_blob", "mode", "kind", "name", "range")},
+                                     "destination_candidates": [destinations[d] for d in unit.get("destination_ids", [])],
+                                     "group_id": group["id"], "neighbor_ids": [u for u in group["unit_ids"] if u != unit["id"]],
+                                     "group_context_complete": group.get("context_complete") is True,
+                                     "dependency_context_status": unit.get("dependency_context_status", "unknown"),
+                                     "boundary_edges": group.get("boundary_edges", []),
+                                     "limitations": group.get("limitations", []), "reference_label_status": "UNREVIEWED"})
+                    family_counts[family] += 1
+                    seen_behaviors.add(behavior)
+                    picked += 1
+                    progressed = True
+                    break
+                if picked >= target or len(selected) >= count:
+                    break
+            if not progressed:
                 break
-            if len(selected) == count:
-                break
-        if not progressed:
-            break
+
+    complete_target = min(count - count // 4, sum(len(v) for (context, _), v in buckets.items()
+                                                   if context == "comparison_candidates_available"))
+    take("comparison_candidates_available", complete_target)
+    take("uncertainty_no_destination_candidate", count - len(selected))
+    # If either stratum had too few diverse cases, fill from the other while
+    # keeping every selected case's context status explicit.
+    take("comparison_candidates_available", count - len(selected))
+    take("uncertainty_no_destination_candidate", count - len(selected))
     if len(selected) < count:
         raise JgError(f"only {len(selected)} eligible diverse cases; do not silently shrink the study")
-    result = {"kind": "presence-study", "schema_version": 1,
+    result = {"kind": "presence-study", "schema_version": 2,
               "repository_id": contributions["repository_id"], "snapshot_digest": contributions["snapshot_digest"],
               "contributions_digest": contributions["contributions_digest"], "groups_digest": groups["groups_digest"],
               "project_goals": project_goals, "case_count": len(selected), "family_counts": dict(family_counts),
+              "context_stratum_counts": dict(Counter(case["context_stratum"] for case in selected)),
+              "context_scope": "destination candidate availability only; this is not dependency completeness or evidence that behavior is present",
+              "dependency_context_status_counts": dict(Counter(case["dependency_context_status"] for case in selected)),
               "excluded_development_branches": sorted(excluded), "cases": selected,
               "selection_uses_model_answers": False, "provider_dispatch_approved": False,
               "expansion_gate": "UNMEASURED", "split_policy": "Keep entire families together; label before viewing model answers"}
