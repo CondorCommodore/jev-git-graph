@@ -56,7 +56,7 @@ def parser() -> argparse.ArgumentParser:
     code_relate = commands.add_parser("code-relate", help="transient opt-in Python excerpt preview or approved Jev request")
     code_relate.add_argument("--repo", required=True)
     code_relate.add_argument("--candidates", required=True)
-    code_relate.add_argument("--selection", required=True, help="metadata-only JSON mapping candidate IDs to pinned refs and ranges")
+    code_relate.add_argument("--selection", required=True, help="JSON mapping candidate IDs to pinned tips, optional refs, and ranges")
     code_relate.add_argument("--use-jev", action="store_true")
     code_relate.add_argument("--approved-payload-sha256")
     code_relate.add_argument("--approved-batch-sha256")
@@ -158,20 +158,31 @@ def run(args: argparse.Namespace) -> str:
             raise JgError("candidates artifact belongs to a different local repository")
         selection = read_json(args.selection)
         if selection.get("kind") != "jev-code-selection" or not isinstance(selection.get("candidates"), dict):
-            raise JgError("code selection must map candidate IDs to pinned refs and ranges")
+            raise JgError("code selection must map candidate IDs to pinned tips and ranges")
         records = {}
         for candidate in candidates.get("candidates", []):
             candidate_id = candidate["id"]
             chosen = selection["candidates"].get(candidate_id)
-            if not isinstance(chosen, dict) or not chosen.get("source_ref") or not chosen.get("main_ref"):
-                raise JgError(f"code selection lacks pinned refs for {candidate_id}")
+            if not isinstance(chosen, dict):
+                raise JgError(f"code selection is invalid for {candidate_id}")
+            snapshot_mode = chosen.get("snapshot_mode")
+            source_ref = chosen.get("source_ref")
+            main_ref = chosen.get("main_ref")
+            if snapshot_mode == "pinned_commits":
+                if source_ref is not None or main_ref is not None:
+                    raise JgError(f"pinned snapshot selection must omit live refs for {candidate_id}")
+            elif snapshot_mode is None:
+                if not source_ref or not main_ref:
+                    raise JgError(f"code selection lacks pinned refs for {candidate_id}")
+            else:
+                raise JgError(f"unknown code snapshot mode for {candidate_id}")
             endpoints = candidate.get("endpoints", {})
             endpoint_tips = {item.get("tip") for item in endpoints.values() if isinstance(item, dict)}
             if endpoint_tips != {chosen.get("source_tip"), chosen.get("main_tip")} or len(endpoint_tips) != 2:
                 raise JgError(f"code selection tips do not match candidate endpoints for {candidate_id}")
             records[candidate_id] = build_code_evidence(
                 args.repo, chosen["source_tip"], chosen["main_tip"], chosen["ranges"],
-                source_ref=chosen["source_ref"], main_ref=chosen["main_ref"])
+                source_ref=source_ref, main_ref=main_ref)
         preview = build_transient_preview(candidates, records)
         approval = approve_code_batch(records.values(), preview["requests"])
         if not args.use_jev:

@@ -57,11 +57,19 @@ class CodeEvidenceTests(unittest.TestCase):
         self.assertRegex(excerpt["source_blob"], r"^[0-9a-f]{40}$")
         self.assertEqual(code_evidence_digest(record), record["evidence_sha256"])
         self.assertEqual(record, revalidate_code_evidence(root, record, record["evidence_sha256"]))
+        pinned_record = build_code_evidence(
+            root, source_tip, main_tip,
+            [{"path": "app.py", "start_line": 1, "end_line": 2}],
+        )
 
         git(root, "switch", "-q", "main")
         git(root, "branch", "-f", "source", main_tip)
         with self.assertRaisesRegex(JgError, "ref moved"):
             revalidate_code_evidence(root, record)
+        self.assertEqual(
+            pinned_record,
+            revalidate_code_evidence(root, pinned_record, pinned_record["evidence_sha256"]),
+        )
 
         changed = json.loads(json.dumps(record))
         changed["excerpts"][0]["text"] = "def answer():\n    return 99\n"
