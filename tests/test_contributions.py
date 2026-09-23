@@ -9,9 +9,9 @@ import unittest
 from unittest.mock import patch
 from pathlib import Path
 
-from jev_git_graph.contributions import _git_env, build_contributions as _build_contributions, write_contributions
+from jev_git_graph.contributions import build_contributions as _build_contributions, write_contributions
 from jev_git_graph.errors import JgError
-from jev_git_graph.snapshot import export_pinned_repository
+from jev_git_graph.snapshot import export_pinned_repository, _git_env
 
 
 def build_contributions(snapshot, repo):

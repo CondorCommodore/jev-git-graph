@@ -7,7 +7,6 @@ import hashlib
 import json
 import os
 import re
-import subprocess
 from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
@@ -22,34 +21,10 @@ MAX_DESTINATION_BLOBS = 5000
 _OID = re.compile(r"\A[0-9a-f]{40,64}\Z")
 
 
-def _git(repo: Path, *args: str, input_bytes: bytes | None = None) -> bytes:
-    try:
-        from .snapshot import run_snapshot_git
-    except ImportError:
-        run_snapshot_git = None
-    if run_snapshot_git is not None:
-        if input_bytes is not None:
-            raise JgError("input is not supported for pinned snapshot object reads")
-        return run_snapshot_git(repo, *args)
-    result = subprocess.run(
-        ("git", "--no-replace-objects", "-c", "core.useReplaceRefs=false", "-C", str(repo), *args),
-        input=input_bytes, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
-        env=_git_env(),
-    )
-    if result.returncode:
-        raise JgError("unable to inspect pinned contribution objects")
-    return result.stdout
+def _git(repo: Path, *args: str) -> bytes:
+    from .snapshot import run_snapshot_git
 
-
-def _git_env() -> dict[str, str]:
-    """Keep ambient Git directory/config redirection out of object reads."""
-    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-    env["GIT_CONFIG_NOSYSTEM"] = "1"
-    env["GIT_CONFIG_GLOBAL"] = os.devnull
-    env["GIT_NO_REPLACE_OBJECTS"] = "1"
-    env["GIT_NO_LAZY_FETCH"] = "1"
-    env["LC_ALL"] = "C"
-    return env
+    return run_snapshot_git(repo, *args)
 
 
 def _oid(value: Any) -> str:
