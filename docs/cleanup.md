@@ -7,17 +7,19 @@ ID, or human disposition does not make a branch removable.
 
 ## Current integration status
 
-The production creator gate remains closed. The package now defines a strict
-creator registry and concrete before-operation lease interface, but the known
-Home Lab entry points do not yet register and hold it. The required integration
-files are `scripts/bootstrap-worktree.sh` (also the L1 path through
+The production creator gate remains closed. The package now has a concrete
+lease capability resolver and `jg cleanup execute` passes that adapter and a
+durable journal to the executor. The known Home Lab checkout has not yet
+demonstrated all required creator hooks, so production execution fails closed.
+The required integration files are `scripts/bootstrap-worktree.sh` (also the L1 path through
 `scripts/l1_drain/workspace.py`), `scripts/new-worktree.sh`,
 `scripts/overnight-codex-backlog-round.sh`, `scripts/ahc_app/coord_wake.py`,
 `scripts/process-safe-prs.sh`, `scripts/pr_gate/guard_execution.py`,
 `scripts/merge_train_parts/prescreen.py`, and
-`scripts/train_construction_driver.py`. The `jg cleanup execute` CLI also does
-not yet pass a journal path or a complete registered adapter. Until the hooks
-and CLI wiring are reviewed, execution remains plan-only.
+`scripts/train_construction_driver.py`. A disposable installed-wheel fixture
+has exercised execute and interrupted-action reconciliation, including
+post-delete capability drift; that fixture does not establish production
+creator participation or authorize Home Lab deletion.
 
 ## Plan
 
@@ -86,11 +88,11 @@ if it reappears, the executor records uncertainty and never overwrites it.
 Any future recovery path must use compare-and-create against an absent ref.
 The executor never performs remote operations.
 
-The CLI exposes `jg cleanup plan`, `jg cleanup approve`, and `jg cleanup execute`.
-It does not provide a worktree-creator lease adapter, so its execute command
-stops without changing refs. The library also hard-gates deletion until known
-worktree creators participate in the lease contract; a caller-supplied callback
-alone cannot enable it. Operators must review the plan, preserve any
-required work, and approve its exact digest. A future integrated coordinator
-must supply the cooperative lease contract before local branch deletion can
-run.
+The CLI exposes `jg cleanup plan`, `jg cleanup approve`, `jg cleanup execute`,
+and interrupted-action reconciliation. Execute resolves the production
+adapter from independently verified creator participation records, or accepts
+an explicit disposable-fixture inventory for a disposable repository. Missing
+or stale production participant proof leaves the plan-only gate in place. The
+library hard-gates deletion until known worktree creators participate in the
+lease contract; a caller-supplied callback alone cannot enable it. Operators
+must review the plan, preserve any required work, and approve its exact digest.
