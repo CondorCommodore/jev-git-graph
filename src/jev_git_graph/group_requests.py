@@ -161,6 +161,8 @@ def build_group_requests(
     model_settings: Mapping[str, Any] | None = None,
     estimated_input_tokens: int | None = None,
     max_provider_tokens: int | None = None,
+    selected_contribution_ids: Iterable[str] | None = None,
+    selection_digest: str | None = None,
 ) -> dict[str, Any]:
     """Build one named-question request per bounded group, retaining omissions."""
     if (not isinstance(max_groups, int) or isinstance(max_groups, bool) or max_groups < 1
@@ -201,11 +203,42 @@ def build_group_requests(
     group_records = groups.get("groups", [])
     if not isinstance(group_records, list):
         raise JgError("groups artifact lacks groups[]")
-    if len(group_records) > max_groups:
-        raise JgError("group request plan exceeds max_groups; split through a reviewed plan")
+    selected_ids = None
+    if selected_contribution_ids is not None:
+        if isinstance(selected_contribution_ids, (str, bytes)):
+            raise JgError("selected contribution IDs must be a sequence of IDs")
+        selected_ids = list(selected_contribution_ids)
+        if (not selected_ids or any(not isinstance(cid, str) or not cid for cid in selected_ids)
+                or len(selected_ids) != len(set(selected_ids))):
+            raise JgError("selected contribution IDs must be unique non-empty IDs")
+        if set(selected_ids) - set(units):
+            raise JgError("selection names contributions absent from the pinned artifact")
+        if not isinstance(selection_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", selection_digest):
+            raise JgError("a pinned selection digest is required with selected contribution IDs")
+    elif selection_digest is not None:
+        raise JgError("selection digest requires selected contribution IDs")
+    selected_set = set(selected_ids) if selected_ids is not None else None
+    selected_groups = []
+    selected_group_members: dict[str, list[str]] = {}
+    for group in group_records:
+        if not isinstance(group, Mapping):
+            raise JgError("group record must be an object")
+        unit_ids = group.get("unit_ids", [])
+        if not isinstance(unit_ids, list):
+            raise JgError("group unit_ids must be a list")
+        targets = [cid for cid in unit_ids if selected_set is None or cid in selected_set]
+        if targets:
+            selected_groups.append(group)
+            selected_group_members[str(group.get("id"))] = targets
+    if selected_ids is not None:
+        covered = {cid for targets in selected_group_members.values() for cid in targets}
+        if covered != selected_set:
+            raise JgError("study selection includes contributions not assigned to an original group")
+    if len(selected_groups) > max_groups:
+        raise JgError("selected group request plan exceeds max_groups")
     seen_group_ids: set[str] = set()
     requests, omitted = [], []
-    for group in group_records:
+    for group in selected_groups:
         if not isinstance(group, Mapping):
             raise JgError("group record must be an object")
         group_id = group.get("id")
@@ -221,7 +254,8 @@ def build_group_requests(
         if not isinstance(destination_ids, list) or any(not isinstance(value, str) or not value for value in destination_ids):
             raise JgError(f"group {group_id} destination_ids must be non-empty strings")
         source_items, questions, evidence_ids, group_omitted = [], {}, [], []
-        for unit_id in unit_ids:
+        target_ids = selected_group_members[group_id]
+        for unit_id in target_ids:
             unit = units.get(unit_id)
             if unit is None:
                 omitted.append({"group_id": group_id, "contribution_id": unit_id, "reason": "unit_missing"})
@@ -236,7 +270,8 @@ def build_group_requests(
                              "neighbor_id": edge.get("destination_id"),
                              "kind": edge.get("kind", edge.get("type", "unknown"))}
                             for edge in unit_edges]
-            unit_questions = presence_questions(unit_id, dependencies)
+            unit_questions = presence_questions(
+                unit_id, dependencies, dependency_context_status=unit.get("dependency_context_status"))
             for question_id, question in unit_questions.items():
                 questions[f"{unit_id}:{question_id}"] = question
             evidence = evidence_by_contribution.get(unit_id)
@@ -252,9 +287,62 @@ def build_group_requests(
                                     if isinstance(record.get("evidence_id"), str))
             source_metadata = {key: unit.get(key) for key in ("source_tip", "main_tip", "path", "mode", "kind", "name", "range", "source_blob", "limitations") if key in unit}
             source_metadata["identity"] = dict(unit.get("source", {}))
-            source_items.append({"contribution_id": unit_id, "source": source_metadata,
-                                 "destination_ids": unit.get("destination_ids", []),
-                                 "dependency_edges": dependencies, "evidence": evidence})
+            candidate_ids = unit.get("destination_ids", [])
+            comparison_limitations = []
+            if evidence is None or not evidence.get("records"):
+                comparison_limitations.append("approved_two_sided_evidence_missing")
+            if not candidate_ids:
+                comparison_limitations.append("destination_candidate_missing")
+            missing_candidate_ids = sorted(set(candidate_ids) - set(destinations))
+            if missing_candidate_ids:
+                comparison_limitations.append("destination_candidate_record_missing")
+            evidence_records = evidence.get("records", []) if isinstance(evidence, Mapping) else []
+            covered_candidates = set()
+            source_evidence_present = False
+            for record in evidence_records:
+                source_record, destination_record = record.get("source", {}), record.get("destination", {})
+                if (source_record.get("path") == unit.get("path")
+                        and source_record.get("blob") == unit.get("source_blob")):
+                    source_evidence_present = True
+                    for destination_id in candidate_ids:
+                        candidate = destinations.get(destination_id, {})
+                        if (destination_record.get("path") == candidate.get("path")
+                                and destination_record.get("blob") == candidate.get("blob")):
+                            covered_candidates.add(destination_id)
+            if evidence_records and not source_evidence_present:
+                comparison_limitations.append("approved_source_range_does_not_match_unit")
+            if set(candidate_ids) - covered_candidates:
+                comparison_limitations.append("approved_destination_ranges_incomplete")
+            source_item = {"contribution_id": unit_id, "source": source_metadata,
+                           "destination_ids": candidate_ids,
+                           "dependency_edges": dependencies, "evidence": evidence,
+                           "comparison_context_complete": bool(evidence_records and source_evidence_present
+                               and candidate_ids and not missing_candidate_ids
+                               and set(candidate_ids) <= covered_candidates),
+                           "comparison_context_limitations": sorted(set(comparison_limitations))}
+            if "dependency_context_status" in unit:
+                dependency_status = unit.get("dependency_context_status")
+                dependency_limitations = list(unit.get("dependency_context_limitations", []))
+                if dependency_status not in {"complete", "unknown", "incomplete"}:
+                    dependency_status = "unknown"
+                    dependency_limitations.append("dependency_context_status_invalid")
+                source_item["dependency_context_status"] = dependency_status
+                source_item["dependency_context_limitations"] = sorted(set(dependency_limitations))
+            source_items.append(source_item)
+        context_items = []
+        target_set = set(target_ids)
+        for context_id in unit_ids:
+            if context_id in target_set:
+                continue
+            context_unit = units.get(context_id)
+            if context_unit is None:
+                group_omitted.append({"contribution_id": context_id, "reason": "context_unit_missing"})
+                continue
+            context_items.append({"contribution_id": context_id,
+                "source": {key: context_unit.get(key) for key in
+                    ("source_tip", "main_tip", "path", "kind", "name", "range", "source_blob", "limitations")
+                    if key in context_unit},
+                "destination_ids": context_unit.get("destination_ids", [])})
         selected_destination_ids = set(group.get("destination_ids", []))
         for item in source_items:
             selected_destination_ids.update(item.get("destination_ids", []))
@@ -271,6 +359,8 @@ def build_group_requests(
         if group_omitted:
             group_limitations.append("group_evidence_omitted")
         state = {"group_id": group_id, "contributions": source_items,
+                 "context_units": context_items,
+                 "context_contribution_ids": [item["contribution_id"] for item in context_items],
                  "destination_ids": group.get("destination_ids", []),
                  "destinations": destination_items,
                  "boundary_edges": group.get("boundary_edges", []),
@@ -286,6 +376,8 @@ def build_group_requests(
             "snapshot_digest": contributions.get("snapshot_digest"),
             "contributions_digest": contributions.get("contributions_digest"),
             "groups_digest": groups.get("groups_digest"),
+            "selected_contribution_ids": selected_ids,
+            "selection_digest": selection_digest,
             "request_count": len(requests), "payload_bytes": size,
             "requests": requests, "omitted": omitted,
             "model_settings": settings, "model_settings_digest": digest(settings),
@@ -298,6 +390,8 @@ def build_group_requests(
                                     "snapshot_digest": contributions.get("snapshot_digest"),
                                     "contributions_digest": contributions.get("contributions_digest"),
                                     "groups_digest": groups.get("groups_digest"),
+                                    "selected_contribution_ids": selected_ids,
+                                    "selection_digest": selection_digest,
                                     "model_settings_digest": digest(settings),
                                     "request_budgets": {"max_groups": max_groups,
                                         "max_request_bytes": max_request_bytes,
@@ -319,6 +413,8 @@ def approved_presence_preview(plan: Mapping[str, Any]) -> dict[str, Any]:
             "snapshot_digest": plan.get("snapshot_digest"),
             "contributions_digest": plan.get("contributions_digest"),
             "groups_digest": plan.get("groups_digest"),
+            "selected_contribution_ids": plan.get("selected_contribution_ids"),
+            "selection_digest": plan.get("selection_digest"),
             "request_count": len(requests), "payload_bytes": len(request_bytes),
             "payload_sha256": payload_sha, "request_bytes_base64": base64.b64encode(request_bytes).decode("ascii"),
             "requests": requests, "model_settings": plan.get("model_settings"),

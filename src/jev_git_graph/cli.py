@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -56,6 +57,24 @@ def _build_group_presence_preview(args):
             "contributions_digest": contributions["contributions_digest"],
             "groups_digest": groups["groups_digest"], "ranges": [],
         }
+    study = read_json(args.study) if args.study else None
+    selected_ids = None
+    selection_digest = None
+    if study is not None:
+        if (study.get("kind") != "presence-study" or study.get("schema_version") != 2
+                or study.get("study_digest") != digest({k: v for k, v in study.items() if k != "study_digest"})
+                or any(study.get(key) != expected for key, expected in (
+                    ("snapshot_digest", snapshot["snapshot_digest"]),
+                    ("contributions_digest", contributions["contributions_digest"]),
+                    ("groups_digest", groups["groups_digest"])) )):
+            raise JgError("study is invalid or belongs to different pinned artifacts")
+        cases = study.get("cases")
+        if not isinstance(cases, list) or not cases:
+            raise JgError("study must contain at least one selected case")
+        selected_ids = [case.get("contribution_id") for case in cases if isinstance(case, dict)]
+        if len(selected_ids) != len(cases) or len(selected_ids) != len(set(selected_ids)):
+            raise JgError("study cases must have unique contribution IDs")
+        selection_digest = study["study_digest"]
     model_settings = read_json(args.model_settings) if args.model_settings else None
     units = {unit["id"]: unit for unit in contributions.get("units", [])}
     evidence_by_contribution = {}
@@ -71,13 +90,16 @@ def _build_group_presence_preview(args):
         contributions, groups, evidence_by_contribution,
         max_groups=args.max_groups, max_request_bytes=args.max_request_bytes,
         model_settings=model_settings, estimated_input_tokens=args.estimated_input_tokens,
-        max_provider_tokens=args.max_provider_tokens)
+        max_provider_tokens=args.max_provider_tokens,
+        selected_contribution_ids=selected_ids, selection_digest=selection_digest)
     preview = approved_presence_preview(plan)
     replay = {
         "kind": "branch-presence-approved-manifest", "schema_version": 1,
         "snapshot_digest": snapshot["snapshot_digest"],
         "contributions_digest": contributions["contributions_digest"],
         "groups_digest": groups["groups_digest"],
+        "selected_contribution_ids": selected_ids,
+        "selection_digest": selection_digest,
         "range_manifest_digest": digest(range_manifest),
         "model_settings": model_settings,
         "model_settings_digest": preview["model_settings_digest"],
@@ -139,6 +161,7 @@ def parser() -> argparse.ArgumentParser:
     group_relate.add_argument("--snapshot", required=True)
     group_relate.add_argument("--contributions", required=True)
     group_relate.add_argument("--groups", required=True)
+    group_relate.add_argument("--study", help="digest-validated study whose cases bound requested contributions")
     group_relate.add_argument("--evidence-ranges")
     group_relate.add_argument("--model-settings")
     group_relate.add_argument("--out", required=True)
@@ -158,6 +181,7 @@ def parser() -> argparse.ArgumentParser:
     presence_reconcile.add_argument("--contributions", required=True)
     presence_reconcile.add_argument("--groups", required=True)
     presence_reconcile.add_argument("--answers", required=True)
+    presence_reconcile.add_argument("--execution-receipt", help="local signed receipt required for Jev-origin answers")
     presence_reconcile.add_argument("--out", required=True)
 
     presence_calibrate = commands.add_parser("presence-calibrate", help="compare reviewed presence labels with Jev and control results")
@@ -341,7 +365,9 @@ def run(args: argparse.Namespace) -> str:
                 preview, args.approved_payload_sha256,
                 approved_approval_sha256=args.approved_approval_sha256,
                 max_workers=args.max_workers, checkpoint=checkpoint,
-                code_evidence_repo=object_repo)
+                code_evidence_repo=object_repo,
+                token=os.environ.get("TYPESAFE_API_KEY"),
+                execution_receipt_path=target / "presence-execution-receipt.json")
             response_path = target / "presence-execution.json"
             write_json(response_path, result)
             return str(response_path)
@@ -359,7 +385,8 @@ def run(args: argparse.Namespace) -> str:
         return str(replay_path)
     if args.command == "presence-reconcile":
         result = reconcile_presence(
-            read_json(args.contributions), read_json(args.groups), read_json(args.answers))
+            read_json(args.contributions), read_json(args.groups), read_json(args.answers),
+            execution_receipt=read_json(args.execution_receipt) if args.execution_receipt else None)
         write_json(args.out, result)
         return args.out
     if args.command == "presence-calibrate":

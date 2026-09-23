@@ -96,12 +96,9 @@ def test_synthetic_answers_are_advisory_and_origin_cannot_be_overridden():
     plan = build_group_requests(contributions, groups)
     preview, result = _synthetic_result(contributions, groups, plan, [{}])
 
-    if groups["groups"][0]["context_complete"]:
-        assert result["contributions"][0]["disposition"] == "LIKELY_PRESERVED"
-    else:
-        assert result["contributions"][0]["disposition"] == "UNRESOLVED"
-        assert result["contributions"][0]["group_context_complete"] is False
-        assert result["contributions"][0]["dependency_context_status"] == "unknown"
+    assert result["contributions"][0]["disposition"] == "UNRESOLVED"
+    assert result["contributions"][0]["comparison_context_complete"] is False
+    assert "comparison_context_incomplete" in result["contributions"][0]["reasons"]
     assert result["contributions"][0]["routing_scope"] == "advisory_only"
     assert validate_outcome_presence(result, contributions) == {}
     with pytest.raises(JgError, match="origin override"):
@@ -148,6 +145,37 @@ def test_empty_dependency_edges_do_not_claim_complete_dependency_context():
     assert row["disposition"] == "UNRESOLVED"
     assert "dependency_context_unknown" in row["reasons"]
     assert row["routing_scope"] == "advisory_only"
+
+
+def test_study_selection_binds_only_targets_and_keeps_original_group_context():
+    contributions, groups = _artifact()
+    second = {**contributions["units"][0], "id": "cu-2", "name": "neighbor"}
+    contributions["units"].append(second)
+    contributions["branches"][0]["unit_ids"].append("cu-2")
+    contributions.pop("contributions_digest")
+    contributions["contributions_digest"] = digest(contributions)
+    groups["contributions_digest"] = contributions["contributions_digest"]
+    groups["groups"][0]["unit_ids"].append("cu-2")
+    groups.pop("groups_digest")
+    groups["groups_digest"] = digest(groups)
+
+    selection = "f" * 64
+    plan = build_group_requests(contributions, groups, selected_contribution_ids=["cu-1"],
+                                selection_digest=selection)
+    request = plan["requests"][0]
+    assert plan["groups_digest"] == groups["groups_digest"]
+    assert plan["selected_contribution_ids"] == ["cu-1"]
+    assert plan["selection_digest"] == selection
+    assert [item["contribution_id"] for item in request["state"]["contributions"]] == ["cu-1"]
+    assert request["questions"] and all(key.startswith("cu-1:") for key in request["questions"])
+    assert request["state"]["context_contribution_ids"] == ["cu-2"]
+
+
+def test_study_selection_rejects_unassigned_contributions():
+    contributions, groups = _artifact()
+    with pytest.raises(JgError, match="absent from the pinned artifact"):
+        build_group_requests(contributions, groups, selected_contribution_ids=["cu-1", "cu-missing"],
+                             selection_digest="f" * 64)
 
 
 def test_resolved_per_unit_context_can_route_without_global_group_completeness():
