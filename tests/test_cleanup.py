@@ -6,9 +6,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from jev_git_graph.cleanup import (CooperativeLease, _atomic_delete,
+from jev_git_graph.cleanup import (_atomic_delete,
                                    approve_cleanup_plan, build_cleanup_plan,
                                    execute_cleanup)
+from jev_git_graph.coordinator import (CleanupActionJournal,
+                                       CooperativeBranchLeaseAdapter,
+                                       REQUIRED_HOME_LAB_CREATORS,
+                                       cleanup_action_id,
+                                       reconcile_interrupted_cleanup)
 from jev_git_graph.errors import JgError
 from jev_git_graph.inventory import build_inventory
 from jev_git_graph.safety import digest, opaque_path_id
@@ -18,6 +23,14 @@ def run(repo: Path, *args: str) -> str:
     result = subprocess.run(("git", "-C", str(repo), *args), check=True,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return result.stdout.decode().strip()
+
+
+def _ref_exists(repo: Path, name: str) -> bool:
+    result = subprocess.run(
+        ("git", "-C", str(repo), "show-ref", "--verify", "--quiet", f"refs/heads/{name}"),
+        check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
 
 
 def coverage_for(repo: Path, records: list[dict]) -> dict:
@@ -43,6 +56,15 @@ def build_old_plan(*args, **kwargs):
 
 
 class CleanupTests(unittest.TestCase):
+    def integrated_lease(self, directory: Path) -> CooperativeBranchLeaseAdapter:
+        lease = CooperativeBranchLeaseAdapter(
+            "synthetic-repository", directory / "branch-leases",
+        )
+        for creator_id in REQUIRED_HOME_LAB_CREATORS:
+            lease.register_creator(creator_id)
+        self.assertTrue(lease.creator_participation_complete)
+        return lease
+
     def test_planner_rechecks_activity_after_coverage(self):
         repo, topic_tip, main_tip = self.make_repo()
         coverage = coverage_for(repo, [{"name": "topic", "tip": topic_tip, "main_tip": main_tip,
@@ -134,6 +156,86 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual("cooperative_lease_unestablished", result["stopped"])
         self.assertEqual(topic_tip, run(repo, "rev-parse", "topic"))
 
+    def test_executor_journals_intent_and_result_while_holding_integrated_lease(self):
+        repo, topic_tip, main_tip = self.make_repo()
+        coverage = coverage_for(repo, [{"name": "topic", "tip": topic_tip, "main_tip": main_tip,
+                                       "verdict": "EXACT", "reason": None, "last_activity_epoch": 1,
+                                       "paths": [{"path": "topic", "verdict": "EXACT_PRESENT"}]}])
+        with tempfile.TemporaryDirectory() as out:
+            root = Path(out)
+            plan = build_old_plan(repo, coverage, bundle_dir=root / "bundle")
+            approved = approve_cleanup_plan(plan, approved_digest=plan["plan_digest"])
+            journal_path = root / "actions.jsonl"
+            lease = self.integrated_lease(root)
+            with patch("jev_git_graph.cleanup.CREATOR_LEASE_INTEGRATED", True), \
+                 patch("jev_git_graph.cleanup._live_reproof", return_value=None):
+                result = execute_cleanup(
+                    repo, approved, approved_digest=approved["plan_digest"],
+                    lease_contract=lease, journal_path=journal_path,
+                )
+            events = CleanupActionJournal(journal_path).read_events()
+        self.assertEqual(["topic"], [item["name"] for item in result["deleted"]])
+        self.assertEqual(["intent", "result"], [event["event"] for event in events])
+        self.assertEqual("deleted", events[-1]["status"])
+        self.assertEqual(topic_tip, events[0]["tip"])
+        self.assertEqual(main_tip, events[-1]["observed_destination_tip"])
+        self.assertFalse(_ref_exists(repo, "topic"))
+
+    def test_interrupted_reconciliation_restores_absent_ref_from_bundle(self):
+        repo, topic_tip, main_tip = self.make_repo()
+        coverage = coverage_for(repo, [{"name": "topic", "tip": topic_tip, "main_tip": main_tip,
+                                       "verdict": "EXACT", "reason": None, "last_activity_epoch": 1,
+                                       "paths": [{"path": "topic", "verdict": "EXACT_PRESENT"}]}])
+        with tempfile.TemporaryDirectory() as out:
+            root = Path(out)
+            plan = build_old_plan(repo, coverage, bundle_dir=root / "bundle")
+            approved = approve_cleanup_plan(plan, approved_digest=plan["plan_digest"])
+            action_id = cleanup_action_id(approved["plan_digest"], 0, "topic", topic_tip)
+            journal = CleanupActionJournal(root / "actions.jsonl")
+            journal.append({
+                "event": "intent", "action_id": action_id,
+                "plan_digest": approved["plan_digest"], "candidate_index": 0,
+                "branch": "topic",
+                "tip": topic_tip, "destination": "main", "destination_tip": main_tip,
+                "bundle_sha256": approved["bundle"]["sha256"],
+            })
+            run(repo, "update-ref", "-d", "refs/heads/topic", topic_tip)
+            lease = self.integrated_lease(root)
+            results = reconcile_interrupted_cleanup(repo, approved, journal, lease)
+            restored_tip = run(repo, "rev-parse", "refs/heads/topic")
+            events = journal.read_events()
+        self.assertEqual("source_restored_after_interruption", results[0]["status"])
+        self.assertTrue(results[0]["restored"])
+        self.assertEqual(topic_tip, restored_tip)
+        self.assertEqual("reconciled", events[-1]["event"])
+        self.assertEqual([], journal.pending_intents(plan_digest=approved["plan_digest"]))
+
+    def test_interrupted_reconciliation_preserves_recreated_ref(self):
+        repo, topic_tip, main_tip = self.make_repo()
+        coverage = coverage_for(repo, [{"name": "topic", "tip": topic_tip, "main_tip": main_tip,
+                                       "verdict": "EXACT", "reason": None, "last_activity_epoch": 1,
+                                       "paths": [{"path": "topic", "verdict": "EXACT_PRESENT"}]}])
+        with tempfile.TemporaryDirectory() as out:
+            root = Path(out)
+            plan = build_old_plan(repo, coverage, bundle_dir=root / "bundle")
+            approved = approve_cleanup_plan(plan, approved_digest=plan["plan_digest"])
+            action_id = cleanup_action_id(approved["plan_digest"], 0, "topic", topic_tip)
+            journal = CleanupActionJournal(root / "actions.jsonl")
+            journal.append({
+                "event": "intent", "action_id": action_id,
+                "plan_digest": approved["plan_digest"], "candidate_index": 0,
+                "branch": "topic",
+                "tip": topic_tip, "destination": "main", "destination_tip": main_tip,
+                "bundle_sha256": approved["bundle"]["sha256"],
+            })
+            run(repo, "branch", "--force", "topic", main_tip)
+            lease = self.integrated_lease(root)
+            results = reconcile_interrupted_cleanup(repo, approved, journal, lease)
+            current_tip = run(repo, "rev-parse", "refs/heads/topic")
+        self.assertEqual("source_recreated_or_moved", results[0]["status"])
+        self.assertFalse(results[0]["restored"])
+        self.assertEqual(main_tip, current_tip)
+
     def test_destination_verify_and_source_delete_are_one_transaction(self):
         repo, topic_tip, main_tip = self.make_repo()
         self.assertFalse(_atomic_delete(repo, "topic", topic_tip, "main", "0" * 40))
@@ -149,17 +251,17 @@ class CleanupTests(unittest.TestCase):
             plan = build_old_plan(repo, coverage, bundle_dir=Path(out))
             plan = approve_cleanup_plan(plan, approved_digest=plan["plan_digest"])
             releases = []
-            lease = CooperativeLease(
-                True, lambda *_: True,
-                lambda name, tip: releases.append((name, tip)) or True,
-            )
+            lease = self.integrated_lease(Path(out))
+            original_release = lease.release
+            lease.release = lambda name, tip: releases.append((name, tip)) or original_release(name, tip)
             with patch("jev_git_graph.cleanup._live_reproof", return_value=None), \
                  patch("jev_git_graph.cleanup.CREATOR_LEASE_INTEGRATED", True), \
                  patch("jev_git_graph.cleanup.git.local_branches",
                        side_effect=JgError("readback unavailable")):
                 result = execute_cleanup(repo, plan,
                                          approved_digest=plan["plan_digest"],
-                                         lease_contract=lease)
+                                         lease_contract=lease,
+                                         journal_path=Path(out) / "actions.jsonl")
         self.assertEqual("delete_readback_uncertain", result["stopped"])
         self.assertTrue(result["restored"])
         self.assertEqual([("topic", topic_tip)], releases)
@@ -186,12 +288,16 @@ class CleanupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as out:
             plan = build_old_plan(repo, coverage, bundle_dir=Path(out))
             approved = approve_cleanup_plan(plan, approved_digest=plan["plan_digest"])
-            lease = CooperativeLease(True, lambda *_: True, lambda *_: False)
+            lease = self.integrated_lease(Path(out))
+            original_release = lease.release
+            lease.release = lambda name, tip: (original_release(name, tip), False)[1]
             with patch("jev_git_graph.cleanup.CREATOR_LEASE_INTEGRATED", True), \
                  patch("jev_git_graph.cleanup._live_reproof", return_value=None), \
                  patch("jev_git_graph.cleanup._ref_presence", return_value=None):
                 result = execute_cleanup(repo, approved,
-                                         approved_digest=approved["plan_digest"], lease_contract=lease)
+                                         approved_digest=approved["plan_digest"],
+                                         lease_contract=lease,
+                                         journal_path=Path(out) / "actions.jsonl")
         self.assertEqual("lease_release_failed", result["stopped"])
         self.assertTrue(result["restoration_attempted"])
         self.assertTrue(result["restored"])
