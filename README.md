@@ -12,7 +12,7 @@ Jev use is separate and opt-in. Before a live request, the tool shows the exact 
 
 ## Run it
 
-Local analysis needs only Python and Git. Live Jev requests also need `curl`; the client passes the API key through a pipe so it does not appear in process arguments. Install the CLI into an environment you control, then choose an artifact directory that is outside the repository being inspected:
+Local analysis needs only Python and Git. Live Jev requests use TypeSafe's official Python SDK and reuse one client connection pool for the batch, without spawning a process for each request. Install the CLI into an environment you control, then choose an artifact directory that is outside the repository being inspected:
 
 ```bash
 python -m pip install -e .
