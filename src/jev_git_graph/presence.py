@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import concurrent.futures
 import base64
+import hashlib
+import hmac
+import os
 import re
+import stat
 from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic
@@ -120,7 +124,91 @@ def _request_bindings(request: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 
 def _answers_digest(artifact: Mapping[str, Any]) -> str:
-    return digest({key: value for key, value in artifact.items() if key != "answers_digest"})
+    return digest({key: value for key, value in artifact.items()
+                   if key not in {"answers_digest", "execution_receipt"}})
+
+
+def _presence_key_path() -> Path:
+    return Path.home() / ".local" / "share" / "jev-git-graph" / "presence-execution.key"
+
+
+def _presence_key(*, create: bool) -> bytes:
+    """Load the owner-only local receipt key; it is not a provider credential."""
+    path = _presence_key_path()
+    if create:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    elif not path.parent.exists():
+        raise JgError("trusted presence execution key is unavailable")
+    if path.parent.stat().st_mode & 0o077:
+        raise JgError("presence receipt key directory must be owner-only")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        if not create:
+            raise JgError("trusted presence execution key is unavailable") from None
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        except FileExistsError:
+            fd = os.open(path, flags)
+        else:
+            key = os.urandom(32)
+            try:
+                os.write(fd, key)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            return key
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_mode & 0o077 or info.st_size != 32):
+            raise JgError("trusted presence execution key has unsafe ownership or permissions")
+        key = os.read(fd, 33)
+    finally:
+        os.close(fd)
+    if len(key) != 32:
+        raise JgError("trusted presence execution key is malformed")
+    return key
+
+
+def _local_signature(payload: Mapping[str, Any], *, create_key: bool = False) -> str:
+    return hmac.new(_presence_key(create=create_key), canonical_json(payload), hashlib.sha256).hexdigest()
+
+
+def _signed_record(kind: str, payload: Mapping[str, Any], *, create_key: bool = False) -> dict[str, Any]:
+    record = {"kind": kind, **dict(payload)}
+    record["signature"] = _local_signature(record, create_key=create_key)
+    return record
+
+
+def _verify_signed_record(record: Any, kind: str) -> bool:
+    if not isinstance(record, Mapping) or record.get("kind") != kind:
+        return False
+    signature = record.get("signature")
+    if not isinstance(signature, str) or not re.fullmatch(r"[0-9a-f]{64}", signature):
+        return False
+    unsigned = {key: value for key, value in record.items() if key != "signature"}
+    try:
+        expected = _local_signature(unsigned)
+    except JgError:
+        return False
+    return hmac.compare_digest(signature, expected)
+
+
+def verify_trusted_presence_result(result: Mapping[str, Any]) -> bool:
+    """Verify the locally attested normalized Jev result; public hashes are insufficient."""
+    if result.get("origin") != "jev" or not _verify_signed_record(
+        result.get("trusted_provenance"), "branch-presence-reconciliation-receipt"
+    ):
+        return False
+    if result.get("presence_digest") != digest({key: value for key, value in result.items()
+                                                if key != "presence_digest"}):
+        return False
+    provenance = result["trusted_provenance"]
+    body = {key: value for key, value in result.items()
+            if key not in {"presence_digest", "trusted_provenance"}}
+    return provenance.get("result_body_sha256") == digest(body)
 
 
 def _validate_sanitized_answers(bindings: list[Mapping[str, Any]], response: Mapping[str, Any]) -> None:
@@ -221,6 +309,7 @@ def execute_presence_preview(
     max_workers: int = 2,
     checkpoint: str | Path | None = None,
     code_evidence_repo: str | Path | None = None,
+    execution_receipt_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Execute an explicitly approved preview with bounded workers/resume.
 
@@ -262,8 +351,9 @@ def execute_presence_preview(
             or not isinstance(budgets.get("max_request_bytes"), int)
             or preview["payload_bytes"] > budgets["max_request_bytes"]):
         raise JgError("presence request exceeds its approved count or byte budget")
+    trusted_sdk_executor = transport is None
     actual_transport = transport
-    if actual_transport is None:
+    if trusted_sdk_executor:
         if not token:
             raise JgError("presence execution requires an explicitly supplied transport token")
         actual_transport = _default_transport
@@ -272,7 +362,7 @@ def execute_presence_preview(
         raise JgError("presence preview lacks model settings")
     if any(request.get("model") != settings.get("model") for request in requests):
         raise JgError("presence request model differs from approved model settings")
-    if actual_transport is _default_transport and any(
+    if trusted_sdk_executor and any(
         settings.get(field) is not None
         for field in ("reasoning_effort", "max_output_tokens", "temperature", "seed")
     ):
@@ -281,8 +371,10 @@ def execute_presence_preview(
         raise JgError("presence execution requires an explicitly supplied transport token")
 
     ledger = {"kind": "branch-presence-execution", "schema_version": 1,
-              "origin": "jev",
-              "preview_sha256": payload_sha, "question_version": PRESENCE_QUESTION_VERSION,
+              "origin": "jev" if trusted_sdk_executor else "synthetic",
+              "executor": "pooled-jev-sdk-v1" if trusted_sdk_executor else "injected-advisory-transport",
+              "preview_sha256": payload_sha, "approval_sha256": approval_sha,
+              "question_version": PRESENCE_QUESTION_VERSION,
               "snapshot_digest": preview.get("snapshot_digest"),
               "contributions_digest": preview.get("contributions_digest"),
               "groups_digest": preview.get("groups_digest"),
@@ -292,9 +384,12 @@ def execute_presence_preview(
     if checkpoint is not None and Path(checkpoint).exists():
         ledger = read_json(checkpoint)
         if (ledger.get("kind") != "branch-presence-execution" or ledger.get("preview_sha256") != payload_sha
+                or ledger.get("approval_sha256") != approval_sha
                 or ledger.get("question_version") != PRESENCE_QUESTION_VERSION
                 or ledger.get("contributions_digest") != preview.get("contributions_digest")
-                or ledger.get("groups_digest") != preview.get("groups_digest")):
+                or ledger.get("groups_digest") != preview.get("groups_digest")
+                or ledger.get("origin") != ("jev" if trusted_sdk_executor else "synthetic")
+                or ledger.get("executor") != ("pooled-jev-sdk-v1" if trusted_sdk_executor else "injected-advisory-transport")):
             raise JgError("presence checkpoint belongs to another preview")
         allowed_attempt_fields = {"request_sha256", "group_id", "status", "started_at", "completed_at",
                                   "error_class", "model", "usage"}
@@ -384,6 +479,26 @@ def execute_presence_preview(
     if checkpoint is not None:
         write_json(Path(checkpoint), ledger)
     ledger["answers_digest"] = _answers_digest(ledger)
+    if trusted_sdk_executor:
+        answered = sorted(item["request_sha256"] for item in ledger["answers"])
+        receipt_payload = {
+            "schema_version": 1,
+            "executor": "pooled-jev-sdk-v1",
+            "preview_sha256": payload_sha,
+            "approval_sha256": approval_sha,
+            "request_sha256s": sorted(digest(request) for request in requests),
+            "answered_request_sha256s": answered,
+            "answers_digest": ledger["answers_digest"],
+            "snapshot_digest": preview.get("snapshot_digest"),
+            "contributions_digest": preview.get("contributions_digest"),
+            "groups_digest": preview.get("groups_digest"),
+            "model_settings_digest": preview.get("model_settings_digest"),
+            "network_performed": ledger.get("network_performed") is True,
+        }
+        receipt = _signed_record("branch-presence-executor-receipt", receipt_payload, create_key=True)
+        ledger["execution_receipt"] = receipt
+        if execution_receipt_path is not None:
+            write_json(Path(execution_receipt_path), receipt)
     return ledger
 
 
@@ -393,6 +508,7 @@ def reconcile_presence(
     answer_artifact: Mapping[str, Any],
     *,
     origin: str | None = None,
+    execution_receipt: Mapping[str, Any] | str | Path | None = None,
 ) -> dict[str, Any]:
     """Deduplicate and deterministically reconcile overlap and contradictions."""
     if contributions.get("kind") != "contributions" or groups.get("kind") != "contribution-groups":
@@ -415,10 +531,38 @@ def reconcile_presence(
         raise JgError("unsupported presence answer artifact")
     if effective_origin == "jev" and answer_artifact.get("kind") != "branch-presence-execution":
         raise JgError("JeV provenance can only come from the approved executor")
-    if effective_origin in {"synthetic", "control"} and answer_artifact.get("kind") != "branch-presence-answers":
-        raise JgError("synthetic/control provenance requires the strict offline importer")
+    if effective_origin == "control" and answer_artifact.get("kind") != "branch-presence-answers":
+        raise JgError("control provenance requires the strict offline importer")
+    if effective_origin == "synthetic" and answer_artifact.get("kind") not in {
+        "branch-presence-answers", "branch-presence-execution"
+    }:
+        raise JgError("synthetic provenance requires the strict importer or advisory executor")
     if answer_artifact.get("answers_digest") != _answers_digest(answer_artifact):
         raise JgError("presence answer digest is invalid")
+    verified_receipt: Mapping[str, Any] | None = None
+    if effective_origin == "jev":
+        if execution_receipt is None:
+            raise JgError("JeV presence requires the separate trusted executor receipt")
+        verified_receipt = read_json(execution_receipt) if isinstance(execution_receipt, (str, Path)) else execution_receipt
+        # Request digest identities are carried by each sanitized answer record.
+        receipt_answer_shas = sorted(item.get("request_sha256") for item in answer_artifact.get("answers", []))
+        receipt_valid = _verify_signed_record(verified_receipt, "branch-presence-executor-receipt")
+        if (not receipt_valid or answer_artifact.get("executor") != "pooled-jev-sdk-v1"
+                or verified_receipt.get("executor") != "pooled-jev-sdk-v1"
+                or verified_receipt.get("preview_sha256") != answer_artifact.get("preview_sha256")
+                or verified_receipt.get("approval_sha256") != answer_artifact.get("approval_sha256")
+                or verified_receipt.get("model_settings_digest") != answer_artifact.get("model_settings_digest")
+                or verified_receipt.get("answers_digest") != answer_artifact.get("answers_digest")
+                or verified_receipt.get("answered_request_sha256s") != receipt_answer_shas
+                or len(set(receipt_answer_shas)) != len(receipt_answer_shas)
+                or not set(receipt_answer_shas).issubset(set(verified_receipt.get("request_sha256s", [])))
+                or verified_receipt.get("request_sha256s") != sorted(verified_receipt.get("request_sha256s", []))
+                or verified_receipt.get("network_performed") is not True
+                or answer_artifact.get("network_performed") is not True):
+            raise JgError("trusted Jev executor receipt does not match the presence answers")
+        for field in ("snapshot_digest", "contributions_digest", "groups_digest"):
+            if verified_receipt.get(field) != answer_artifact.get(field):
+                raise JgError("trusted Jev executor receipt does not match the pinned inputs")
     for field in ("snapshot_digest", "contributions_digest", "groups_digest"):
         if answer_artifact.get(field) != ({"snapshot_digest": contributions.get("snapshot_digest"),
                 "contributions_digest": contributions.get("contributions_digest"),
@@ -565,6 +709,13 @@ def reconcile_presence(
               "groups_digest": groups.get("groups_digest"),
               "contributions_digest": contributions.get("contributions_digest"),
               "contributions": result_rows, "network_performed": bool(answer_artifact.get("network_performed"))}
+    if verified_receipt is not None:
+        result_body_sha = digest(result)
+        result["trusted_provenance"] = _signed_record(
+            "branch-presence-reconciliation-receipt",
+            {"executor_receipt_sha256": digest(verified_receipt),
+             "result_body_sha256": result_body_sha},
+        )
     result["presence_digest"] = digest(result)
     return result
 
@@ -577,6 +728,12 @@ def validate_outcome_presence(presence: Mapping[str, Any], contributions: Mappin
         raise JgError("outcome presence digest is invalid")
     if presence.get("origin") not in {"jev", "synthetic", "control"}:
         raise JgError("outcome presence origin is invalid")
+    trusted_provenance = presence.get("trusted_provenance")
+    if presence.get("origin") == "jev":
+        if not verify_trusted_presence_result(presence):
+            raise JgError("JeV outcome lacks a matching trusted reconciliation receipt")
+    elif trusted_provenance is not None:
+        raise JgError("advisory presence cannot carry trusted Jev provenance")
     if contributions.get("contributions_digest") != digest({k: v for k, v in contributions.items() if k != "contributions_digest"}):
         raise JgError("outcome contribution digest is invalid")
     if (presence.get("contributions_digest") != contributions.get("contributions_digest")

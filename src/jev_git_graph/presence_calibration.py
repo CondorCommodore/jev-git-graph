@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from .errors import JgError
+from .presence import verify_trusted_presence_result
 from .safety import digest
 
 CLASSES = ("LIKELY_PRESERVED", "USABLE_WORK_REMAINS", "UNRESOLVED")
@@ -50,6 +51,8 @@ def _validate_result(result: Mapping[str, Any], labels: Mapping[str, Any], arm: 
     expected_origin = "jev" if arm == "JeV" else "control"
     if result.get("origin") != expected_origin:
         raise JgError(f"{arm} result has the wrong origin")
+    if arm == "JeV" and not verify_trusted_presence_result(result):
+        raise JgError("JeV calibration result lacks trusted executor provenance")
     for field in ("snapshot_digest", "contributions_digest", "groups_digest"):
         if result.get(field) != labels.get(field):
             raise JgError(f"{arm} result and owner labels differ at {field}")

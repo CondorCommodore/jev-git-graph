@@ -4,6 +4,7 @@ import subprocess
 
 import pytest
 
+import jev_git_graph.presence as presence_module
 from jev_git_graph.errors import JgError
 from jev_git_graph.group_requests import (
     approved_presence_preview,
@@ -13,6 +14,7 @@ from jev_git_graph.group_requests import (
 )
 from jev_git_graph.groups import build_groups
 from jev_git_graph.presence import (
+    execute_presence_preview,
     import_synthetic_answers,
     reconcile_presence,
     validate_outcome_presence,
@@ -106,6 +108,77 @@ def test_synthetic_answers_are_advisory_and_origin_cannot_be_overridden():
                            import_synthetic_answers(preview, [{"request_sha256": digest(preview["requests"][0]),
                                                               "response": _response(preview["requests"][0])}]),
                            origin="jev")
+
+
+def test_injected_executor_is_synthetic_and_public_origin_spoof_fails_closed():
+    contributions, groups = _artifact()
+    plan = build_group_requests(contributions, groups, estimated_input_tokens=100, max_provider_tokens=1000)
+    _add_context_contract(plan)
+    preview = approved_presence_preview(plan)
+
+    def injected(payload, token):
+        response = _response(payload)
+        response["model"] = payload["model"]
+        return response
+
+    executed = execute_presence_preview(
+        preview, preview["payload_sha256"],
+        approved_approval_sha256=preview["approval_sha256"],
+        transport=injected, token="fixture-only",
+    )
+    assert executed["origin"] == "synthetic"
+    advisory = reconcile_presence(contributions, groups, executed)
+    assert advisory["contributions"][0]["routing_scope"] == "advisory_only"
+    assert validate_outcome_presence(advisory, contributions) == {}
+
+    spoofed = {**executed, "origin": "jev", "executor": "pooled-jev-sdk-v1"}
+    spoofed["answers_digest"] = digest({key: value for key, value in spoofed.items()
+                                        if key not in {"answers_digest", "execution_receipt"}})
+    with pytest.raises(JgError, match="separate trusted executor receipt"):
+        reconcile_presence(contributions, groups, spoofed)
+
+
+def test_trusted_sdk_receipt_binds_answers_and_reconciled_outcome(tmp_path, monkeypatch):
+    contributions, groups = _artifact()
+    plan = build_group_requests(contributions, groups, estimated_input_tokens=100, max_provider_tokens=1000)
+    _add_context_contract(plan)
+    preview = approved_presence_preview(plan)
+    monkeypatch.setattr(presence_module, "_presence_key_path", lambda: tmp_path / "private" / "key")
+
+    def fixture_sdk(payload, token):
+        response = _response(payload)
+        response["model"] = payload["model"]
+        return response
+
+    monkeypatch.setattr(presence_module, "_default_transport", fixture_sdk)
+    receipt_path = tmp_path / "receipt.json"
+    executed = execute_presence_preview(
+        preview, preview["payload_sha256"],
+        approved_approval_sha256=preview["approval_sha256"],
+        token="fixture-only", execution_receipt_path=receipt_path,
+    )
+    assert executed["origin"] == "jev"
+    receipt = presence_module.read_json(receipt_path)
+    result = reconcile_presence(contributions, groups, executed, execution_receipt=receipt)
+    assert result["contributions"][0]["routing_scope"] == "production_review_candidate"
+    assert validate_outcome_presence(result, contributions)
+
+    with pytest.raises(JgError, match="separate trusted executor receipt"):
+        reconcile_presence(contributions, groups, executed)
+
+    changed = {**executed, "answers": [dict(executed["answers"][0])]}
+    changed["answers"][0]["group_id"] = "changed"
+    changed["answers_digest"] = digest({key: value for key, value in changed.items()
+                                        if key not in {"answers_digest", "execution_receipt"}})
+    with pytest.raises(JgError, match="receipt does not match"):
+        reconcile_presence(contributions, groups, changed, execution_receipt=receipt)
+
+    tampered_result = {**result, "contributions": [dict(result["contributions"][0])]}
+    tampered_result["contributions"][0]["routing_scope"] = "advisory_only"
+    tampered_result.pop("presence_digest")
+    tampered_result["presence_digest"] = digest(tampered_result)
+    with pytest.raises(JgError, match="trusted reconciliation receipt"):
+        validate_outcome_presence(tampered_result, contributions)
 
 
 def test_overlapping_contradiction_and_incomplete_group_remain_unresolved():
@@ -205,7 +278,7 @@ def test_missing_comparison_ranges_keep_presence_advisory():
     assert "comparison_context_incomplete" in row["reasons"]
 
 
-def test_calibration_excludes_unreviewed_labels_and_uses_matched_cases():
+def test_calibration_excludes_unreviewed_labels_and_uses_matched_cases(tmp_path, monkeypatch):
     contributions, groups = _artifact()
     plan = build_group_requests(contributions, groups)
     _, result = _synthetic_result(contributions, groups, plan, [{}])
@@ -220,12 +293,20 @@ def test_calibration_excludes_unreviewed_labels_and_uses_matched_cases():
                           "reviewed": True, "disposition": "LIKELY_PRESERVED"},
                          {"contribution_id": "cu-unreviewed", "family_id": "family-2",
                           "reviewed": False, "disposition": None}]}
-    jev_result = {**result, "origin": "jev"}
-    jev_result.pop("presence_digest")
-    jev_result["presence_digest"] = digest(jev_result)
+    monkeypatch.setattr(presence_module, "_presence_key_path", lambda: tmp_path / "private" / "key")
+    jev_body = {**result, "origin": "jev"}
+    jev_body.pop("presence_digest")
     control_result = {**result, "origin": "control"}
     control_result.pop("presence_digest")
     control_result["presence_digest"] = digest(control_result)
+    spoofed_jev = {**jev_body, "presence_digest": digest(jev_body)}
+    with pytest.raises(JgError, match="trusted executor provenance"):
+        build_presence_calibration(labels, spoofed_jev, control_result)
+    jev_body["trusted_provenance"] = presence_module._signed_record(
+        "branch-presence-reconciliation-receipt",
+        {"executor_receipt_sha256": "a" * 64,
+         "result_body_sha256": digest(jev_body)}, create_key=True)
+    jev_result = {**jev_body, "presence_digest": digest(jev_body)}
     calibration = build_presence_calibration(labels, jev_result, control_result)
     assert calibration["labels"]["unreviewed_excluded"] == 1
     assert calibration["matched_contribution_ids"] == ["cu-1"]
