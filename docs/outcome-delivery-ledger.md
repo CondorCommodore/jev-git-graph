@@ -20,19 +20,24 @@ the full 2,917-blob destination index. Artifact SHA-256 is
 stored privately at
 `~/.local/share/jev-git-graph/runs/home-lab/r2-foundation-pilot-twzbuv70/contributions-v2-extractor-77ec978.json`.
 The run took 845 seconds and peaked at 22,699,081,728 bytes RSS (reported peak
-footprint 24,936,040,496 bytes), with no swap use. The 2.0 GB artifact includes
+footprint 24,936,040,496 bytes), with no swap use. The 4.4 GB artifact includes
 versioned module bindings, imports, static references, dependency status, and
-observed edges; its new size is a material resource cost. Counts and the
-grouping result are pending. The earlier contributions, groups, and failed
-study artifacts remain intact as historical evidence.
+observed edges; its new size is a material resource cost. It contains 113,211
+source units (1,671 dependency-context complete, 111,540 unknown), 52,667
+destination units (2,286 complete, 50,381 unknown), and 99,343 resolved static
+candidate edges. Remaining unresolved reference observations number 513,882
+source-side and 218,816 destination-side; the extractor explicitly reports
+partial cross-module, attribute/reflection, and local-binding resolution.
+Earlier contributions and failed study artifacts remain intact as historical
+evidence.
 
 | Requirement | Implementation owner | Acceptance evidence required | State |
 | --- | --- | --- | --- |
 | Immutable evidence, 24-hour exclusion, complete path accounting | Existing snapshot foundation | Pinned Home Lab replay; excluded objects retained | Existing baseline; reverify after changes |
 | Cached parallel analysis with resumable checkpoints | Luna scale_build | Installed CLI repeated run reuses checkpoints; deterministic result | Full pinned extraction completed with two process workers and resumable checkpoint; repeat/resume determinism still unverified |
-| Useful bounded groups with local boundaries | Luna scale_build | Home Lab group size/context report; no missing units | Full pinned grouping running against the new artifact; no utility claim yet |
+| Useful bounded groups with local boundaries | Luna scale_build | Home Lab group size/context report; no missing units | Full pinned grouping completed: 4,748 groups account for all 113,211 eligible source units; 32 groups report globally complete context, 4,716 incomplete. Groups cap at 24 units; 163 were incomplete at the edge-output budget. Pairwise discovery is explicitly non-exhaustive. Run took 616 seconds, peak RSS 14,538,604,544 bytes (reported footprint 27,968,835,576), no swap. |
 | Typed presence questions, two-sided evidence, approved dispatch, strict records | Luna presence_build | Offline synthetic import; privacy and digest rejection; approved real pilot | Offline synthetic import/reconcile, digest checks, and no-store preview verified; no live provider call or approval |
-| Blind control and label-based utility measurement | Luna presence_build + parent | 24–40 evidence cards, accepted labels, matched Jev/control report | Building; live payload approval pending preparation |
+| Blind control and label-based utility measurement | Luna presence_build + parent | 24–40 evidence cards, accepted labels, matched Jev/control report | Versioned study v4 binds 32 cases (24 dependency-context supported, 8 explicit uncertainty; 26 families, cap 4). Source review cards propose 24 likely-preserved (23 byte-identical) and 8 unresolved. This is a technical presence-validation packet with zero demonstrated usable delta, not a utility result. No accepted labels or Jev/control calls. |
 | One row per object, actionable preservation tasks and review interface | Parent | Installed outcomes CLI counts match inventory; concrete task fields | Disposable installed-CLI outcomes flow and review export round-trip verified; prior decisions retained and unresolved units surfaced |
 | Verified useful-work integration | Parent | Reviewed task, tested PR, merge readback, remaining-unit reassessment | Pending actual dispositions |
 | Creator participation, durable cleanup journal, restore and atomic deletion | Cleanup lane + parent | Creator races and interrupted execution in disposable repo | Cross-package lease/race proof exists; CLI journal/participation wiring is being integrated; real integration unproven and live gate remains closed |
