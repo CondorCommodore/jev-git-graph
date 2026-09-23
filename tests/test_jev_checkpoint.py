@@ -1,4 +1,6 @@
 import os
+import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,6 +9,7 @@ from unittest.mock import patch
 from jev_git_graph.errors import JgError
 from jev_git_graph.jev import (
     JEV_ENDPOINT,
+    _default_transport,
     checkpoint_lock,
     estimate_cost,
     execute_preview,
@@ -17,6 +20,48 @@ from jev_git_graph.safety import canonical_json, digest, read_json, write_json
 
 
 class CheckpointTests(unittest.TestCase):
+    def test_default_transport_uses_curl_without_secret_in_argv(self):
+        response = {"model": "jev-latest", "usage": {"input_tokens": 1, "output_tokens": 1},
+                    "answers": {"test": {"noul": .5}}}
+        completed = subprocess.CompletedProcess([], 0, json.dumps(response).encode() + b"\n200")
+        with patch("jev_git_graph.jev.subprocess.run", return_value=completed) as run:
+            result = _default_transport({"state": "sample"}, "secret-test-token")
+        self.assertEqual(result, response)
+        arguments = run.call_args.args[0]
+        self.assertIn("curl", arguments)
+        self.assertNotIn("secret-test-token", " ".join(arguments))
+        self.assertEqual(run.call_args.kwargs["input"], canonical_json({"state": "sample"}))
+        self.assertEqual(len(run.call_args.kwargs["pass_fds"]), 1)
+
+    def test_default_transport_does_not_return_provider_error_body(self):
+        completed = subprocess.CompletedProcess([], 0, b'{"secret":"must-not-appear"}\n403')
+        with patch("jev_git_graph.jev.subprocess.run", return_value=completed):
+            with self.assertRaisesRegex(JgError, "Jev HTTP error: 403") as caught:
+                _default_transport({"state": "sample"}, "secret-test-token")
+        self.assertNotIn("must-not-appear", str(caught.exception))
+
+    def test_metadata_checkpoint_drops_provider_extra_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request = {"state": {"candidate_id": "pair"}, "model": "jev-latest",
+                       "questions": {"test": {"type": "noul", "instructions": "synthetic"}}}
+            sha = digest([request])
+            preview = root / "preview.json"
+            checkpoint = root / "relations.json"
+            write_json(preview, {"kind": "jev-preview", "endpoint": JEV_ENDPOINT,
+                       "network_performed": False, "requests": [request],
+                       "payload_sha256": sha, "request_count": 1,
+                       "payload_bytes": len(canonical_json([request]))})
+            response = {"model": "jev-latest", "usage": {"input_tokens": 1, "output_tokens": 1},
+                        "answers": {"test": {"noul": .5, "echo": "must-not-persist"}},
+                        "echo": "must-not-persist"}
+            with patch.dict(os.environ, {"TYPESAFE_API_KEY": "synthetic-test-only"}):
+                execute_preview(preview, sha, transport=lambda *_: response, checkpoint=checkpoint)
+            self.assertNotIn("must-not-persist", checkpoint.read_text())
+            self.assertEqual(read_json(checkpoint)["relations"][0]["response"],
+                             {"model": "jev-latest", "usage": {"input_tokens": 1, "output_tokens": 1},
+                              "answers": {"test": {"noul": .5}}})
+
     def test_nonfinite_provider_probability_is_uncertain(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
