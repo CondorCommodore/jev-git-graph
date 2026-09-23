@@ -1,5 +1,10 @@
 # Project specification
 
+The next planned revision is [pinned contribution groups and measured review
+utility](2026-09-23-group-context-revision-plan.md). Section 13 below defines its
+additions to the original pairwise workflow; it does not claim those additions
+are already implemented.
+
 ## 1. Problem statement
 
 A repository can accumulate local and remote branches, linked worktrees, stashes, and uncommitted changes faster than maintainers can reconcile them. Git reliably tells us ancestry and exact object identity, but it does not answer whether two independent branches represent the same task, whether one supersedes another, or where a partial change was preserved. As a result, an apparently tidy cleanup can lose unique work, while avoiding cleanup leaves the canonical checkout dirty and the remaining work hard to understand.
@@ -241,3 +246,52 @@ For a busy repository such as the Home Lab pilot:
 5. Execute approved cleanup in small batches and resnapshot after each.
 
 Finishing every pending Jev request is not a prerequisite for progress. The canonical checkout can be cleaned and straightforward branches closed while explicitly unresolved work is retained. Completion means a clean canonical checkout and a disposition for every remaining object, including documented unresolved items; it does not mean deleting every branch or forcing every relationship to a confident answer.
+
+## 13. Revision 2 — shared context and contribution preservation
+
+Planned 2026-09-23. The [revision plan](2026-09-23-group-context-revision-plan.md)
+is the implementation sequence for these requirements. The existing v3 pairwise
+API and records remain readable as historical evidence.
+
+1. **Pin advisory inputs.** Capture explicit source and destination commits in
+   an independently restorable local snapshot outside inspected repositories.
+   Advisory results describe those immutable objects even if live branch names
+   move. Live cleanup eligibility is separately revalidated.
+2. **Account for contributions.** Map every changed path to source units,
+   destination candidates, or explicit uncertainty. Local Git/AST discovery
+   precedes model review; structural similarity cannot establish whole-branch
+   exact preservation. Record unsupported languages and ambiguous references.
+3. **Supply connected context.** Build a local graph across the eligible
+   snapshot, then prepare bounded groups with dependencies, known boundary
+   edges, and discovery/truncation limits. Shared state supports multiple named
+   questions in one request. Neither a missing edge nor a context partition
+   proves independence. Main must not collapse every group into one component.
+4. **Ask typed contribution questions.** Version presence, usable-delta,
+   dependency, and evidence-sufficiency questions separately from v3. Code
+   assigns all contribution/evidence IDs; Jev returns typed answers. Code also
+   checks scope, contradictions, and missing evidence before routing review.
+5. **Measure utility.** Compare Jev with a blinded inexpensive LLM control and
+   deterministic baselines on labeled pinned cases. Separate context and
+   evidence effects. Import normalized control answers offline; the product
+   does not gain an automatic generic-model fallback. Report errors, abstention,
+   coverage, uncertainty, cost, review effort, and verified preservation work.
+6. **Produce actions.** Every branch, worktree, and stash gets an accounted-for
+   ledger entry, destination or hold reason, and next step. Usable work becomes
+   a concrete preservation task; only strict exact coverage can enter the
+   existing cleanup planner. Enable execution only after the separate real
+   cooperative-lease integration and exact action approval.
+
+The planned privacy extension permits local committed-blob parsing for
+contribution extraction and a versioned code profile containing explicitly
+approved bounded source AND destination Python excerpts. It excludes dirty or
+stash content, retains sensitive-content scanning and fail-closed behavior,
+and never stores raw excerpts in preview/response artifacts. Metadata remains
+the default. The exact state, questions, ranges, and digests are previewed and
+approved before any disclosure; changing context is a new payload. Persist
+only validated typed answers, provenance IDs/digests, model, timing, usage, and
+status. These permissions apply equally to a separately authorized LLM control.
+
+This revision's acceptance is progress toward section 1: fewer unresolved
+objects, verified destinations for usable work, a complete review ledger, and
+a recoverable cleanup dry-run. Raw confidence scores or a completed request
+queue cannot substitute for those outcomes.
