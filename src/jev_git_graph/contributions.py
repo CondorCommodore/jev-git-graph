@@ -85,28 +85,152 @@ def _definitions_from_tree(tree: ast.Module) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     module_imports = []
     module_bindings: set[str] = set()
-    for statement in tree.body:
-        if isinstance(statement, ast.Import):
-            for item in statement.names:
+    module_value_bindings: set[str] = set()
+    module_dynamic: set[str] = set()
+
+    class ModuleEnvironmentVisitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.conditional_depth = 0
+            self.binding_events = 0
+            self.class_depth = 0
+
+        def _event(self, name: str, *, value: bool = True) -> None:
+            if self.class_depth:
+                return
+            module_bindings.add(name)
+            if value:
+                module_value_bindings.add(name)
+            self.binding_events += 1
+            if self.conditional_depth:
+                module_dynamic.add("conditional_module_binding_unanalyzed")
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            if not self.class_depth:
+                self._event(node.name, value=False)
+            for expression in [*node.decorator_list, *node.args.defaults,
+                               *(item for item in node.args.kw_defaults if item is not None),
+                               *(arg.annotation for arg in node.args.posonlyargs + node.args.args + node.args.kwonlyargs
+                                 if arg.annotation is not None), node.returns]:
+                if expression is not None:
+                    self.visit(expression)
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            if not self.class_depth:
+                self._event(node.name, value=False)
+            for expression in [*node.decorator_list, *node.bases, *(keyword.value for keyword in node.keywords)]:
+                self.visit(expression)
+            self.class_depth += 1
+            for statement in node.body:
+                self.visit(statement)
+            self.class_depth -= 1
+
+        def visit_Import(self, node: ast.Import) -> None:
+            if self.class_depth:
+                module_dynamic.add("class_body_import_binding_unanalyzed")
+                return
+            for item in node.names:
                 binding = item.asname or item.name.split(".", 1)[0]
+                self._event(binding, value=False)
                 module_imports.append({"kind": "module", "module": item.name,
-                                       "symbol": None,
-                                       "binding": binding})
-                module_bindings.add(binding)
-        elif isinstance(statement, ast.ImportFrom):
-            for item in statement.names:
+                                       "symbol": None, "binding": binding})
+
+        def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+            if self.class_depth:
+                module_dynamic.add("class_body_import_binding_unanalyzed")
+                return
+            for item in node.names:
                 binding = item.asname or item.name
-                module_imports.append({"kind": "from", "module": statement.module or "",
-                                       "level": statement.level, "symbol": item.name,
+                self._event(binding, value=False)
+                module_imports.append({"kind": "from", "module": node.module or "",
+                                       "level": node.level, "symbol": item.name,
                                        "binding": binding})
-                module_bindings.add(binding)
-        elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            module_bindings.add(statement.name)
-        elif isinstance(statement, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
-            targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
-            for target in targets:
-                module_bindings.update(child.id for child in ast.walk(target)
-                                       if isinstance(child, ast.Name))
+                if item.name == "*":
+                    module_dynamic.add("module_star_import_unresolved")
+
+        def visit_Name(self, node: ast.Name) -> None:
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                self._event(node.id)
+
+        def visit_Call(self, node: ast.Call) -> None:
+            dynamic_names = {"exec", "globals", "locals", "vars", "setattr",
+                             "delattr", "__import__"}
+            call_name = (node.func.id if isinstance(node.func, ast.Name) else
+                         node.func.attr if isinstance(node.func, ast.Attribute) else None)
+            if call_name in dynamic_names:
+                module_dynamic.add(f"module_dynamic_namespace_call:{call_name}")
+            self.generic_visit(node)
+
+        def visit_Attribute(self, node: ast.Attribute) -> None:
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                module_dynamic.add("module_attribute_binding_write_unanalyzed")
+            self.generic_visit(node)
+
+        def visit_Subscript(self, node: ast.Subscript) -> None:
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                module_dynamic.add("module_subscript_binding_write_unanalyzed")
+            self.generic_visit(node)
+
+        def visit_If(self, node: ast.If) -> None:
+            self._visit_conditional(node)
+
+        visit_For = visit_If
+        visit_AsyncFor = visit_If
+        visit_While = visit_If
+        visit_With = visit_If
+        visit_AsyncWith = visit_If
+        visit_Try = visit_If
+        visit_TryStar = visit_If
+
+        def visit_Match(self, node: ast.Match) -> None:
+            self.visit(node.subject)
+            for case in node.cases:
+                self.conditional_depth += 1
+                for child in ast.walk(case.pattern):
+                    name = None
+                    if isinstance(child, ast.MatchAs):
+                        name = child.name
+                    elif isinstance(child, ast.MatchStar):
+                        name = child.name
+                    elif isinstance(child, ast.MatchMapping):
+                        name = child.rest
+                    if name:
+                        self._event(name)
+                if case.guard:
+                    self.visit(case.guard)
+                for statement in case.body:
+                    self.visit(statement)
+                self.conditional_depth -= 1
+
+        def _visit_conditional(self, node: ast.AST) -> None:
+            self.conditional_depth += 1
+            self.generic_visit(node)
+            self.conditional_depth -= 1
+
+        def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+            if node.name:
+                self._event(node.name)
+            self.generic_visit(node)
+
+        def visit_Lambda(self, _node: ast.Lambda) -> None:
+            return
+
+        def visit_ListComp(self, node: ast.ListComp) -> None:
+            module_dynamic.add("module_comprehension_binding_unanalyzed")
+
+        visit_SetComp = visit_ListComp
+        visit_DictComp = visit_ListComp
+        visit_GeneratorExp = visit_ListComp
+
+    ModuleEnvironmentVisitor().visit(tree)
+    if any(isinstance(node, ast.Global) for node in ast.walk(tree)):
+        module_dynamic.add("module_global_write_unanalyzed")
+    module_definition_records = [
+        {"name": statement.name, "ast_fingerprint": _fingerprint(statement)}
+        for statement in tree.body
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    ]
 
     def visit(body: Iterable[ast.stmt], parents: tuple[str, ...] = ()) -> None:
         for node in body:
@@ -124,6 +248,9 @@ def _definitions_from_tree(tree: ast.Module) -> list[dict[str, Any]]:
                 "dynamic_reference_observations": dynamic,
                 "module_imports": module_imports,
                 "module_bindings": sorted(module_bindings),
+                "module_value_bindings": sorted(module_value_bindings),
+                "module_definition_records": module_definition_records,
+                "module_dynamic_reference_observations": sorted(module_dynamic),
             })
             visit(node.body, (*parents, node.name))
 
@@ -371,6 +498,9 @@ def _analyze_branch(repo: Path, branch: dict[str, Any], main_tip: str,
                                     "dynamic_reference_observations": definition.get("dynamic_reference_observations", []),
                                     "module_imports": definition.get("module_imports", []),
                                     "module_bindings": definition.get("module_bindings", []),
+                                    "module_value_bindings": definition.get("module_value_bindings", []),
+                                    "module_definition_records": definition.get("module_definition_records", []),
+                                    "module_dynamic_reference_observations": definition.get("module_dynamic_reference_observations", []),
                                     "dependency_context_status": "unknown",
                                     "dependency_context_limitations": ["module_imports_and_dynamic_resolution_not_exhaustive"],
                                     "destination_ids": list(candidates), "limitations": unit_limitations,
@@ -561,7 +691,7 @@ def build_contributions(snapshot: dict, object_repo: Path, *, workers: int | Non
                     branch = unit.get("branch")
                     if branch:
                         targets.extend(source_symbols.get((branch, path, imported["symbol"]), []))
-                    if not targets:
+                    else:
                         targets.extend(destination_symbols.get((path, imported["symbol"]), []))
             if targets:
                 unique = {item["id"]: item for item in targets}
@@ -572,8 +702,15 @@ def build_contributions(snapshot: dict, object_repo: Path, *, workers: int | Non
         candidates = ([candidate for candidate in source_symbols.get(
             (branch, unit["path"], reference), []) if candidate["id"] != unit["id"]]
             if branch else [])
-        if len(candidates) != 1:
-            candidates = destination_symbols.get((unit["path"], reference), []) if not candidates else candidates
+        if branch and not candidates:
+            source_definitions = [item for item in unit.get("module_definition_records", [])
+                                  if item.get("name") == reference]
+            if len(source_definitions) == 1:
+                source_fingerprint = source_definitions[0].get("ast_fingerprint")
+                candidates = [item for item in destination_symbols.get((unit["path"], reference), [])
+                              if item.get("ast_fingerprint") == source_fingerprint]
+        elif not branch:
+            candidates = destination_symbols.get((unit["path"], reference), [])
         return candidates
 
     resolved_dependencies = 0
@@ -585,6 +722,9 @@ def build_contributions(snapshot: dict, object_repo: Path, *, workers: int | Non
         for reference in unit.get("static_references", []):
             if reference == unit.get("name", "").rsplit(".", 1)[-1]:
                 resolved_reference_count += 1
+                continue
+            if reference in unit.get("module_value_bindings", []):
+                unresolved.append(reference)
                 continue
             candidates = reference_targets(unit, reference)
             if len(candidates) == 1:
@@ -601,7 +741,8 @@ def build_contributions(snapshot: dict, object_repo: Path, *, workers: int | Non
                     resolved_reference_count += 1
                 else:
                     unresolved.append(reference)
-        dynamic = unit.get("dynamic_reference_observations", [])
+        dynamic = sorted(set(unit.get("dynamic_reference_observations", [])) |
+                         set(unit.get("module_dynamic_reference_observations", [])))
         dependency_status = "complete" if not unresolved and not dynamic else "unknown"
         unit["dependency_observations"] = {
             "resolved_same_module_reference_count": resolved_reference_count,

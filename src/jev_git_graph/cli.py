@@ -27,6 +27,7 @@ from .groups import write_groups
 from .outcomes import write_outcomes
 from .study import write_study
 from .snapshot import load_snapshot
+from .transient_preview import serve_presence_preview
 
 
 def _build_group_presence_preview(args):
@@ -165,6 +166,8 @@ def parser() -> argparse.ArgumentParser:
     group_relate.add_argument("--evidence-ranges")
     group_relate.add_argument("--model-settings")
     group_relate.add_argument("--out", required=True)
+    group_relate.add_argument("--show-preview", action="store_true",
+                              help="render exact transient request content on stdout without storing it")
     group_relate.add_argument("--max-groups", type=int, default=32)
     group_relate.add_argument("--max-request-bytes", type=int, default=64000)
     group_relate.add_argument("--estimated-input-tokens", type=int)
@@ -359,6 +362,8 @@ def run(args: argparse.Namespace) -> str:
         else:
             write_json(replay_path, replay)
             write_json(ranges_path, range_manifest)
+        if args.show_preview and not args.execute and not args.answers:
+            serve_presence_preview(preview)
         if args.execute:
             checkpoint = validate_output_path(args.checkpoint, [object_repo]) if args.checkpoint else None
             result = execute_presence_preview(
@@ -387,7 +392,7 @@ def run(args: argparse.Namespace) -> str:
         result = reconcile_presence(
             read_json(args.contributions), read_json(args.groups), read_json(args.answers),
             execution_receipt=read_json(args.execution_receipt) if args.execution_receipt else None)
-        write_json(args.out, result)
+        write_json(Path(args.out), result)
         return args.out
     if args.command == "presence-calibrate":
         result = build_presence_calibration(
@@ -395,7 +400,7 @@ def run(args: argparse.Namespace) -> str:
             jev_metadata=read_json(args.jev_metadata) if args.jev_metadata else None,
             control_metadata=read_json(args.control_metadata) if args.control_metadata else None,
         )
-        write_json(args.out, result)
+        write_json(Path(args.out), result)
         return args.out
     if args.command == "study":
         contributions = read_json(args.contributions)
