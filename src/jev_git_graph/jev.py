@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import os
-import subprocess
 import tempfile
 import fcntl
+import atexit
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -298,46 +299,52 @@ def write_preview(candidates_path: str | Path, output: str | Path, evidence_prof
     return target
 
 
-def _default_transport(payload: dict[str, Any], token: str) -> dict[str, Any]:
-    if not token or "\n" in token or "\r" in token:
-        raise JgError("Jev credential is unavailable or malformed")
-    # curl reaches TypeSafe from this host; urllib's HTTP fingerprint is denied
-    # by the edge. Pass the secret header through a pipe, never process argv.
-    header_fd, writer = os.pipe()
-    try:
-        os.write(writer, f"Authorization: Bearer {token}\n".encode("utf-8"))
-        os.close(writer)
-        writer = -1
-        completed = subprocess.run(
-            ["curl", "--silent", "--show-error", "--max-time", "30",
-             "--request", "POST", "--header", f"@/dev/fd/{header_fd}",
-             "--header", "Content-Type: application/json", "--header", "Accept: application/json",
-             "--data-binary", "@-", "--write-out", "\n%{http_code}", JEV_ENDPOINT],
-            input=canonical_json(payload), stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, pass_fds=(header_fd,), timeout=35,
-            check=False,
-            env={key: value for key, value in os.environ.items()
-                 if key not in {"TYPESAFE_API_KEY", "OP_SESSION"}},
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        raise JgError("Jev network error") from None
-    finally:
-        os.close(header_fd)
-        if writer != -1:
-            os.close(writer)
-    if completed.returncode:
-        raise JgError("Jev network error")
-    try:
-        body, status_text = completed.stdout.rsplit(b"\n", 1)
-        status = int(status_text)
-    except (ValueError, TypeError):
-        raise JgError("Jev response framing error") from None
-    if status != 200:
-        raise JgError(f"Jev HTTP error: {status}")
-    try:
-        return json.loads(body)
-    except (ValueError, UnicodeDecodeError):
-        raise JgError("Jev JSON response invalid") from None
+class _TypeSafeTransport:
+    """Reuse one official SDK client for a process and never retry a Jev call."""
+
+    def __init__(self) -> None:
+        self._client = None
+        self._token = None
+
+    def _build_client(self, token: str):
+        from typesafe_sdk import RetryPolicy, TypeSafeClient
+
+        return TypeSafeClient(api_key=token, retry=RetryPolicy(max_retries=0), timeout=30)
+
+    def __call__(self, payload: dict[str, Any], token: str) -> dict[str, Any]:
+        from typesafe_sdk import RetryPolicy
+
+        if not token:
+            raise JgError("Jev credential is unavailable")
+        if self._client is None:
+            self._client = self._build_client(token)
+            self._token = token
+        elif token != self._token:
+            raise JgError("Jev client cannot change credentials during a run")
+
+        sdk_logger = logging.getLogger("typesafe_sdk")
+        was_disabled = sdk_logger.disabled
+        sdk_logger.disabled = True
+        try:
+            response = self._client.system_one(
+                state=payload["state"],
+                questions=payload["questions"],
+                model=payload["model"],
+                retry=RetryPolicy(max_retries=0),
+            )
+            return response.model_dump(mode="json")
+        finally:
+            sdk_logger.disabled = was_disabled
+
+    def close(self) -> None:
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+            self._token = None
+
+
+_default_transport = _TypeSafeTransport()
+atexit.register(_default_transport.close)
 
 
 class _ResponseValidationError(Exception):

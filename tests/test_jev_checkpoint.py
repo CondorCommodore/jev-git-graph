@@ -1,6 +1,5 @@
 import os
 import json
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,7 +8,7 @@ from unittest.mock import patch
 from jev_git_graph.errors import JgError
 from jev_git_graph.jev import (
     JEV_ENDPOINT,
-    _default_transport,
+    _TypeSafeTransport,
     checkpoint_lock,
     estimate_cost,
     execute_preview,
@@ -20,27 +19,25 @@ from jev_git_graph.safety import canonical_json, digest, read_json, write_json
 
 
 class CheckpointTests(unittest.TestCase):
-    def test_default_transport_uses_curl_without_secret_in_argv(self):
-        response = {"model": "jev-latest", "usage": {"input_tokens": 1, "output_tokens": 1},
-                    "answers": {"test": {"noul": .5}}}
-        completed = subprocess.CompletedProcess([], 0, json.dumps(response).encode() + b"\n200")
-        with patch("jev_git_graph.jev.subprocess.run", return_value=completed) as run:
-            result = _default_transport({"state": "sample"}, "secret-test-token")
-        self.assertEqual(result, response)
-        arguments = run.call_args.args[0]
-        self.assertIn("curl", arguments)
-        self.assertNotIn("secret-test-token", " ".join(arguments))
-        self.assertEqual(run.call_args.kwargs["input"], canonical_json({"state": "sample"}))
-        self.assertEqual(len(run.call_args.kwargs["pass_fds"]), 1)
-        self.assertNotIn("TYPESAFE_API_KEY", run.call_args.kwargs["env"])
-        self.assertNotIn("OP_SESSION", run.call_args.kwargs["env"])
-
-    def test_default_transport_does_not_return_provider_error_body(self):
-        completed = subprocess.CompletedProcess([], 0, b'{"secret":"must-not-appear"}\n403')
-        with patch("jev_git_graph.jev.subprocess.run", return_value=completed):
-            with self.assertRaisesRegex(JgError, "Jev HTTP error: 403") as caught:
-                _default_transport({"state": "sample"}, "secret-test-token")
-        self.assertNotIn("must-not-appear", str(caught.exception))
+    def test_default_transport_reuses_one_sdk_client_without_retries(self):
+        response = type("Response", (), {"model_dump": lambda self, **_: {"model": "jev-latest"}})()
+        client = type("Client", (), {
+            "__init__": lambda self: setattr(self, "calls", []),
+            "system_one": lambda self, **kwargs: (self.calls.append(kwargs), response)[1],
+            "close": lambda self: setattr(self, "closed", True),
+        })()
+        transport = _TypeSafeTransport()
+        with patch.object(transport, "_build_client", return_value=client) as build_client:
+            result_a = transport({"state": "a", "questions": {}, "model": "jev-latest"}, "token")
+            result_b = transport({"state": "b", "questions": {}, "model": "jev-latest"}, "token")
+            transport.close()
+        self.assertEqual(result_a, {"model": "jev-latest"})
+        self.assertEqual(result_b, {"model": "jev-latest"})
+        build_client.assert_called_once_with("token")
+        self.assertEqual(len(client.calls), 2)
+        self.assertTrue(all(call["retry"].max_retries == 0 for call in client.calls))
+        self.assertTrue(client.closed)
+        self.assertNotIn("token", repr(client.calls))
 
     def test_metadata_checkpoint_drops_provider_extra_fields(self):
         with tempfile.TemporaryDirectory() as directory:
