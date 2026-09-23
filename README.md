@@ -32,6 +32,24 @@ jg plan --repo /path/to/repository --inventory /path/to/private-artifacts/invent
 
 For committed Python excerpts, create a metadata-only selection JSON with `kind: "jev-code-selection"` and `candidates` keyed by candidate ID. Each entry names pinned `source_tip` and `main_tip` commits and `ranges` containing `path`, `start_line`, and `end_line`. Include `source_ref` and `main_ref` to require the branch labels still point to those commits, or set `snapshot_mode: "pinned_commits"` and omit both refs to compare the fixed snapshot while live branches advance. Run `jg code-relate --repo PATH --candidates CANDIDATES --selection SELECTION` to print the exact request bytes and approval digests to the terminal without saving raw code. A live request repeats that command with `--use-jev --approved-payload-sha256 SHA --approved-batch-sha256 SHA --out PRIVATE_DIR`; it rechecks pinned objects before each send and writes only validated response fields. The default request and byte caps still apply. This advisory snapshot mode does not relax the cleanup executor's live-ref checks.
 
+### Fixed contribution snapshots (local only)
+
+The first Revision 2 build preserves an independent Git object store and creates
+metadata-only contribution and context-group artifacts:
+
+```bash
+jg snapshot --repo PATH --inventory PRIVATE_DIR/inventory.json --out PRIVATE_DIR/snapshot
+jg contributions --repo PATH --snapshot PRIVATE_DIR/snapshot/snapshot.json --out PRIVATE_DIR/contributions.json
+jg groups --repo PATH --contributions PRIVATE_DIR/contributions.json --out PRIVATE_DIR/groups
+```
+
+Use an owner-only parent directory and a new snapshot output path. Branches with
+activity in the last 24 hours, or unverifiable activity, are excluded. Later main
+movement does not invalidate this advisory snapshot. Groups report omitted
+relationships and cross-group boundaries; they cannot authorize deletion.
+Grouped Jev requests, two-sided excerpt previews, and the blinded control
+experiment remain planned and are not enabled by these commands.
+
 ### Large, active repositories
 
 Use a private artifact directory outside every inspected worktree. For a local Home Lab pilot on a MacBook:
