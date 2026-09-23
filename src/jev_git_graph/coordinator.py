@@ -14,6 +14,7 @@ import fcntl
 import hashlib
 import json
 import os
+import subprocess
 import threading
 import time
 from contextlib import contextmanager
@@ -124,12 +125,14 @@ class CooperativeBranchLeaseAdapter:
 
     contract = COOPERATIVE_LEASE_CONTRACT
 
-    def __init__(self, repository_id: str, lease_dir: str | Path, *,
+    def __init__(self, repository_id: str, lease_dir: str | Path | None = None, *,
                  lock_timeout: float = 0.0):
         if not repository_id:
             raise JgError("cooperative lease requires repository identity")
         self.repository_id = repository_id
-        self.lease_dir = Path(lease_dir).expanduser().resolve(strict=False)
+        configured_root = lease_dir or os.environ.get("JEV_BRANCH_LEASE_DIR")
+        self.lease_dir = Path(configured_root or Path.home() / ".local" / "state" /
+                              "jev-git-graph" / "branch-leases").expanduser().resolve(strict=False)
         self.lease_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         if self.lease_dir.stat().st_mode & 0o077:
             raise JgError("cooperative lease directory must be owner-only")
@@ -138,6 +141,25 @@ class CooperativeBranchLeaseAdapter:
         self._held: dict[str, tuple[int, int]] = {}
         self._thread_locks: dict[str, threading.RLock] = {}
         self._thread_locks_guard = threading.Lock()
+        self.common_dir: Path | None = None
+
+    @classmethod
+    def for_repository(cls, repository: str | Path, *, lock_timeout: float = 0.0) -> "CooperativeBranchLeaseAdapter":
+        """Bind to Git's canonical common directory and shared Home Lab lock root.
+
+        The constructor computes lock identity itself so an opaque artifact ID
+        or linked-checkout path cannot silently miss a creator's branch lock.
+        """
+        cp = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            capture_output=True, text=True, check=False, timeout=15,
+        )
+        if cp.returncode or not cp.stdout.strip():
+            raise JgError("cannot resolve canonical Git common directory for cooperative lease")
+        common_dir = Path(cp.stdout.strip()).resolve(strict=True)
+        adapter = cls(str(common_dir), lock_timeout=lock_timeout)
+        adapter.common_dir = common_dir
+        return adapter
 
     @property
     def creator_participants(self) -> frozenset[str]:

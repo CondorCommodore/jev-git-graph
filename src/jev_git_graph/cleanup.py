@@ -373,10 +373,21 @@ def write_cleanup_plan(repo: str | Path, coverage_path: str | Path, out: str | P
     return path
 
 
-def _lease_established(contract: Any) -> bool:
+def _lease_established(contract: Any, repository: Path | None = None) -> bool:
     if not CREATOR_LEASE_INTEGRATED:
         return False
     if not isinstance(contract, CooperativeBranchLeaseAdapter):
+        return False
+    if repository is None or contract.common_dir is None:
+        return False
+    try:
+        resolved = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            capture_output=True, text=True, check=False, timeout=15,
+        )
+        if resolved.returncode or Path(resolved.stdout.strip()).resolve(strict=True) != contract.common_dir:
+            return False
+    except (OSError, subprocess.SubprocessError):
         return False
     if not contract.creator_participation_complete:
         return False
@@ -515,7 +526,7 @@ def execute_cleanup(repo: str | Path, plan: Mapping[str, Any] | str | Path,
     if (loaded.get("manifest_approved") is not True
             or bundle.get("manifest_approved") is not True):
         raise JgError("cleanup plan manifest is not approved")
-    if not _lease_established(lease_contract):
+    if not _lease_established(lease_contract, root):
         return {"kind": "cleanup-execution", "plan_digest": expected,
                 "deletion_ready": False, "mode": "deletion-ready-plan-only",
                 "deleted": [], "stopped": "cooperative_lease_unestablished",

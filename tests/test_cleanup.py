@@ -56,10 +56,8 @@ def build_old_plan(*args, **kwargs):
 
 
 class CleanupTests(unittest.TestCase):
-    def integrated_lease(self, directory: Path) -> CooperativeBranchLeaseAdapter:
-        lease = CooperativeBranchLeaseAdapter(
-            "synthetic-repository", directory / "branch-leases",
-        )
+    def integrated_lease(self, repository: Path) -> CooperativeBranchLeaseAdapter:
+        lease = CooperativeBranchLeaseAdapter.for_repository(repository)
         for creator_id in REQUIRED_HOME_LAB_CREATORS:
             lease.register_creator(creator_id)
         self.assertTrue(lease.creator_participation_complete)
@@ -166,7 +164,7 @@ class CleanupTests(unittest.TestCase):
             plan = build_old_plan(repo, coverage, bundle_dir=root / "bundle")
             approved = approve_cleanup_plan(plan, approved_digest=plan["plan_digest"])
             journal_path = root / "actions.jsonl"
-            lease = self.integrated_lease(root)
+            lease = self.integrated_lease(repo)
             with patch("jev_git_graph.cleanup.CREATOR_LEASE_INTEGRATED", True), \
                  patch("jev_git_graph.cleanup._live_reproof", return_value=None):
                 result = execute_cleanup(
@@ -200,7 +198,7 @@ class CleanupTests(unittest.TestCase):
                 "bundle_sha256": approved["bundle"]["sha256"],
             })
             run(repo, "update-ref", "-d", "refs/heads/topic", topic_tip)
-            lease = self.integrated_lease(root)
+            lease = self.integrated_lease(repo)
             results = reconcile_interrupted_cleanup(repo, approved, journal, lease)
             restored_tip = run(repo, "rev-parse", "refs/heads/topic")
             events = journal.read_events()
@@ -229,7 +227,7 @@ class CleanupTests(unittest.TestCase):
                 "bundle_sha256": approved["bundle"]["sha256"],
             })
             run(repo, "branch", "--force", "topic", main_tip)
-            lease = self.integrated_lease(root)
+            lease = self.integrated_lease(repo)
             results = reconcile_interrupted_cleanup(repo, approved, journal, lease)
             current_tip = run(repo, "rev-parse", "refs/heads/topic")
         self.assertEqual("source_recreated_or_moved", results[0]["status"])
@@ -251,7 +249,7 @@ class CleanupTests(unittest.TestCase):
             plan = build_old_plan(repo, coverage, bundle_dir=Path(out))
             plan = approve_cleanup_plan(plan, approved_digest=plan["plan_digest"])
             releases = []
-            lease = self.integrated_lease(Path(out))
+            lease = self.integrated_lease(repo)
             original_release = lease.release
             lease.release = lambda name, tip: releases.append((name, tip)) or original_release(name, tip)
             with patch("jev_git_graph.cleanup._live_reproof", return_value=None), \
@@ -288,7 +286,7 @@ class CleanupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as out:
             plan = build_old_plan(repo, coverage, bundle_dir=Path(out))
             approved = approve_cleanup_plan(plan, approved_digest=plan["plan_digest"])
-            lease = self.integrated_lease(Path(out))
+            lease = self.integrated_lease(repo)
             original_release = lease.release
             lease.release = lambda name, tip: (original_release(name, tip), False)[1]
             with patch("jev_git_graph.cleanup.CREATOR_LEASE_INTEGRATED", True), \
