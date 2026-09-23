@@ -29,7 +29,8 @@ from .snapshot import load_snapshot, write_snapshot
 from .contributions import write_contributions
 from .groups import write_groups
 from .outcomes import write_outcomes
-from .study import build_selected_study, write_selected_study_artifacts, write_study
+from .study import (build_selected_study, validate_selected_range_manifest,
+                    write_selected_study_artifacts, write_study)
 from .snapshot import load_snapshot
 from .transient_preview import serve_presence_preview
 
@@ -81,14 +82,7 @@ def _build_group_presence_preview(args):
             raise JgError("study cases must have unique contribution IDs")
         selection_digest = study["study_digest"]
         if study.get("selection_policy") == "explicit-validated-case-list-v1":
-            expected_arms = {case["contribution_id"]: case.get("selection_arm") for case in cases}
-            if range_manifest.get("selection_digest") != study.get("selection_manifest_digest"):
-                raise JgError("explicit study and evidence ranges do not share the selection manifest digest")
-            range_items = range_manifest["ranges"]
-            range_arms = {item.get("contribution_id"): item.get("arm")
-                          for item in range_items if isinstance(item, dict)}
-            if len(range_arms) != len(range_items) or range_arms != expected_arms:
-                raise JgError("explicit study and evidence range arms do not match")
+            validate_selected_range_manifest(study, range_manifest)
     model_settings = read_json(args.model_settings) if args.model_settings else None
     units = {unit["id"]: unit for unit in contributions.get("units", [])}
     evidence_by_contribution = {}

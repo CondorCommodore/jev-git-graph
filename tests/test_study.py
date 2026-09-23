@@ -3,7 +3,8 @@ import pytest
 from jev_git_graph.groups import build_groups
 from jev_git_graph.errors import JgError
 from jev_git_graph.safety import digest
-from jev_git_graph.study import build_selected_study, build_study
+from jev_git_graph.study import (build_selected_study, build_study,
+                                 validate_selected_range_manifest)
 
 
 def _artifact(complete_count=20, total=32):
@@ -119,7 +120,18 @@ def test_explicit_selection_keeps_source_only_case_unknown_and_binds_pins():
     assert study["cases"][-1]["dependency_context_status"] == "unknown"
     assert study["cases"][-1]["destination_candidates"] == []
     assert ranges["ranges"][-1]["ranges"][0].get("destination_path") is None
+    assert study["evidence_ranges_digest"] == digest(ranges["ranges"])
+    validate_selected_range_manifest(study, ranges)
     assert study["context_stratum_counts"]["uncertainty_dependency_or_destination_context"] == 1
+
+
+def test_explicit_study_rejects_rewritten_line_ranges():
+    contributions, groups, selection = _explicit_selection_fixture()
+    study, ranges = build_selected_study(contributions, groups, selection)
+    ranges["ranges"][0]["ranges"][0]["source_range"]["start_line"] += 1
+
+    with pytest.raises(JgError, match="pinned range manifest"):
+        validate_selected_range_manifest(study, ranges)
 
 
 def test_explicit_selection_rejects_source_only_case_with_a_destination_claim():

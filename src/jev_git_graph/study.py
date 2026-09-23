@@ -291,13 +291,36 @@ def build_selected_study(contributions: dict, groups: dict, selection: dict) -> 
         "selection_uses_model_answers": False, "provider_dispatch_approved": False,
         "expansion_gate": "UNMEASURED", "split_policy": "Keep entire families together; label before viewing model answers",
     }
+    evidence_ranges_digest = digest(normalized_ranges)
+    result["evidence_ranges_digest"] = evidence_ranges_digest
     result["study_digest"] = digest(result)
     range_manifest = {"kind": "branch-presence-range-manifest", "schema_version": 1,
                       "snapshot_digest": result["snapshot_digest"],
                       "contributions_digest": result["contributions_digest"],
                       "groups_digest": result["groups_digest"], "selection_digest": selection_digest,
+                      "evidence_ranges_digest": evidence_ranges_digest,
                       "ranges": normalized_ranges}
     return result, range_manifest
+
+
+def validate_selected_range_manifest(study: dict, range_manifest: dict) -> None:
+    """Require the exact normalized line ranges selected for this study."""
+    if study.get("selection_policy") != "explicit-validated-case-list-v1":
+        return
+    ranges = range_manifest.get("ranges")
+    cases = study.get("cases")
+    if (range_manifest.get("selection_digest") != study.get("selection_manifest_digest")
+            or not isinstance(ranges, list)
+            or digest(ranges) != study.get("evidence_ranges_digest")
+            or range_manifest.get("evidence_ranges_digest") != study.get("evidence_ranges_digest")
+            or not isinstance(cases, list)):
+        raise JgError("explicit study and evidence ranges do not share the pinned range manifest")
+    expected_arms = {case.get("contribution_id"): case.get("selection_arm")
+                     for case in cases if isinstance(case, dict)}
+    range_arms = {item.get("contribution_id"): item.get("arm")
+                  for item in ranges if isinstance(item, dict)}
+    if len(expected_arms) != len(cases) or len(range_arms) != len(ranges) or range_arms != expected_arms:
+        raise JgError("explicit study and evidence range arms do not match")
 
 
 def write_study(contributions_path: str, groups_path: str, out: str | Path,
