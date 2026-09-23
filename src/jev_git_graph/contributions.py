@@ -34,7 +34,7 @@ def _oid(value: Any) -> str:
 
 
 def _tree_entry(repo: Path, treeish: str, path: str) -> dict[str, str] | None:
-    raw = _git(repo, "ls-tree", "-z", treeish, "--", path)
+    raw = _git(repo, "ls-tree", "-z", treeish, "--", f":(literal){path}")
     if not raw:
         return None
     record = raw.rstrip(b"\0").split(b"\t", 1)

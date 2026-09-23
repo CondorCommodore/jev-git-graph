@@ -17,6 +17,7 @@ class SnapshotCliTests(unittest.TestCase):
             repo, _, _, _ = make_repo(root)
             git(repo, 'switch', 'topic')
             (repo / 'broken.py').write_text('def broken(:\n')
+            (repo / ':(glob)x.py').write_text('VALUE = 1\n')
             git(repo, 'add', '.')
             git(repo, 'commit', '-qm', 'unparsed Python')
             git(repo, 'branch', 'topic-alias')
@@ -29,7 +30,7 @@ class SnapshotCliTests(unittest.TestCase):
             contributions = call('contributions', '--repo', str(repo), '--snapshot', str(snap), '--out', str(root / 'contributions.json'))
             groups = call('groups', '--repo', str(repo), '--contributions', str(contributions), '--out', str(root / 'groups'))
             artifact = json.loads(groups.read_text())
-            self.assertEqual(artifact['coverage']['grouped_source_units'], 4)
+            self.assertEqual(artifact['coverage']['grouped_source_units'], 6)
             self.assertTrue(all(not group['context_complete'] for group in artifact['groups']))
 
     def test_chain_uses_fixed_objects_and_writes_no_source_files(self):
