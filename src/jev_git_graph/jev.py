@@ -316,6 +316,8 @@ def _default_transport(payload: dict[str, Any], token: str) -> dict[str, Any]:
             input=canonical_json(payload), stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, pass_fds=(header_fd,), timeout=35,
             check=False,
+            env={key: value for key, value in os.environ.items()
+                 if key not in {"TYPESAFE_API_KEY", "OP_SESSION"}},
         )
     except (OSError, subprocess.TimeoutExpired):
         raise JgError("Jev network error") from None
