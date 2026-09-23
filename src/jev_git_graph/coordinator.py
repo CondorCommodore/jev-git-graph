@@ -14,11 +14,15 @@ import fcntl
 import hashlib
 import json
 import os
+import plistlib
+import re
+import shlex
 import subprocess
 import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
@@ -32,12 +36,63 @@ REQUIRED_HOME_LAB_CREATORS = frozenset({
     "scripts/bootstrap-worktree.sh",
     "scripts/new-worktree.sh",
     "scripts/overnight-codex-backlog-round.sh::prepare_lane_workspace",
-    "scripts/ahc_app/coord_wake.py::ensure_runtime_worktree",
-    "scripts/process-safe-prs.sh",
-    "scripts/pr_gate/guard_execution.py",
-    "scripts/merge_train_parts/prescreen.py",
-    "scripts/train_construction_driver.py",
+    "scripts/ahc_app/coord_wake.py::ensure_coord_wake_worktree",
+    "scripts/merge_train_parts/prescreen.py::run_prescreen",
+    "scripts/merge_train_parts/local_guard_verdict.py",
+    "scripts/pr_gate/guard_execution.py::_run_guard_suite_in_worktree",
+    "scripts/merge_train_parts/candidate_lifecycle.py::construct_candidate_head",
+    "scripts/merge_train_parts/verdict_lifecycle.py",
+    "scripts/train_builder.py::construct_train",
+    "scripts/l1_drain/self_reported.py",
+    "scripts/l1_drain/workspace.py::create_worktree",
+    "scripts/pr_repair_loop.py::repair_workspace",
+    "scripts/deploy_sync.py",
+    "scripts/forge-coord-deploy.sh",
 })
+
+# Exact physical files from the reviewed Home Lab lease-hook integration.
+# Installed runtime metadata and caller-provided creator lists never replace
+# these code-owned expected hashes.
+_REVIEWED_HOOK_FILES = {
+    "scripts/cooperative_branch_lease.py": "aada6ce9ad4905b3e49c317d0b49ee587f8486973c6a6aa3b034829a846cac43",
+    "scripts/bootstrap-worktree.sh": "c63745dae3652141ac7687a54aa03bf997de145c018a0460a6952100da928664",
+    "scripts/new-worktree.sh": "ee28b1e34af1638f6c39948c39248a3015c9ed2f3a6f9cc0b87172247b4a10c5",
+    "scripts/overnight-codex-backlog-round.sh": "e188e7415c68ca318a298c704cc87b710404ed912d781b79b85ea3000e64dddd",
+    "scripts/ahc_app/coord_wake.py": "616203361a9f4323ab85629165cde1fbd683a75bfdf608b2d24a8b136736cffb",
+    "scripts/merge_train_parts/prescreen.py": "bccecab240f597abd0ab6485afa0586e003f7dc11082352a3ec2eea33eee25e9",
+    "scripts/merge_train_parts/local_guard_verdict.py": "fc36b0b3544acfd2a43871eb829b4479d3019b765a4e7ad29e5f12686f5319bf",
+    "scripts/pr_gate/guard_execution.py": "91dba3571398639d0456a72eae929377b483bab8d376db3daf7c079fcd5b3c7c",
+    "scripts/merge_train_parts/candidate_lifecycle.py": "c35db21b44c0d9024b68f802c46f13c9c3e70e0a5ead3eabd45a8c3240d1450e",
+    "scripts/merge_train_parts/verdict_lifecycle.py": "e20f1f5ecba03e84be97fd3ae88f5b687e39738ec5f3ef96d9bdc8e7be5eb782",
+    "scripts/train_builder.py": "289c985aaf9d8b9b00f3934ba767eee9114773240ec67a44207d74625d8ab367",
+    "scripts/l1_drain/self_reported.py": "662d9cbcd86fc021dad1612347e10a9f23f4456e8d482ca3362419ef63e69fae",
+    "scripts/l1_drain/workspace.py": "5aecacb06b3322cc64dc729227d45508eb4ffff7cd0504bcf6f46bce20795b70",
+    "scripts/pr_repair_loop.py": "c4275a0a2988fcd5737e394f3083a10e87eb52178df48ec7edbe00b8c51d36f0",
+    "scripts/deploy_sync.py": "bb54d9ede1a318951c109b8453c7ace28accc9f38867b3272c4e0891b67ec84d",
+    "scripts/forge-coord-deploy.sh": "5ac70ff08333e3d224bbd4d63e10297a3eb1b524ab8f3ba5646ea5e799c36620",
+}
+_RUNTIME_SELECTORS = (
+    "code/.runtime/releases/home-lab/stable",
+    "code/.runtime/home-lab",
+    "code/home-lab",
+)
+_LOCK_ROOT_SUFFIX = Path(".local/state/jev-git-graph/branch-leases")
+_REQUIRED_LAUNCHD_SELECTORS = {
+    "com.mikebook.all-health-controller": "code/.runtime/releases/home-lab/stable",
+    "com.mikebook.all-health-coord-wake-consumer": "code/.runtime/releases/home-lab/stable",
+    "com.mikebook.merge-safe-prs-loop": "code/.runtime/releases/home-lab/stable",
+    "com.mikebook.deploy-sync": "code/.runtime/home-lab",
+    "com.mikebook.pr-convergence-wake-consumer": "code/.runtime/releases/home-lab/stable",
+    "com.mikebook.pr-convergence-wake-producer": "code/.runtime/releases/home-lab/stable",
+    "com.mikebook.wip-convergence-loop": "code/.runtime/releases/home-lab/stable",
+    "com.mikebook.train-construction": "code/home-lab",
+    "com.mikebook.pr-repair-loop": "code/home-lab",
+    "com.condor.autonomy-drain-loop.codex": "code/home-lab",
+    "com.condor.autonomy-drain-loop.claude": "code/home-lab",
+    "com.tradeengine.coord-wake-codex": "code/home-lab",
+    "com.mikebook.ahc-inventory-alarm": "code/.runtime/home-lab",
+}
+DISPOSABLE_FIXTURE_ROOT = Path.home() / ".local/state/jev-git-graph/disposable-fixtures"
 
 
 def _utc_now() -> str:
@@ -46,6 +101,310 @@ def _utc_now() -> str:
 
 def _branch_key(repository_id: str, branch: str) -> str:
     return hashlib.sha256(f"{repository_id}\0{branch}".encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class CreatorLeaseCapability:
+    """Ephemeral production capability derived from installed reviewed files."""
+
+    common_dir: Path
+    runtime_roots: tuple[Path, ...]
+    hook_digests: tuple[tuple[str, str, str], ...]
+    loaded_runtime_jobs: tuple[tuple[str, str, str], ...]
+    lock_root: Path
+    scope: str = "production"
+
+
+@dataclass(frozen=True)
+class DisposableFixtureLeaseCapability:
+    """Explicit, repository-bound no-automation contract for disposable fixtures."""
+
+    common_dir: Path
+    lock_root: Path
+    branches: tuple[str, ...]
+    branch_tips: tuple[tuple[str, str], ...]
+    operator: str
+    fixture_root: Path
+    scope: str = "disposable_fixture"
+
+    def is_current(self, repository: str | Path) -> bool:
+        try:
+            inventory = build_disposable_fixture_inventory(
+                repository, list(self.branches), operator=self.operator,
+                fixture_root=self.fixture_root, recorded_tips=dict(self.branch_tips))
+            return (Path(inventory["common_dir"]) == self.common_dir
+                    and self.lock_root == _fixed_lock_root())
+        except (JgError, OSError):
+            return False
+
+
+def production_capability_is_current(capability: CreatorLeaseCapability,
+                                     repository: str | Path) -> bool:
+    try:
+        current = resolve_production_creator_capability(repository)
+        return current == capability
+    except (JgError, OSError):
+        return False
+
+
+def _common_dir(repository: str | Path) -> Path:
+    cp = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        capture_output=True, text=True, check=False, timeout=15,
+    )
+    if cp.returncode or not cp.stdout.strip():
+        raise JgError("cannot resolve canonical Git common directory for cooperative lease")
+    return Path(cp.stdout.strip()).resolve(strict=True)
+
+
+def _fixed_lock_root() -> Path:
+    expected = (Path.home() / _LOCK_ROOT_SUFFIX).resolve(strict=False)
+    override = os.environ.get("JEV_BRANCH_LEASE_DIR")
+    if override and Path(override).expanduser().resolve(strict=False) != expected:
+        raise JgError("cooperative lease lock root differs from the reviewed shared protocol")
+    return expected
+
+
+def default_cleanup_journal_path(common_dir: Path) -> Path:
+    key = hashlib.sha256(str(common_dir.resolve()).encode()).hexdigest()
+    return Path.home() / ".local/state/jev-git-graph/cleanup-journals" / f"{key}.jsonl"
+
+
+def _runtime_selector_targets(home: Path | None = None) -> tuple[Path, ...]:
+    base = (home or Path.home()).resolve()
+    targets: list[Path] = []
+    for selector in _RUNTIME_SELECTORS:
+        path = (base / selector)
+        if selector.endswith("/stable") and not path.is_symlink():
+            raise JgError("stable Home Lab runtime selector must be a release symlink")
+        if path.is_symlink() and selector.endswith("/stable"):
+            target = path.resolve(strict=True)
+            metadata_path = target / "release-metadata.json"
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise JgError("stable Home Lab runtime release metadata is unavailable") from exc
+            release_sha = metadata.get("release_sha") if isinstance(metadata, dict) else None
+            release_path = metadata.get("release_path") if isinstance(metadata, dict) else None
+            if (release_sha != target.name or Path(str(release_path)).resolve(strict=False) != target
+                    or target.parent.resolve() != (base / "code/.runtime/releases/home-lab").resolve()):
+                raise JgError("stable Home Lab runtime selector does not match its release metadata")
+        else:
+            target = path.resolve(strict=True)
+        if not target.is_dir():
+            raise JgError(f"Home Lab runtime selector is not a directory: {selector}")
+        targets.append(target)
+    if len(set(targets)) != len(_RUNTIME_SELECTORS):
+        raise JgError("Home Lab runtime selectors resolve to duplicate trees")
+    return tuple(targets)
+
+
+def _verify_runtime_hook_files(runtime_root: Path) -> tuple[tuple[str, str, str], ...]:
+    records: list[tuple[str, str, str]] = []
+    for relative, expected_sha in sorted(_REVIEWED_HOOK_FILES.items()):
+        path = runtime_root / relative
+        if path.is_symlink() or not path.is_file():
+            raise JgError(f"creator runtime hook file missing or symlinked: {relative}")
+        try:
+            actual_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError as exc:
+            raise JgError(f"creator runtime hook file unreadable: {relative}") from exc
+        if actual_sha != expected_sha:
+            raise JgError(f"creator runtime hook digest mismatch: {relative}")
+        records.append((str(runtime_root), relative, actual_sha))
+    helper = (runtime_root / "scripts/cooperative_branch_lease.py").read_text(encoding="utf-8")
+    if f'CONTRACT = "{COOPERATIVE_LEASE_CONTRACT}"' not in helper:
+        raise JgError("creator runtime helper contract does not match Jev")
+    return tuple(records)
+
+
+def _verify_loaded_runtime_jobs(home: Path, runtime_roots: tuple[Path, ...]) -> tuple[tuple[str, str, str], ...]:
+    """Verify configured launchd entrypoints and their currently loaded processes."""
+    expected_roots = {selector: root for selector, root in zip(_RUNTIME_SELECTORS, runtime_roots)}
+    jobs: list[tuple[str, str, str]] = []
+    uid = os.getuid()
+    for label, selector in sorted(_REQUIRED_LAUNCHD_SELECTORS.items()):
+        plist_path = home / "Library/LaunchAgents" / f"{label}.plist"
+        if plist_path.is_symlink() or not plist_path.is_file():
+            raise JgError(f"creator runtime launchd entrypoint missing: {label}")
+        try:
+            with plist_path.open("rb") as stream:
+                plist = plistlib.load(stream)
+        except (OSError, plistlib.InvalidFileException) as exc:
+            raise JgError(f"creator runtime launchd entrypoint unreadable: {label}") from exc
+        root = expected_roots[selector]
+        args = plist.get("ProgramArguments")
+        wd = plist.get("WorkingDirectory")
+        def under_root(value: Any) -> bool:
+            if not isinstance(value, str) or not Path(value).is_absolute():
+                return False
+            try:
+                Path(value).resolve(strict=False).relative_to(root)
+                return True
+            except ValueError:
+                return False
+        if (plist.get("Label") != label or not isinstance(args, list)
+                or not any(under_root(arg) for arg in args)
+                or (isinstance(wd, str) and ".runtime/" in wd and Path(wd).resolve(strict=False) != root)):
+            raise JgError(f"creator runtime launchd entrypoint targets an unverified tree: {label}")
+        check = subprocess.run(["launchctl", "print", f"gui/{uid}/{label}"],
+                               capture_output=True, text=True, check=False, timeout=10)
+        if check.returncode or f"path = {plist_path}" not in check.stdout:
+            raise JgError(f"creator runtime launchd job is not loaded from the reviewed plist: {label}")
+        pid = None
+        for line in check.stdout.splitlines():
+            match = re.match(r"\s*pid = ([0-9]+)\s*$", line)
+            if match:
+                pid = int(match.group(1))
+                break
+        if pid is not None:
+            process = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                                     capture_output=True, text=True, check=False, timeout=5)
+            cwd_result = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                                        capture_output=True, text=True, check=False, timeout=5)
+            cwd = next((line[1:] for line in cwd_result.stdout.splitlines()
+                        if line.startswith("n/") and cwd_result.returncode == 0), None)
+            cwd_path = Path(cwd).resolve(strict=False) if cwd else None
+            argv = shlex.split(process.stdout) if process.returncode == 0 else []
+            executable_evidence = False
+            for token in argv:
+                token_path = Path(token)
+                candidate = token_path if token_path.is_absolute() else ((cwd_path / token_path) if cwd_path else Path("/nonexistent"))
+                if candidate.is_file() and under_root(str(candidate)):
+                    executable_evidence = True
+                    break
+            if (not cwd_path or not under_root(str(cwd_path)) or not executable_evidence):
+                raise JgError(f"runtime_adoption_unverified: creator process is not running from the reviewed tree: {label}")
+        jobs.append((label, str(plist_path.resolve()), str(root)))
+    return tuple(jobs)
+
+
+def resolve_production_creator_capability(repository: str | Path) -> CreatorLeaseCapability:
+    """Derive production readiness from both configured installed runtime trees.
+
+    No serialized attestation or in-memory creator registration is authoritative.
+    Every execute attempt calls this resolver again, so symlink/release drift fails
+    closed before another branch lease is acquired.
+    """
+    common_dir = _common_dir(repository)
+    lock_root = _fixed_lock_root()
+    runtime_roots = _runtime_selector_targets()
+    canonical = (Path.home() / "code/home-lab").resolve(strict=True)
+    if canonical != runtime_roots[-1]:
+        raise JgError("canonical_creator_unverified: Home Lab source selector changed")
+    try:
+        digests = tuple(record for root in runtime_roots
+                        for record in _verify_runtime_hook_files(root))
+    except JgError as exc:
+        if runtime_roots[-1] in str(exc) or "hook digest mismatch" in str(exc):
+            raise JgError("canonical_creator_unverified: canonical Home Lab source does not match reviewed hooks") from exc
+        raise
+    jobs = _verify_loaded_runtime_jobs(Path.home(), runtime_roots)
+    return CreatorLeaseCapability(common_dir, runtime_roots, digests, jobs, lock_root)
+
+
+def build_disposable_fixture_inventory(repository: str | Path, branches: list[str],
+                                       *, operator: str,
+                                       fixture_root: str | Path | None = None,
+                                       recorded_tips: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """Create an explicit, non-production inventory under a controlled fixture root.
+
+    ``fixture_root`` exists for hermetic tests. Production CLI resolution always
+    uses the fixed per-user state directory and cannot be redirected by JSON.
+    """
+    common_dir = _common_dir(repository)
+    root = Path(fixture_root).expanduser().resolve(strict=True) if fixture_root else DISPOSABLE_FIXTURE_ROOT.resolve(strict=False)
+    top_result = subprocess.run(["git", "-C", str(repository), "rev-parse", "--show-toplevel"],
+                                capture_output=True, text=True, check=False, timeout=10)
+    if top_result.returncode:
+        raise JgError("cannot resolve disposable fixture worktree")
+    top_path = Path(top_result.stdout.strip()).resolve(strict=True)
+    try:
+        top_path.relative_to(root)
+    except ValueError as exc:
+        raise JgError("disposable fixture repository is outside the controlled fixture root") from exc
+    if root.is_symlink():
+        raise JgError("disposable fixture root must not be a symlink")
+    if not root.is_dir() or root.stat().st_mode & 0o077:
+        raise JgError("disposable fixture root must be an existing owner-only directory")
+    if not operator.strip() or len(set(branches)) != len(branches):
+        raise JgError("fixture inventory requires an operator and a finite unique branch list")
+    remotes = subprocess.run(["git", "-C", str(repository), "remote"],
+                             capture_output=True, text=True, check=False, timeout=10)
+    worktrees = subprocess.run(["git", "-C", str(repository), "worktree", "list", "--porcelain"],
+                               capture_output=True, text=True, check=False, timeout=10)
+    if remotes.returncode or remotes.stdout.strip():
+        raise JgError("disposable fixture must have no configured remotes")
+    hooks = subprocess.run(["git", "-C", str(repository), "config", "--show-origin", "--get", "core.hooksPath"],
+                           capture_output=True, text=True, check=False, timeout=10)
+    includes = subprocess.run(["git", "-C", str(repository), "config", "--show-origin", "--get-regexp",
+                              r"^include(\..*)?\.path$"],
+                             capture_output=True, text=True, check=False, timeout=10)
+    if hooks.returncode == 0 or includes.returncode == 0:
+        raise JgError("disposable fixture has externally configured Git hooks or config includes")
+    if worktrees.returncode:
+        raise JgError("cannot verify disposable fixture worktree inventory")
+    registered = [Path(line[9:]).resolve(strict=False) for line in worktrees.stdout.splitlines()
+                  if line.startswith("worktree ")]
+    if registered != [top_path]:
+        raise JgError("disposable fixture must have exactly one registered worktree")
+    hooks_dir = common_dir / "hooks"
+    if hooks_dir.exists() and any(path.is_file() and os.access(path, os.X_OK)
+                                  and not path.name.endswith(".sample") for path in hooks_dir.iterdir()):
+        raise JgError("disposable fixture has an executable repository hook")
+    tips: dict[str, str] = {}
+    for branch in sorted(branches):
+        if not branch or branch.startswith("-"):
+            raise JgError("disposable fixture branch list is invalid")
+        valid = subprocess.run(["git", "check-ref-format", "--branch", branch],
+                               capture_output=True, text=True, check=False, timeout=10)
+        if valid.returncode:
+            raise JgError("disposable fixture branch list is invalid")
+        tip = subprocess.run(["git", "-C", str(repository), "rev-parse", "--verify", f"refs/heads/{branch}"],
+                             capture_output=True, text=True, check=False, timeout=10)
+        if tip.returncode:
+            if not recorded_tips or branch not in recorded_tips:
+                raise JgError("disposable fixture branch is missing")
+            exists = subprocess.run(["git", "-C", str(repository), "show-ref", "--verify", "--quiet",
+                                     f"refs/heads/{branch}"], check=False, timeout=10)
+            if exists.returncode != 1:
+                raise JgError("disposable fixture branch lookup failed")
+            tips[branch] = recorded_tips[branch]
+        else:
+            tips[branch] = tip.stdout.strip()
+    return {"kind": "jev-disposable-cleanup-fixture", "schema_version": 1,
+            "common_dir": str(common_dir), "scope": "disposable_fixture",
+            "fixture_root": str(root), "worktree": str(top_path),
+            "no_known_automation": True, "creators": [], "branches": sorted(branches),
+            "branch_tips": tips, "operator": operator.strip(),
+            "contract": COOPERATIVE_LEASE_CONTRACT}
+
+
+def resolve_disposable_fixture_capability(repository: str | Path,
+                                          inventory: Mapping[str, Any],
+                                          expected_branches: list[str], *,
+                                          fixture_root: str | Path | None = None) -> DisposableFixtureLeaseCapability:
+    """Validate explicit no-creator fixture evidence; never production authority."""
+    common_dir = _common_dir(repository)
+    root = Path(fixture_root).resolve(strict=True) if fixture_root else DISPOSABLE_FIXTURE_ROOT.resolve(strict=False)
+    if inventory.get("fixture_root") != str(root):
+        raise JgError("disposable fixture inventory is outside the controlled fixture root")
+    recorded = inventory.get("branch_tips")
+    if (not isinstance(recorded, dict)
+            or set(recorded) != set(expected_branches)
+            or any(not isinstance(tip, str) or not re.fullmatch(r"[0-9a-f]{40,64}", tip)
+                   for tip in recorded.values())):
+        raise JgError("disposable fixture inventory has invalid pinned branch tips")
+    expected = build_disposable_fixture_inventory(repository, expected_branches,
+                                                  operator=str(inventory.get("operator", "")),
+                                                  fixture_root=root,
+                                                  recorded_tips=inventory.get("branch_tips"))
+    if dict(inventory) != expected or inventory.get("common_dir") != str(common_dir):
+        raise JgError("disposable fixture inventory does not match the live repository scope")
+    return DisposableFixtureLeaseCapability(common_dir, _fixed_lock_root(),
+                                             tuple(expected_branches),
+                                             tuple(sorted((str(k), str(v)) for k, v in inventory["branch_tips"].items())),
+                                             str(inventory["operator"]), root)
 
 
 class CleanupActionJournal:
@@ -117,19 +476,19 @@ class CleanupActionJournal:
 class CooperativeBranchLeaseAdapter:
     """Cross-process per-branch advisory lock shared by creators and cleanup.
 
-    The adapter only becomes deletion-ready when every reviewed Home Lab
-    creator has registered. Creator integrations register once during startup,
-    then acquire ``creator_operation`` before their first ref/worktree mutation
-    and retain it until publication is complete.
+    Production readiness comes only from revalidated installed hook digests;
+    manually registered IDs are diagnostic and never grant deletion authority.
     """
 
     contract = COOPERATIVE_LEASE_CONTRACT
 
     def __init__(self, repository_id: str, lease_dir: str | Path | None = None, *,
-                 lock_timeout: float = 0.0):
+                 lock_timeout: float = 0.0,
+                 capability: CreatorLeaseCapability | DisposableFixtureLeaseCapability | None = None):
         if not repository_id:
             raise JgError("cooperative lease requires repository identity")
         self.repository_id = repository_id
+        self.capability = capability
         configured_root = lease_dir or os.environ.get("JEV_BRANCH_LEASE_DIR")
         self.lease_dir = Path(configured_root or Path.home() / ".local" / "state" /
                               "jev-git-graph" / "branch-leases").expanduser().resolve(strict=False)
@@ -161,16 +520,37 @@ class CooperativeBranchLeaseAdapter:
         adapter.common_dir = common_dir
         return adapter
 
+    @classmethod
+    def for_production_repository(cls, repository: str | Path, *, lock_timeout: float = 0.0) -> "CooperativeBranchLeaseAdapter":
+        capability = resolve_production_creator_capability(repository)
+        adapter = cls(str(capability.common_dir), capability.lock_root,
+                      lock_timeout=lock_timeout, capability=capability)
+        adapter.common_dir = capability.common_dir
+        return adapter
+
+    @classmethod
+    def for_disposable_fixture(cls, repository: str | Path, inventory: Mapping[str, Any],
+                                expected_branches: list[str], *, lock_timeout: float = 0.0,
+                                fixture_root: str | Path | None = None) -> "CooperativeBranchLeaseAdapter":
+        capability = resolve_disposable_fixture_capability(
+            repository, inventory, expected_branches, fixture_root=fixture_root)
+        adapter = cls(str(capability.common_dir), capability.lock_root,
+                      lock_timeout=lock_timeout, capability=capability)
+        adapter.common_dir = capability.common_dir
+        return adapter
+
     @property
     def creator_participants(self) -> frozenset[str]:
         return frozenset(self._registered)
 
     @property
     def creator_participation_complete(self) -> bool:
-        return self.creator_participants == REQUIRED_HOME_LAB_CREATORS
+        return isinstance(self.capability, CreatorLeaseCapability)
 
     @property
     def established(self) -> bool:
+        if isinstance(self.capability, DisposableFixtureLeaseCapability):
+            return self.capability.is_current(self.common_dir or "")
         return self.creator_participation_complete
 
     def register_creator(self, creator_id: str) -> None:
@@ -331,6 +711,17 @@ def reconcile_interrupted_cleanup(repo: str | Path, plan: Mapping[str, Any],
     from .cleanup import _plan_digest
 
     root = Path(repo).expanduser().resolve()
+    if lease.common_dir != _common_dir(root) or lease.lease_dir != _fixed_lock_root():
+        raise JgError("cleanup reconciliation lease scope does not match the repository")
+    capability = lease.capability
+    if isinstance(capability, CreatorLeaseCapability):
+        if not production_capability_is_current(capability, root):
+            raise JgError("production creator hook capability is stale or unavailable")
+    elif isinstance(capability, DisposableFixtureLeaseCapability):
+        if not capability.is_current(root):
+            raise JgError("disposable fixture capability is stale or unavailable")
+    else:
+        raise JgError("cleanup reconciliation requires a verified lease capability")
     plan_digest = str(plan.get("plan_digest") or "")
     bundle = plan.get("bundle")
     if (not plan_digest or _plan_digest(plan) != plan_digest
@@ -345,6 +736,10 @@ def reconcile_interrupted_cleanup(repo: str | Path, plan: Mapping[str, Any],
     main = plan.get("main")
     if not isinstance(candidates, list) or not isinstance(main, Mapping):
         raise JgError("interrupted cleanup plan is malformed")
+    if isinstance(capability, DisposableFixtureLeaseCapability):
+        planned = tuple(sorted(str(item.get("name")) for item in candidates))
+        if planned != capability.branches:
+            raise JgError("fixture reconciliation branch inventory mismatch")
     results: list[dict[str, Any]] = []
     for intent in journal.pending_intents(plan_digest=plan_digest):
         index = intent.get("candidate_index")
@@ -364,6 +759,10 @@ def reconcile_interrupted_cleanup(repo: str | Path, plan: Mapping[str, Any],
                 or intent.get("bundle_sha256") != bundle.get("sha256")
                 or action_id != cleanup_action_id(plan_digest, index, branch, tip)):
             raise JgError("cleanup journal intent does not match the approved plan")
+        if isinstance(capability, CreatorLeaseCapability) and not production_capability_is_current(capability, root):
+            raise JgError("production creator hook capability changed during reconciliation")
+        if isinstance(capability, DisposableFixtureLeaseCapability) and not capability.is_current(root):
+            raise JgError("disposable fixture capability changed during reconciliation")
         with lease.cleanup_operation(branch, tip):
             current = _ref_tip(root, branch)
             if current == tip:
@@ -382,7 +781,7 @@ def reconcile_interrupted_cleanup(repo: str | Path, plan: Mapping[str, Any],
                 else:
                     status, restored = "restore_uncertain", False
             result = {
-                "event": "reconciled", "action_id": action_id,
+                "event": "reconciled", "scope": capability.scope, "action_id": action_id,
                 "plan_digest": plan_digest, "branch": branch, "tip": tip,
                 "destination": main, "destination_tip": main_tip,
                 "observed_destination_tip": _ref_tip(root, main),
@@ -395,6 +794,9 @@ def reconcile_interrupted_cleanup(repo: str | Path, plan: Mapping[str, Any],
 
 __all__ = [
     "COOPERATIVE_LEASE_CONTRACT", "REQUIRED_HOME_LAB_CREATORS",
+    "CreatorLeaseCapability", "DisposableFixtureLeaseCapability",
+    "resolve_production_creator_capability", "build_disposable_fixture_inventory",
+    "resolve_disposable_fixture_capability", "default_cleanup_journal_path",
     "CleanupActionJournal", "CooperativeBranchLeaseAdapter",
     "cleanup_action_id", "reconcile_interrupted_cleanup",
 ]

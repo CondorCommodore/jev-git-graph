@@ -28,7 +28,10 @@ from typing import Any
 from . import git
 from .coverage import _tree
 from .coordinator import (COOPERATIVE_LEASE_CONTRACT, CleanupActionJournal,
-                          CooperativeBranchLeaseAdapter, cleanup_action_id)
+                          CooperativeBranchLeaseAdapter, CreatorLeaseCapability,
+                          DisposableFixtureLeaseCapability, _fixed_lock_root,
+                          _common_dir, production_capability_is_current,
+                          cleanup_action_id)
 from .errors import JgError
 from .equivalence import _activity
 from .inventory import protected_worktree_paths
@@ -37,8 +40,7 @@ from .safety import digest, opaque_path_id, read_json, validate_output_path, wri
 
 SCHEMA_VERSION = 1
 MAX_BRANCHES = 25
-# No automated worktree creator currently participates in this contract.
-# Keep ref deletion unavailable until that integration is implemented and tested.
+# Retained only for compatibility with old offline tests; never grants authority.
 CREATOR_LEASE_INTEGRATED = False
 _SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 
@@ -374,24 +376,27 @@ def write_cleanup_plan(repo: str | Path, coverage_path: str | Path, out: str | P
 
 
 def _lease_established(contract: Any, repository: Path | None = None) -> bool:
-    if not CREATOR_LEASE_INTEGRATED:
-        return False
     if not isinstance(contract, CooperativeBranchLeaseAdapter):
         return False
-    if repository is None or contract.common_dir is None:
+    if repository is None or contract.common_dir is None or contract.capability is None:
         return False
     try:
-        resolved = subprocess.run(
-            ["git", "-C", str(repository), "rev-parse", "--path-format=absolute", "--git-common-dir"],
-            capture_output=True, text=True, check=False, timeout=15,
-        )
-        if resolved.returncode or Path(resolved.stdout.strip()).resolve(strict=True) != contract.common_dir:
+        canonical_common = _common_dir(repository)
+        if canonical_common != contract.common_dir:
             return False
-    except (OSError, subprocess.SubprocessError):
+        if contract.lease_dir != _fixed_lock_root():
+            return False
+        if isinstance(contract.capability, CreatorLeaseCapability):
+            if not production_capability_is_current(contract.capability, repository):
+                return False
+        elif isinstance(contract.capability, DisposableFixtureLeaseCapability):
+            if not contract.capability.is_current(repository):
+                return False
+        else:
+            return False
+    except (JgError, OSError, subprocess.SubprocessError):
         return False
-    if not contract.creator_participation_complete:
-        return False
-    return bool(contract.established)
+    return True
 
 
 def _lease_call(contract: Any, method: str, name: str, tip: str) -> bool:
@@ -521,6 +526,9 @@ def execute_cleanup(repo: str | Path, plan: Mapping[str, Any] | str | Path,
     if not bundle_path.is_file() or hashlib.sha256(bundle_path.read_bytes()).hexdigest() != bundle.get("sha256"):
         raise JgError("cleanup bundle is missing or changed")
     root, _common, runner = git.open_repository(repo)
+    scope = (lease_contract.capability.scope
+             if isinstance(lease_contract, CooperativeBranchLeaseAdapter)
+             and lease_contract.capability is not None else "production")
     if loaded.get("repository_id") != opaque_path_id(root):
         raise JgError("cleanup plan belongs to a different local repository")
     if (loaded.get("manifest_approved") is not True
@@ -528,28 +536,44 @@ def execute_cleanup(repo: str | Path, plan: Mapping[str, Any] | str | Path,
         raise JgError("cleanup plan manifest is not approved")
     if not _lease_established(lease_contract, root):
         return {"kind": "cleanup-execution", "plan_digest": expected,
+                "scope": scope,
                 "deletion_ready": False, "mode": "deletion-ready-plan-only",
                 "deleted": [], "stopped": "cooperative_lease_unestablished",
                 "network_performed": False, "destructive_action_authorized": False}
     if journal_path is None:
         return {"kind": "cleanup-execution", "plan_digest": expected,
+                "scope": scope,
                 "deletion_ready": False, "mode": "deletion-ready-plan-only",
                 "deleted": [], "stopped": "cleanup_journal_required",
                 "network_performed": False, "destructive_action_authorized": False}
     journal_destination = validate_output_path(
-        journal_path, protected_worktree_paths(root),
+        journal_path, [*protected_worktree_paths(root), _common_dir(root)],
     )
     journal = CleanupActionJournal(journal_destination)
     if journal.pending_intents():
         return {"kind": "cleanup-execution", "plan_digest": expected,
+                "scope": scope,
                 "deletion_ready": False, "mode": "deletion-ready-plan-only",
                 "deleted": [], "stopped": "interrupted_cleanup_reconciliation_required",
                 "network_performed": False, "destructive_action_authorized": False}
     deleted: list[dict[str, str]] = []
+    if isinstance(lease_contract.capability, DisposableFixtureLeaseCapability):
+        planned = tuple(sorted(str(item.get("name")) for item in loaded.get("candidates", [])))
+        if planned != lease_contract.capability.branches:
+            return {"kind": "cleanup-execution", "plan_digest": expected,
+                    "scope": scope, "deletion_ready": False, "deleted": [],
+                    "stopped": "fixture_branch_inventory_mismatch",
+                    "network_performed": False, "destructive_action_authorized": False}
     for index, candidate in enumerate(loaded.get("candidates", [])):
         name, tip = str(candidate["name"]), str(candidate["tip"])
+        if not _lease_established(lease_contract, root):
+            return {"kind": "cleanup-execution", "plan_digest": expected,
+                    "scope": scope, "deletion_ready": False, "deleted": deleted,
+                    "stopped": "creator_capability_changed", "branch": name,
+                    "network_performed": False, "destructive_action_authorized": False}
         if not _lease_call(lease_contract, "acquire", name, tip):
             return {"kind": "cleanup-execution", "plan_digest": expected,
+                    "scope": scope,
                     "deletion_ready": False, "deleted": deleted,
                     "stopped": "lease_not_acquired", "branch": name,
                     "network_performed": False, "destructive_action_authorized": False}
@@ -572,6 +596,7 @@ def execute_cleanup(repo: str | Path, plan: Mapping[str, Any] | str | Path,
                 destination_tip = str(loaded["main"]["tip"])
                 journal.append({
                     "event": "intent", "action_id": action_id,
+                    "scope": scope,
                     "plan_digest": expected, "approved_digest": approved_digest,
                     "candidate_index": index, "branch": name, "tip": tip,
                     "destination": destination, "destination_tip": destination_tip,
@@ -628,6 +653,7 @@ def execute_cleanup(repo: str | Path, plan: Mapping[str, Any] | str | Path,
                     )
                     journal.append({
                         "event": "result", "action_id": action_id,
+                        "scope": scope,
                         "plan_digest": expected, "branch": name, "tip": tip,
                         "destination": str(loaded["main"]["name"]),
                         "destination_tip": str(loaded["main"]["tip"]),
@@ -658,6 +684,7 @@ def execute_cleanup(repo: str | Path, plan: Mapping[str, Any] | str | Path,
                                "restored": restored}
                 journal.append({
                     "event": "result", "action_id": action_id,
+                    "scope": scope,
                     "plan_digest": expected, "branch": name, "tip": tip,
                     "destination": str(loaded["main"]["name"]),
                     "destination_tip": str(loaded["main"]["tip"]),
@@ -670,6 +697,7 @@ def execute_cleanup(repo: str | Path, plan: Mapping[str, Any] | str | Path,
         if outcome is not None:
             return outcome
     return {"kind": "cleanup-execution", "plan_digest": expected,
+            "scope": scope,
             "deletion_ready": True, "deleted": deleted, "stopped": None,
             "network_performed": False, "destructive_action_authorized": True}
 

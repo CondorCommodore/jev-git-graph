@@ -13,6 +13,10 @@ from .batches import prepare_batches, collect_batches
 from .calibration import write_calibration
 from .coverage import write_coverage
 from .cleanup import approve_cleanup_plan, execute_cleanup, write_cleanup_plan
+from .coordinator import (DISPOSABLE_FIXTURE_ROOT, CleanupActionJournal, CooperativeBranchLeaseAdapter,
+                          CreatorLeaseCapability, DisposableFixtureLeaseCapability,
+                          _common_dir, default_cleanup_journal_path,
+                          reconcile_interrupted_cleanup)
 from .code_evidence import approve_code_batch, build_code_evidence, build_transient_preview
 from .decisions import write_decisions
 from .equivalence import write_equivalence
@@ -62,7 +66,7 @@ def _build_group_presence_preview(args):
     selected_ids = None
     selection_digest = None
     if study is not None:
-        if (study.get("kind") != "presence-study" or study.get("schema_version") != 2
+        if (study.get("kind") != "presence-study" or study.get("schema_version") not in {2, 3}
                 or study.get("study_digest") != digest({k: v for k, v in study.items() if k != "study_digest"})
                 or any(study.get(key) != expected for key, expected in (
                     ("snapshot_digest", snapshot["snapshot_digest"]),
@@ -111,6 +115,35 @@ def _build_group_presence_preview(args):
     }
     replay["manifest_digest"] = digest(replay)
     return object_repo, range_manifest, replay, preview
+
+
+def _cleanup_executor_context(repo: str, plan: dict, journal_arg: str | None,
+                              fixture_inventory_arg: str | None):
+    root, _common, _runner = git.open_repository(repo)
+    common_dir = _common_dir(root)
+    journal_path = Path(journal_arg).expanduser() if journal_arg else default_cleanup_journal_path(common_dir)
+    journal_path = validate_output_path(
+        journal_path, [*protected_worktree_paths(root), common_dir])
+    branch_names = sorted(str(item.get("name")) for item in plan.get("candidates", []))
+    if fixture_inventory_arg:
+        fixture_path = Path(fixture_inventory_arg).expanduser()
+        if fixture_path.is_symlink():
+            raise JgError("disposable fixture inventory must not be a symlink")
+        fixture_path = fixture_path.resolve(strict=True)
+        fixture_root = DISPOSABLE_FIXTURE_ROOT.resolve(strict=False)
+        try:
+            fixture_path.relative_to(fixture_root)
+        except ValueError as exc:
+            raise JgError("disposable fixture inventory is outside the controlled fixture root") from exc
+        fixture_inventory = read_json(fixture_path)
+        lease = CooperativeBranchLeaseAdapter.for_disposable_fixture(
+            root, fixture_inventory, branch_names, fixture_root=fixture_root)
+        return lease, journal_path, None
+    try:
+        lease = CooperativeBranchLeaseAdapter.for_production_repository(root)
+        return lease, journal_path, None
+    except JgError as exc:
+        return None, journal_path, str(exc)
 from .group_requests import (
     approved_presence_preview,
     build_group_requests,
@@ -204,6 +237,8 @@ def parser() -> argparse.ArgumentParser:
     study.add_argument("--max-per-family", type=int, default=4)
     study.add_argument("--exclude-branch", action="append", default=[])
     study.add_argument("--project-goals", default="")
+    study.add_argument("--selection-policy", choices=("candidate-availability-24-8-v2", "dependency-complete-majority-v1"),
+                       default="candidate-availability-24-8-v2")
 
     outcomes = commands.add_parser("outcomes", help="account for every object and render preservation tasks and review page")
     outcomes.add_argument("--repo", required=True)
@@ -309,6 +344,13 @@ def parser() -> argparse.ArgumentParser:
     cleanup_execute.add_argument("--repo", required=True)
     cleanup_execute.add_argument("--plan", required=True)
     cleanup_execute.add_argument("--approved-digest", required=True)
+    cleanup_execute.add_argument("--journal", help="owner-private action journal (defaults to user state)")
+    cleanup_execute.add_argument("--fixture-inventory", help="explicit no-known-automation disposable-fixture inventory")
+    cleanup_reconcile = cleanup_steps.add_parser("reconcile", help="restore or record one interrupted cleanup intent")
+    cleanup_reconcile.add_argument("--repo", required=True)
+    cleanup_reconcile.add_argument("--plan", required=True)
+    cleanup_reconcile.add_argument("--journal", required=True)
+    cleanup_reconcile.add_argument("--fixture-inventory", help="explicit no-known-automation disposable-fixture inventory")
     resume = commands.add_parser("resume", help="resume one approved Jev batch plan, retaining uncertain attempts")
     resume.add_argument("--repo", required=True)
     resume.add_argument("--batch-plan", required=True)
@@ -409,7 +451,7 @@ def run(args: argparse.Namespace) -> str:
             raise JgError("contributions belong to a different local repository")
         target = validate_output_path(args.out, [*protected_worktree_paths(args.repo), common])
         return str(write_study(args.contributions, args.groups, target, args.count,
-                               args.max_per_family, args.exclude_branch, args.project_goals))
+                               args.max_per_family, args.exclude_branch, args.project_goals, args.selection_policy))
     if args.command == "outcomes":
         inventory = read_json(args.inventory)
         root, common, _runner = git.open_repository(args.repo)
@@ -510,8 +552,23 @@ def run(args: argparse.Namespace) -> str:
             path = target / "approved-cleanup-plan.json"
             write_json(path, approved)
             return str(path)
-        result = execute_cleanup(args.repo, args.plan, approved_digest=args.approved_digest)
-        return json.dumps(result, sort_keys=True)
+        if args.cleanup_command == "execute":
+            plan = read_json(args.plan)
+            lease, journal_path, diagnostic = _cleanup_executor_context(
+                args.repo, plan, args.journal, args.fixture_inventory)
+            result = execute_cleanup(args.repo, plan, approved_digest=args.approved_digest,
+                                     lease_contract=lease, journal_path=journal_path)
+            if diagnostic:
+                result["capability_diagnostic"] = diagnostic
+            return json.dumps(result, sort_keys=True)
+        plan = read_json(args.plan)
+        lease, journal_path, diagnostic = _cleanup_executor_context(
+            args.repo, plan, args.journal, args.fixture_inventory)
+        if diagnostic or lease is None:
+            raise JgError(f"creator capability unavailable: {diagnostic or 'missing'}")
+        journal = CleanupActionJournal(journal_path)
+        result = reconcile_interrupted_cleanup(args.repo, plan, journal, lease)
+        return json.dumps({"scope": lease.capability.scope, "reconciled": result}, sort_keys=True)
     if args.command == "decisions":
         destination = _protected_output(args.repo, args.out)
         return str(write_decisions(args.inventory, args.candidates, args.relations, destination, args.equivalence))
