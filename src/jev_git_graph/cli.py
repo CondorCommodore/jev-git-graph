@@ -20,6 +20,9 @@ from .inventory import protected_worktree_paths, write_inventory
 from .jev import DEFAULT_MAX_JEV_PAYLOAD_BYTES, DEFAULT_MAX_JEV_REQUESTS, EVIDENCE_PROFILES, checkpoint_lock, execute_preview, execute_transient_preview, write_preview
 from .plan import write_plan
 from .residual import analyze_residual
+from .snapshot import load_snapshot, write_snapshot
+from .contributions import write_contributions
+from .groups import write_groups
 from .resume import resume_batches
 from .safety import canonical_json, opaque_path_id, read_json, validate_output_path, write_json
 from .viewer import serve as serve_viewer
@@ -33,6 +36,24 @@ def parser() -> argparse.ArgumentParser:
     inventory = commands.add_parser("inventory", help="collect a read-only local Git snapshot")
     inventory.add_argument("--repo", required=True)
     inventory.add_argument("--out", required=True)
+
+    snapshot = commands.add_parser("snapshot", help="preserve immutable analysis commits in an independent local object store")
+    snapshot.add_argument("--repo", required=True)
+    snapshot.add_argument("--inventory", required=True)
+    snapshot.add_argument("--out", required=True)
+    snapshot.add_argument("--recent-hours", type=float, default=24)
+
+    contributions = commands.add_parser("contributions", help="account for changed units in a pinned snapshot without model calls")
+    contributions.add_argument("--repo", required=True)
+    contributions.add_argument("--snapshot", required=True)
+    contributions.add_argument("--out", required=True)
+
+    groups = commands.add_parser("groups", help="build bounded local contribution context groups")
+    groups.add_argument("--repo", required=True)
+    groups.add_argument("--contributions", required=True)
+    groups.add_argument("--out", required=True)
+    groups.add_argument("--max-units", type=int, default=24)
+    groups.add_argument("--max-edges", type=int, default=1000)
 
     candidates = commands.add_parser("candidates", help="build bounded deterministic relationship candidates")
     candidates.add_argument("--repo", required=True)
@@ -151,6 +172,22 @@ def _protected_output(repo: str, output: str) -> Path:
 
 
 def run(args: argparse.Namespace) -> str:
+    if args.command == "groups":
+        contributions = read_json(args.contributions)
+        root, common, _runner = git.open_repository(args.repo)
+        if contributions.get("repository_id") != opaque_path_id(root):
+            raise JgError("contributions belong to a different local repository")
+        target = validate_output_path(args.out, [*protected_worktree_paths(args.repo), common])
+        return str(write_groups(args.contributions, target, args.max_units, args.max_edges))
+    if args.command == "snapshot":
+        return str(write_snapshot(args.repo, args.inventory, args.out, recent_hours=args.recent_hours))
+    if args.command == "contributions":
+        snapshot, _store = load_snapshot(args.snapshot)
+        root, common, _runner = git.open_repository(args.repo)
+        if snapshot.get("repository_id") != opaque_path_id(root):
+            raise JgError("snapshot belongs to a different local repository")
+        target = validate_output_path(args.out, [*protected_worktree_paths(args.repo), common])
+        return str(write_contributions(args.snapshot, target))
     if args.command == "code-relate":
         candidates = read_json(args.candidates)
         root, _common, _runner = git.open_repository(args.repo)
