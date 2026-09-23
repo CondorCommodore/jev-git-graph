@@ -719,6 +719,7 @@ def build_contributions(snapshot: dict, object_repo: Path, *, workers: int | Non
         edge_count_before = len(edges)
         unresolved = []
         resolved_reference_count = 0
+        dependency_target_ids = set()
         for reference in unit.get("static_references", []):
             if reference == unit.get("name", "").rsplit(".", 1)[-1]:
                 resolved_reference_count += 1
@@ -729,6 +730,8 @@ def build_contributions(snapshot: dict, object_repo: Path, *, workers: int | Non
             candidates = reference_targets(unit, reference)
             if len(candidates) == 1:
                 target = candidates[0]
+                if target["id"] != unit["id"]:
+                    dependency_target_ids.add(target["id"])
                 if emit_edges and target["id"] != unit["id"]:
                     edges.append({"source_id": unit["id"], "destination_id": target["id"],
                                   "type": "dependency", "provenance": "static_ast_symbol_reference",
@@ -749,6 +752,7 @@ def build_contributions(snapshot: dict, object_repo: Path, *, workers: int | Non
             "unresolved_reference_count": len(unresolved) + len(dynamic),
             "unresolved_reference_samples": unresolved[:12],
             "dynamic_reference_observations": dynamic,
+            "dependency_target_ids": sorted(dependency_target_ids),
             "status": dependency_status,
         }
         if unresolved or dynamic:
@@ -783,7 +787,56 @@ def build_contributions(snapshot: dict, object_repo: Path, *, workers: int | Non
         unit["source_dependency_context_status"] = source_status
         unit["dependency_context_status"] = dependency_status
         unit["dependency_context_limitations"] = sorted(set(limitations_for_unit))
+        unit["_direct_dependency_context_limitations"] = list(limitations_for_unit)
         unresolved_reference_observations += unit["dependency_observations"]["unresolved_reference_count"]
+
+    # A locally resolved name is not enough when its target depends on unknown
+    # behavior. Propagate uncertainty through both source and destination
+    # reference graphs to a fixed point, including cycles reached from an
+    # unresolved node.
+    dependency_nodes = {unit["id"]: unit for unit in [*units, *destinations]
+                        if unit.get("kind") == "python_definition"}
+    changed = True
+    while changed:
+        changed = False
+        for unit in dependency_nodes.values():
+            observations = unit.get("dependency_observations", {})
+            if observations.get("status") != "complete":
+                continue
+            targets = observations.get("dependency_target_ids", [])
+            if any(target_id not in dependency_nodes
+                   or dependency_nodes[target_id].get("dependency_observations", {}).get("status") != "complete"
+                   for target_id in targets):
+                observations["status"] = "unknown"
+                unit["_transitive_dependency_context_unknown"] = True
+                changed = True
+    for unit in destinations:
+        if unit.get("kind") == "python_definition":
+            unit["dependency_context_status"] = unit["dependency_observations"]["status"]
+            if unit.pop("_transitive_dependency_context_unknown", False):
+                unit["dependency_context_limitations"] = sorted(set(
+                    [*unit.get("dependency_context_limitations", []),
+                     "transitive_dependency_context_unknown"]))
+    for unit in units:
+        if unit.get("kind") != "python_definition":
+            continue
+        source_status = unit["dependency_observations"]["status"]
+        limitations_for_unit = list(unit.pop("_direct_dependency_context_limitations", []))
+        if unit.pop("_transitive_dependency_context_unknown", False):
+            limitations_for_unit.append("transitive_dependency_context_unknown")
+        candidates = [destination_by_id[item] for item in unit.get("destination_ids", [])
+                      if item in destination_by_id]
+        if not candidates:
+            if "destination_dependency_context_unavailable" not in limitations_for_unit:
+                limitations_for_unit.append("destination_dependency_context_unavailable")
+        elif any(item.get("dependency_context_status") != "complete" for item in candidates):
+            limitations_for_unit.append("destination_dependency_context_incomplete")
+        dependency_status = ("complete" if source_status == "complete" and candidates
+                             and all(item.get("dependency_context_status") == "complete" for item in candidates)
+                             else "unknown")
+        unit["source_dependency_context_status"] = source_status
+        unit["dependency_context_status"] = dependency_status
+        unit["dependency_context_limitations"] = sorted(set(limitations_for_unit))
     unresolved_destination_reference_observations = sum(
         unit.get("dependency_observations", {}).get("unresolved_reference_count", 0)
         for unit in destinations if unit.get("kind") == "python_definition")

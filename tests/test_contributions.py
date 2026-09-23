@@ -339,6 +339,40 @@ def test_module_value_reference_does_not_fall_back_to_destination_definition(tmp
     assert unit["dependency_context_status"] == "unknown"
 
 
+def test_unknown_dependency_status_propagates_to_callers(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    (repo / "src.py").write_text(
+        "import builtins\n"
+        "def mutate():\n    return 0\n"
+        "def subject(values):\n    return values\n", encoding="utf-8")
+    base = commit(repo, "base")
+    git(repo, "checkout", "-q", "-b", "source")
+    subject = "def subject(values):\n    mutate()\n    return len(values) + 1\n"
+    (repo / "src.py").write_text(
+        "import builtins\n"
+        "def mutate():\n    builtins.len = custom_length\n    return 0\n"
+        + subject, encoding="utf-8")
+    source_tip = commit(repo, "dynamic dependency")
+    git(repo, "checkout", "-q", "main")
+    (repo / "dst.py").write_text(subject, encoding="utf-8")
+    commit(repo, "destination subject candidate")
+    main_tip = git(repo, "rev-parse", "HEAD")
+    snapshot = {"kind": "git-snapshot", "schema_version": 1, "snapshot_digest": "s",
+                "repository_id": "r", "main": {"name": "main", "tip": main_tip},
+                "branches": [{"name": "source", "tip": source_tip, "merge_base": base,
+                              "eligible": True, "exclusion_reasons": []}]}
+    result = build_contributions(snapshot, repo)
+    caller = next(unit for unit in result["units"] if unit.get("name") == "subject")
+    mutator = next(unit for unit in result["units"] if unit.get("name") == "mutate")
+    assert any(edge["source_id"] == caller["id"] and edge["destination_id"] == mutator["id"]
+               for edge in result["edges"])
+    assert mutator["source_dependency_context_status"] == "unknown"
+    assert caller["source_dependency_context_status"] == "unknown"
+    assert "transitive_dependency_context_unknown" in caller["dependency_context_limitations"]
+
+
 def test_match_capture_and_global_statement_keep_module_resolution_unknown() -> None:
     match_unit = _definitions(
         "match value:\n"
