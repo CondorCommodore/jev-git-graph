@@ -1,8 +1,8 @@
 # Guarded local branch cleanup
 
-`jev_git_graph.cleanup` is the narrow execution boundary for the strict
-`branch-coverage` artifact. It is intentionally separate from the CLI and
-from Jev review decisions. A relationship judgment, ancestry result, patch
+`jev_git_graph.cleanup` is the narrow execution boundary wrapped by the CLI
+for the strict `branch-coverage` artifact. It remains separate from Jev review
+decisions. A relationship judgment, ancestry result, patch
 ID, or human disposition does not make a branch removable.
 
 ## Current integration status
@@ -85,7 +85,8 @@ Removal uses one Git `update-ref --stdin` transaction containing a destination
 destination and source still equal their approved SHAs. The destination tip is
 also checked in the live reproof. After deletion the source ref is checked;
 if it reappears, the executor records uncertainty and never overwrites it.
-Any future recovery path must use compare-and-create against an absent ref.
+The implemented recovery path restores a missing approved ref only with
+compare-and-create against an absent ref.
 The executor never performs remote operations.
 
 The CLI exposes `jg cleanup plan`, `jg cleanup approve`, `jg cleanup execute`,

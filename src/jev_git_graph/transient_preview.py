@@ -41,8 +41,8 @@ def serve_presence_preview(preview: Mapping[str, Any]) -> None:
             return
 
     server = _PreviewServer(("127.0.0.1", 0), Handler)
-    print(f"Transient no-store preview: http://127.0.0.1:{server.server_port}/{token}")
-    print("Press Ctrl+C to close; request text remains in memory only.")
+    print(f"Transient no-store preview: http://127.0.0.1:{server.server_port}/{token}", flush=True)
+    print("Press Ctrl+C to close; request text remains in memory only.", flush=True)
     try:
         server.serve_forever(poll_interval=0.2)
     except KeyboardInterrupt:
