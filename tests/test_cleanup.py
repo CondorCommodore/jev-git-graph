@@ -261,6 +261,50 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(topic_tip, run(repo, "rev-parse", "topic"))
         self.assertEqual(["intent", "result"], [event["event"] for event in events])
 
+    def test_post_delete_capability_drift_restores_exact_tip_without_overwriting_recreation(self):
+        # Exercise both outcomes after a real CAS deletion: restore the pinned
+        # source only while the ref is still absent, and preserve a concurrent
+        # recreation at a different tip.
+        for recreate in (False, True):
+            with self.subTest(recreate=recreate):
+                repo, topic_tip, main_tip = self.make_repo(old_commits=True)
+                coverage = coverage_for(repo, [{"name": "topic", "tip": topic_tip, "main_tip": main_tip,
+                                               "verdict": "EXACT", "reason": None, "last_activity_epoch": 1,
+                                               "paths": [{"path": "topic", "verdict": "EXACT_PRESENT"}]}])
+                with tempfile.TemporaryDirectory() as out:
+                    root = Path(out)
+                    plan = build_old_plan(repo, coverage, bundle_dir=root / "bundle")
+                    approved = approve_cleanup_plan(plan, approved_digest=plan["plan_digest"])
+                    lease = self.integrated_lease(repo)
+                    original = _lease_established
+                    calls = 0
+
+                    def drift_after_delete(contract, repository):
+                        nonlocal calls
+                        calls += 1
+                        if calls == 5:
+                            if recreate:
+                                run(repo, "update-ref", "refs/heads/topic", main_tip)
+                            return False
+                        return original(contract, repository)
+
+                    with patch("jev_git_graph.cleanup._live_reproof", return_value=None), \
+                         patch("jev_git_graph.cleanup._lease_established", drift_after_delete):
+                        result = execute_cleanup(
+                            repo, approved, approved_digest=approved["plan_digest"],
+                            lease_contract=lease, journal_path=root / "actions.jsonl",
+                        )
+                    observed_tip = run(repo, "rev-parse", "refs/heads/topic")
+                self.assertEqual(5, calls)
+                self.assertEqual("creator_capability_changed_after_delete", result["stopped"])
+                self.assertTrue(result["restoration_attempted"])
+                if recreate:
+                    self.assertFalse(result["restored"])
+                    self.assertEqual(main_tip, observed_tip)
+                else:
+                    self.assertTrue(result["restored"])
+                    self.assertEqual(topic_tip, observed_tip)
+
     def test_interrupted_reconciliation_restores_absent_ref_from_bundle(self):
         repo, topic_tip, main_tip = self.make_repo()
         coverage = coverage_for(repo, [{"name": "topic", "tip": topic_tip, "main_tip": main_tip,
