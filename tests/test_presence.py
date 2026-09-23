@@ -277,6 +277,8 @@ def test_study_selection_binds_only_targets_and_keeps_original_group_context():
     assert [item["contribution_id"] for item in request["state"]["contributions"]] == ["cu-1"]
     assert request["questions"] and all(key.startswith("cu-1:") for key in request["questions"])
     assert request["state"]["context_contribution_ids"] == ["cu-2"]
+    assert request["state"]["context_units"] == []
+    assert request["state"]["limitations"]
 
 
 def test_study_selection_rejects_unassigned_contributions():

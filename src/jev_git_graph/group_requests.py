@@ -343,14 +343,25 @@ def build_group_requests(
             if context_unit is None:
                 group_omitted.append({"contribution_id": context_id, "reason": "context_unit_missing"})
                 continue
-            context_items.append({"contribution_id": context_id,
-                "source": {key: context_unit.get(key) for key in
-                    ("source_tip", "main_tip", "path", "kind", "name", "range", "source_blob", "limitations")
-                    if key in context_unit},
-                "destination_ids": context_unit.get("destination_ids", [])})
+            if selected_ids is None:
+                context_items.append({"contribution_id": context_id,
+                    "source": {key: context_unit.get(key) for key in
+                        ("source_tip", "main_tip", "path", "kind", "name", "range", "source_blob", "limitations")
+                        if key in context_unit},
+                    "destination_ids": context_unit.get("destination_ids", [])})
+        if selected_ids is not None:
+            # IDs remain visible in context_contribution_ids below; the repeated
+            # per-neighbor source metadata is available in the pinned artifact.
+            context_items = []
         selected_destination_ids = set(group.get("destination_ids", []))
         for item in source_items:
             selected_destination_ids.update(item.get("destination_ids", []))
+        if selected_ids is not None:
+            # A study request is contribution-scoped. Preserve all original
+            # group membership as IDs and exact omission digests, but avoid
+            # repeating every neighbor's full metadata in each selected case.
+            selected_destination_ids = set().union(
+                *(set(item.get("destination_ids", [])) for item in source_items)) if source_items else set()
         destination_items = []
         for destination_id in sorted(selected_destination_ids):
             destination = destinations.get(destination_id)
@@ -360,22 +371,82 @@ def build_group_requests(
             destination_items.append({key: destination.get(key) for key in
                 ("id", "path", "blob", "mode", "kind", "name", "range", "ast_fingerprint", "limitations")
                 if key in destination})
+        all_boundary_edges = group.get("boundary_edges", [])
+        all_group_edges = group.get("edges", [])
+        if not isinstance(all_boundary_edges, list):
+            raise JgError(f"group {group_id} boundary_edges must be a list")
+        if not isinstance(all_group_edges, list):
+            raise JgError(f"group {group_id} edges must be a list")
+        if selected_ids is not None:
+            relevant_boundary_edges = [edge for edge in all_boundary_edges
+                                       if isinstance(edge, Mapping) and
+                                       (edge.get("source_id") in target_set or edge.get("destination_id") in target_set)]
+            omitted_boundary_edges = [edge for edge in all_boundary_edges if edge not in relevant_boundary_edges]
+            relevant_group_edges = [edge for edge in all_group_edges
+                                    if isinstance(edge, Mapping) and
+                                    (edge.get("source_id") in target_set or edge.get("destination_id") in target_set)]
+            omitted_group_edges = [edge for edge in all_group_edges if edge not in relevant_group_edges]
+            boundary_summary = {
+                "original_count": len(all_boundary_edges),
+                "relevant_count": len(relevant_boundary_edges),
+                "omitted_count": len(omitted_boundary_edges),
+                "omitted_ids": sorted(str(edge.get("id", "")) for edge in omitted_boundary_edges
+                                       if isinstance(edge, Mapping)),
+                "omitted_digest": digest(omitted_boundary_edges),
+            }
+            group_edge_summary = {
+                "original_count": len(all_group_edges),
+                "relevant_count": len(relevant_group_edges),
+                "omitted_count": len(omitted_group_edges),
+                "omitted_ids": sorted(str(edge.get("id", "")) for edge in omitted_group_edges
+                                       if isinstance(edge, Mapping)),
+                "omitted_digest": digest(omitted_group_edges),
+            }
+            boundary_edges = relevant_boundary_edges
+            destination_ids_for_request = sorted(selected_destination_ids)
+            group_destination_ids_summary = {
+                "original_count": len(group.get("destination_ids", [])),
+                "omitted_count": len(set(group.get("destination_ids", [])) - selected_destination_ids),
+                "omitted_ids": sorted(set(group.get("destination_ids", [])) - selected_destination_ids),
+                "original_ids_digest": digest(group.get("destination_ids", [])),
+            }
+        else:
+            boundary_summary = None
+            relevant_group_edges = all_group_edges
+            group_edge_summary = None
+            boundary_edges = all_boundary_edges
+            destination_ids_for_request = group.get("destination_ids", [])
+            group_destination_ids_summary = None
         group_limitations = list(group.get("limitations", []))
         if group_omitted:
             group_limitations.append("group_evidence_omitted")
+        if selected_ids is not None and (any(unit_id not in target_set for unit_id in unit_ids)
+                                         or (boundary_summary and boundary_summary["omitted_count"])
+                                         or (group_edge_summary and group_edge_summary["omitted_count"])):
+            group_limitations.append("study_request_summarizes_unselected_group_context")
         state = {"group_id": group_id, "contributions": source_items,
                  "context_units": context_items,
-                 "context_contribution_ids": [item["contribution_id"] for item in context_items],
-                 "destination_ids": group.get("destination_ids", []),
+                 "context_contribution_ids": [unit_id for unit_id in unit_ids if unit_id not in target_set],
+                 "destination_ids": destination_ids_for_request,
                  "destinations": destination_items,
-                 "boundary_edges": group.get("boundary_edges", []),
+                 "group_edges": relevant_group_edges,
+                 "group_edge_summary": group_edge_summary,
+                 "boundary_edges": boundary_edges,
+                 "boundary_summary": boundary_summary,
+                 "group_destination_ids_summary": group_destination_ids_summary,
                  "limitations": sorted(set(group_limitations)), "omissions": group_omitted,
                  "context_complete": group.get("context_complete") is True and not group_limitations,
                  "evidence_ids": sorted(set(evidence_ids))}
         requests.append({"state": state, "model": settings["model"], "questions": questions})
     size = len(canonical_json(requests))
     if size > max_request_bytes:
-        raise JgError("group request payload exceeds max_request_bytes")
+        field_sizes = {key: sum(len(canonical_json(request.get("questions") if key == "questions"
+                                                    else request.get("state", {}).get(key)))
+                                for request in requests)
+                       for key in ("contributions", "context_units", "destinations", "group_edges",
+                                   "group_edge_summary", "boundary_edges", "boundary_summary",
+                                   "group_destination_ids_summary", "questions")}
+        raise JgError(f"group request payload is {size} bytes, exceeds max_request_bytes; field_bytes={field_sizes}")
     return {"kind": "branch-presence-request-plan", "schema_version": 1,
             "question_version": PRESENCE_QUESTION_VERSION,
             "snapshot_digest": contributions.get("snapshot_digest"),
