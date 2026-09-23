@@ -584,8 +584,10 @@ def execute_cleanup(repo: str | Path, plan: Mapping[str, Any] | str | Path,
         intent_written = False
         operation_exception = False
         try:
-            reason = _live_reproof(root, candidate, loaded["main"], runner,
-                                   float(loaded.get("recent_hours", 0)))
+            reason = (None if _lease_established(lease_contract, root) else "creator_capability_changed")
+            if reason is None:
+                reason = _live_reproof(root, candidate, loaded["main"], runner,
+                                       float(loaded.get("recent_hours", 0)))
             if reason:
                 outcome = {"kind": "cleanup-execution", "plan_digest": expected,
                            "deletion_ready": False, "deleted": deleted,
@@ -603,7 +605,12 @@ def execute_cleanup(repo: str | Path, plan: Mapping[str, Any] | str | Path,
                     "bundle_sha256": bundle.get("sha256"),
                 })
                 intent_written = True
-                if not _atomic_delete(root, name, tip, destination, destination_tip):
+                if not _lease_established(lease_contract, root):
+                    outcome = {"kind": "cleanup-execution", "plan_digest": expected,
+                               "deletion_ready": False, "deleted": deleted,
+                               "stopped": "creator_capability_changed", "branch": name,
+                               "network_performed": False, "destructive_action_authorized": False}
+                elif not _atomic_delete(root, name, tip, destination, destination_tip):
                     outcome = {"kind": "cleanup-execution", "plan_digest": expected,
                                "deletion_ready": False, "deleted": deleted,
                                "stopped": "source_delete_race", "branch": name,
@@ -638,6 +645,14 @@ def execute_cleanup(repo: str | Path, plan: Mapping[str, Any] | str | Path,
                                        "stopped": "delete_verification_uncertain",
                                        "restoration_attempted": False, "branch": name,
                                        "network_performed": False, "destructive_action_authorized": False}
+                        elif not _lease_established(lease_contract, root):
+                            restored = _atomic_restore(root, name, tip)
+                            outcome = {"kind": "cleanup-execution", "plan_digest": expected,
+                                       "deletion_ready": False, "deleted": deleted,
+                                       "stopped": "creator_capability_changed_after_delete",
+                                       "restoration_attempted": True, "restored": restored,
+                                       "branch": name, "network_performed": False,
+                                       "destructive_action_authorized": False}
                         else:
                             deleted.append({"name": name, "tip": tip})
         except BaseException:

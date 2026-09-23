@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from jev_git_graph.cleanup import (_atomic_delete,
                                    approve_cleanup_plan, build_cleanup_plan,
-                                   execute_cleanup)
+                                   execute_cleanup, _lease_established)
 from jev_git_graph.cli import main as jg_main
 from jev_git_graph.coordinator import (CleanupActionJournal,
                                        CooperativeBranchLeaseAdapter,
@@ -230,6 +230,36 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(topic_tip, events[0]["tip"])
         self.assertEqual(main_tip, events[-1]["observed_destination_tip"])
         self.assertFalse(_ref_exists(repo, "topic"))
+
+    def test_capability_drift_after_branch_lock_blocks_ref_transaction(self):
+        repo, topic_tip, main_tip = self.make_repo(old_commits=True)
+        coverage = coverage_for(repo, [{"name": "topic", "tip": topic_tip, "main_tip": main_tip,
+                                       "verdict": "EXACT", "reason": None, "last_activity_epoch": 1,
+                                       "paths": [{"path": "topic", "verdict": "EXACT_PRESENT"}]}])
+        with tempfile.TemporaryDirectory() as out:
+            root = Path(out)
+            plan = build_old_plan(repo, coverage, bundle_dir=root / "bundle")
+            approved = approve_cleanup_plan(plan, approved_digest=plan["plan_digest"])
+            lease = self.integrated_lease(repo)
+            journal_path = root / "actions.jsonl"
+            original = _lease_established
+            calls = 0
+
+            def drift_after_intent(contract, repository):
+                nonlocal calls
+                calls += 1
+                return False if calls == 4 else original(contract, repository)
+
+            with patch("jev_git_graph.cleanup._lease_established", drift_after_intent):
+                result = execute_cleanup(
+                    repo, approved, approved_digest=approved["plan_digest"],
+                    lease_contract=lease, journal_path=journal_path,
+                )
+            events = CleanupActionJournal(journal_path).read_events()
+        self.assertEqual("creator_capability_changed", result["stopped"])
+        self.assertEqual(4, calls)
+        self.assertEqual(topic_tip, run(repo, "rev-parse", "topic"))
+        self.assertEqual(["intent", "result"], [event["event"] for event in events])
 
     def test_interrupted_reconciliation_restores_absent_ref_from_bundle(self):
         repo, topic_tip, main_tip = self.make_repo()
