@@ -298,6 +298,7 @@ def build_groups(contributions: dict[str, Any], max_units: int = 24, max_edges: 
         for offset in range(0, len(component), max_units):
             partitions.append(component[offset:offset + max_units])
     groups = []
+    destination_id_sets: list[set[str]] = []
     group_index_by_unit = {
         unit_id: group_index
         for group_index, partition in enumerate(partitions)
@@ -324,6 +325,7 @@ def build_groups(contributions: dict[str, Any], max_units: int = 24, max_edges: 
             "limitations": sorted(set(limitations)),
             "context_complete": not any(item in _CONTEXT_GAP_LIMITATIONS for item in limitations),
         })
+        destination_id_sets.append(set(destination_ids))
 
     # max_edges is a per-group output budget. A global cap made later groups
     # look unrelated, so connectivity is retained and omitted edges are
@@ -373,8 +375,9 @@ def build_groups(contributions: dict[str, Any], max_units: int = 24, max_edges: 
                 continue
             source_group = group_index_by_unit[source]
             placements = [(source_group, "edges", edge)]
-            if target not in groups[source_group]["destination_ids"]:
+            if target not in destination_id_sets[source_group]:
                 groups[source_group]["destination_ids"].append(target)
+                destination_id_sets[source_group].add(target)
         else:
             # Validation rejects this, but retain the fail-closed boundary.
             raise JgError(f"edge refers to unknown destination id: {target}")
