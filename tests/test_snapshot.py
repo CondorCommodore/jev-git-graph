@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from jev_git_graph.errors import JgError
 from jev_git_graph.inventory import build_inventory, write_inventory
-from jev_git_graph.snapshot import export_pinned_repository, load_snapshot, write_snapshot
+from jev_git_graph.safety import digest
+from jev_git_graph.snapshot import export_pinned_repository, load_snapshot, run_snapshot_git, write_snapshot
 
 
 def git(repo: Path, *args: str, env: dict[str, str] | None = None) -> str:
@@ -41,6 +44,7 @@ def make_repo(parent: Path) -> tuple[Path, str, str, str]:
     git(repo, "add", ".")
     git(repo, "commit", "-qm", "orphan")
     orphan = git(repo, "rev-parse", "HEAD")
+    git(repo, "worktree", "add", "--detach", str(parent / "detached-worktree"), orphan)
     git(repo, "switch", "-q", "main")
     git(repo, "branch", "-D", "orphan")
     return repo, main, topic, orphan
@@ -61,7 +65,8 @@ class SnapshotTests(unittest.TestCase):
             self.assertEqual(topic, next(b["tip"] for b in manifest["branches"] if b["name"] == "topic"))
             for pin in manifest["object_store"]["pins"]:
                 git(objects, "cat-file", "-e", f"{pin}^{{commit}}")
-            self.assertNotIn(orphan, manifest["object_store"]["pins"])
+            self.assertIn(orphan, manifest["object_store"]["pins"])
+            self.assertIn(orphan, [item.get("head") for item in manifest["worktrees"]])
             # A caller can pin an orphaned SHA directly; export does not depend on refs.
             orphan_store = root / "orphan-store.git"
             exported = export_pinned_repository(repo, [orphan], orphan_store)
@@ -125,6 +130,57 @@ class SnapshotTests(unittest.TestCase):
             inv.write_text(json.dumps(inventory))
             with self.assertRaisesRegex(JgError, "at least 24"):
                 write_snapshot(repo, inv, root / "snapshot", recent_hours=23)
+
+    def test_rejects_replacement_refs_and_alternates_and_helper_ignores_git_redirects(self):
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+            root = Path(temporary)
+            repo, main, topic, _ = make_repo(root)
+            inv = write_inventory(repo, root / "inventory-run")
+            artifact = write_snapshot(repo, inv, root / "snapshot")
+            _, objects = load_snapshot(artifact)
+            with patch.dict(os.environ, {"GIT_OBJECT_DIRECTORY": str(root / "missing-objects")}):
+                restored = run_snapshot_git(objects, "rev-parse", topic)
+                self.assertEqual(topic, restored.decode().strip())
+            git(objects, "replace", topic, main)
+            with self.assertRaisesRegex(JgError, "named refs"):
+                load_snapshot(artifact)
+
+            artifact = write_snapshot(repo, inv, root / "alternate-snapshot")
+            _, objects = load_snapshot(artifact)
+            (objects / "objects" / "info" / "alternates").write_text(str(root / "external.git"))
+            with self.assertRaisesRegex(JgError, "alternates"):
+                load_snapshot(artifact)
+
+            artifact = write_snapshot(repo, inv, root / "loose-snapshot")
+            _, objects = load_snapshot(artifact)
+            loose = objects / "objects" / "aa"
+            loose.mkdir()
+            (loose / ("b" * 38)).write_bytes(b"unexpected object")
+            with self.assertRaisesRegex(JgError, "unexpected object data"):
+                load_snapshot(artifact)
+
+    def test_rejects_pack_path_traversal_even_with_recomputed_snapshot_digest(self):
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+            root = Path(temporary)
+            repo, _, _, _ = make_repo(root)
+            inv = write_inventory(repo, root / "inventory-run")
+            artifact = write_snapshot(repo, inv, root / "snapshot")
+            manifest = json.loads(artifact.read_text())
+            manifest["object_store"]["pack_path"] = "objects/pack/../pack/other.pack"
+            unsigned = {key: value for key, value in manifest.items() if key != "snapshot_digest"}
+            manifest["snapshot_digest"] = digest(unsigned)
+            artifact.write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(JgError, "pack path"):
+                load_snapshot(artifact)
+
+    def test_source_export_rejects_ambient_git_directory_redirect(self):
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+            root = Path(temporary)
+            repo, _, _, _ = make_repo(root)
+            inv = write_inventory(repo, root / "inventory-run")
+            with patch.dict(os.environ, {"GIT_DIR": str(root / "somewhere-else.git")}):
+                with self.assertRaisesRegex(JgError, "environment redirect"):
+                    write_snapshot(repo, inv, root / "snapshot")
 
 
 if __name__ == "__main__":
