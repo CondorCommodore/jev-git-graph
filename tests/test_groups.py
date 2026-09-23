@@ -119,7 +119,7 @@ class TestGroups(unittest.TestCase):
         units = [unit(f"cu-{index:03}", f"independent/{index:03}", path="shared/common.py") for index in range(300)]
         result = build_groups(contribution_artifact(branches, units), max_units=24)
         self.assertLessEqual(result["coverage"]["candidate_edges_discovered"], 256)
-        self.assertGreater(result["coverage"]["omitted_candidates_by_type"]["path"], 0)
+        self.assertEqual(result["coverage"]["omitted_candidates_by_type"]["path"], 300 * 299 // 2 - 256)
         self.assertTrue(result["coverage"]["truncated"])
         self.assertEqual(sum(len(group["unit_ids"]) for group in result["groups"]), 300)
 

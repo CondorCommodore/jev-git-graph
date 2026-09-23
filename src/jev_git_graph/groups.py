@@ -222,7 +222,7 @@ def build_groups(contributions: dict[str, Any], max_units: int = 24, max_edges: 
         # A wide signal's first unit is a deterministic representative. The
         # remaining units are accounted as omitted candidate comparisons.
         allowed = ids[:_SIGNAL_BUCKET_LIMIT]
-        possible = len(allowed) * (len(allowed) - 1) // 2
+        possible = len(ids) * (len(ids) - 1) // 2
         pairs_added = 0
         for i, first in enumerate(allowed):
             for second in allowed[i + 1:]:
@@ -232,8 +232,6 @@ def build_groups(contributions: dict[str, Any], max_units: int = 24, max_edges: 
                 pairs_added += 1
             if pairs_added >= _SIGNAL_EDGE_LIMIT:
                 break
-        if len(ids) > len(allowed):
-            omitted[signal_type] += len(ids) - len(allowed)
         omitted[signal_type] += max(0, possible - pairs_added)
 
     known_source_edges = [

@@ -9,8 +9,23 @@ import unittest
 from unittest.mock import patch
 from pathlib import Path
 
-from jev_git_graph.contributions import _git_env, build_contributions, write_contributions
+from jev_git_graph.contributions import _git_env, build_contributions as _build_contributions, write_contributions
 from jev_git_graph.errors import JgError
+from jev_git_graph.snapshot import export_pinned_repository
+
+
+def build_contributions(snapshot, repo):
+    """Use the production independent object-store contract in every fixture."""
+    pins = [snapshot['main']['tip']]
+    for branch in snapshot['branches']:
+        if branch.get('eligible'):
+            pins.append(branch['tip'])
+            if branch.get('merge_base'):
+                pins.append(branch['merge_base'])
+    with tempfile.TemporaryDirectory(dir='/private/tmp') as temporary:
+        store = Path(temporary) / 'objects.git'
+        export_pinned_repository(repo, pins, store)
+        return _build_contributions(snapshot, store)
 
 
 def git(repo: Path, *args: str, input_text: str | None = None) -> str:
