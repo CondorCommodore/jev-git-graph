@@ -267,13 +267,16 @@ def _verify_loaded_runtime_jobs(home: Path, runtime_roots: tuple[Path, ...]) -> 
             cwd_path = Path(cwd).resolve(strict=False) if cwd else None
             argv = shlex.split(process.stdout) if process.returncode == 0 else []
             executable_evidence = False
+            absolute_entrypoint_evidence = False
             for token in argv:
                 token_path = Path(token)
                 candidate = token_path if token_path.is_absolute() else ((cwd_path / token_path) if cwd_path else Path("/nonexistent"))
                 if candidate.is_file() and under_root(str(candidate)):
                     executable_evidence = True
-                    break
-            if (not cwd_path or not under_root(str(cwd_path)) or not executable_evidence):
+                    if token_path.is_absolute():
+                        absolute_entrypoint_evidence = True
+            cwd_entrypoint_evidence = bool(cwd_path and under_root(str(cwd_path)) and executable_evidence)
+            if not (cwd_entrypoint_evidence or absolute_entrypoint_evidence):
                 raise JgError(f"runtime_adoption_unverified: creator process is not running from the reviewed tree: {label}")
         jobs.append((label, str(plist_path.resolve()), str(root)))
     return tuple(jobs)
