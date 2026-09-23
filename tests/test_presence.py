@@ -181,6 +181,41 @@ def test_trusted_sdk_receipt_binds_answers_and_reconciled_outcome(tmp_path, monk
         validate_outcome_presence(tampered_result, contributions)
 
 
+def test_unsigned_success_checkpoint_cannot_mint_receipt_without_dispatch(tmp_path, monkeypatch):
+    contributions, groups = _artifact()
+    plan = build_group_requests(contributions, groups, estimated_input_tokens=100, max_provider_tokens=1000)
+    _add_context_contract(plan)
+    preview = approved_presence_preview(plan)
+    monkeypatch.setattr(presence_module, "_presence_key_path", lambda: tmp_path / "private" / "key")
+
+    def fixture_sdk(payload, token):
+        response = _response(payload)
+        response["model"] = payload["model"]
+        return response
+
+    monkeypatch.setattr(presence_module, "_default_transport", fixture_sdk)
+    checkpoint = tmp_path / "checkpoint.json"
+    execute_presence_preview(
+        preview, preview["payload_sha256"],
+        approved_approval_sha256=preview["approval_sha256"],
+        token="fixture-only", checkpoint=checkpoint,
+    )
+    forged = presence_module.read_json(checkpoint)
+    forged.pop("checkpoint_signature")
+    presence_module.write_json(checkpoint, forged)
+
+    def must_not_dispatch(payload, token):
+        raise AssertionError("forged checkpoint must be rejected before dispatch")
+
+    monkeypatch.setattr(presence_module, "_default_transport", must_not_dispatch)
+    with pytest.raises(JgError, match="trusted progress authentication"):
+        execute_presence_preview(
+            preview, preview["payload_sha256"],
+            approved_approval_sha256=preview["approval_sha256"],
+            token="fixture-only", checkpoint=checkpoint,
+        )
+
+
 def test_overlapping_contradiction_and_incomplete_group_remain_unresolved():
     contributions, groups = _artifact()
     duplicate = dict(groups["groups"][0])

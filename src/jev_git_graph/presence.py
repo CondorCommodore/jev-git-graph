@@ -196,6 +196,23 @@ def _verify_signed_record(record: Any, kind: str) -> bool:
     return hmac.compare_digest(signature, expected)
 
 
+def _seal_checkpoint(ledger: dict[str, Any], *, create_key: bool = False) -> None:
+    body = {key: value for key, value in ledger.items() if key != "checkpoint_signature"}
+    ledger["checkpoint_signature"] = _local_signature(body, create_key=create_key)
+
+
+def _verify_checkpoint(ledger: Mapping[str, Any]) -> bool:
+    signature = ledger.get("checkpoint_signature")
+    if not isinstance(signature, str) or not re.fullmatch(r"[0-9a-f]{64}", signature):
+        return False
+    body = {key: value for key, value in ledger.items() if key != "checkpoint_signature"}
+    try:
+        expected = _local_signature(body)
+    except JgError:
+        return False
+    return hmac.compare_digest(signature, expected)
+
+
 def verify_trusted_presence_result(result: Mapping[str, Any]) -> bool:
     """Verify the locally attested normalized Jev result; public hashes are insufficient."""
     if result.get("origin") != "jev" or not _verify_signed_record(
@@ -383,6 +400,8 @@ def execute_presence_preview(
               "network_performed": False, "attempts": [], "answers": []}
     if checkpoint is not None and Path(checkpoint).exists():
         ledger = read_json(checkpoint)
+        if not _verify_checkpoint(ledger):
+            raise JgError("presence checkpoint lacks trusted progress authentication")
         if (ledger.get("kind") != "branch-presence-execution" or ledger.get("preview_sha256") != payload_sha
                 or ledger.get("approval_sha256") != approval_sha
                 or ledger.get("question_version") != PRESENCE_QUESTION_VERSION
@@ -431,6 +450,7 @@ def execute_presence_preview(
         ledger["attempts"].append({"request_sha256": request_sha, "group_id": request["state"].get("group_id"),
                                    "status": "uncertain", "started_at": datetime.now(UTC).isoformat()})
     if checkpoint is not None:
+        _seal_checkpoint(ledger, create_key=True)
         write_json(Path(checkpoint), ledger)
 
     def invoke(item: tuple[str, dict[str, Any]]) -> tuple[str, Any, str | None, bool]:
@@ -477,7 +497,9 @@ def execute_presence_preview(
         "wall_time_seconds": prior_wall + monotonic() - elapsed_started,
     }
     if checkpoint is not None:
+        _seal_checkpoint(ledger)
         write_json(Path(checkpoint), ledger)
+    ledger.pop("checkpoint_signature", None)
     ledger["answers_digest"] = _answers_digest(ledger)
     if trusted_sdk_executor:
         answered = sorted(item["request_sha256"] for item in ledger["answers"])
