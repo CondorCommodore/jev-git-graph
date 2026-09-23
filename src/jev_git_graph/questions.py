@@ -83,6 +83,7 @@ def relationship_questions() -> dict[str, dict[str, Any]]:
 def presence_questions(
     contribution_id: str,
     dependency_edges: list[dict[str, str]] | None = None,
+    dependency_context_status: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Return named, typed questions for one contribution in a shared group.
 
@@ -92,6 +93,8 @@ def presence_questions(
     """
     if not isinstance(contribution_id, str) or not contribution_id:
         raise ValueError("contribution_id must be a non-empty string")
+    if dependency_context_status not in {None, "complete", "unknown", "incomplete"}:
+        raise ValueError("dependency_context_status must be complete, unknown, incomplete, or omitted")
     edge_records = dependency_edges or []
 
     def noul(instructions: str, true: str, false: str) -> dict[str, Any]:
@@ -120,6 +123,14 @@ def presence_questions(
             "No concrete potentially useful missing behavior or test is established by the supplied evidence.",
         ),
     }
+    if dependency_context_status is not None:
+        questions["dependency_context_sufficient"] = noul(
+            prefix + "Given the supplied dependency/reference evidence and analyzer status "
+            + dependency_context_status
+            + ", can integration readiness be assessed without assuming that unlisted references do not exist?",
+            "All required references are enumerated and resolved; there are no dynamic or unresolved references that could change whether this contribution integrates.",
+            "Dependency coverage is unknown or incomplete, a reference is dynamic/unresolved, or the supplied context cannot establish integration readiness.",
+        )
     for edge in sorted(edge_records, key=lambda item: item["id"]):
         edge_id = edge["id"]
         neighbor_id = edge.get("neighbor_id", "unknown")

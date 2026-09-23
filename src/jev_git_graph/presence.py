@@ -97,14 +97,26 @@ def _sanitize_response(request: Mapping[str, Any], response: Mapping[str, Any]) 
 
 def _request_bindings(request: Mapping[str, Any]) -> list[dict[str, Any]]:
     state = request.get("state", {})
-    return [{"contribution_id": item.get("contribution_id"),
-             "dependency_edges": [{"id": edge.get("id"), "neighbor_id": edge.get("neighbor_id")}
-                                  for edge in item.get("dependency_edges", [])],
-             "context_complete": state.get("context_complete") is True,
-             "context_limitations": list(state.get("limitations", [])),
-             "evidence_ids": sorted({record.get("evidence_id") for record in (item.get("evidence") or {}).get("records", [])
-                                     if isinstance(record.get("evidence_id"), str)})}
-            for item in state.get("contributions", [])]
+    bindings = []
+    for item in state.get("contributions", []):
+        binding = {"contribution_id": item.get("contribution_id"),
+                   "dependency_edges": [{"id": edge.get("id"), "neighbor_id": edge.get("neighbor_id")}
+                                        for edge in item.get("dependency_edges", [])],
+                   "context_complete": state.get("context_complete") is True,
+                   "context_limitations": list(state.get("limitations", [])),
+                   "evidence_ids": sorted({record.get("evidence_id") for record in (item.get("evidence") or {}).get("records", [])
+                                           if isinstance(record.get("evidence_id"), str)})}
+        if "comparison_context_complete" in item:
+            binding["comparison_context_complete"] = item.get("comparison_context_complete") is True
+            binding["comparison_context_limitations"] = list(item.get("comparison_context_limitations", []))
+        if "dependency_context_status" in item:
+            status = item.get("dependency_context_status")
+            if status not in {"complete", "unknown", "incomplete"}:
+                raise JgError("presence binding has an invalid dependency context status")
+            binding["dependency_context_status"] = status
+            binding["dependency_context_limitations"] = list(item.get("dependency_context_limitations", []))
+        bindings.append(binding)
+    return bindings
 
 
 def _answers_digest(artifact: Mapping[str, Any]) -> str:
@@ -130,6 +142,8 @@ def _validate_sanitized_answers(bindings: list[Mapping[str, Any]], response: Map
         expected[prefix + "evidence_sufficient"] = "noul"
         expected[prefix + "presence"] = "choice"
         expected[prefix + "usable_delta"] = "noul"
+        if "dependency_context_status" in binding:
+            expected[prefix + "dependency_context_sufficient"] = "noul"
         for edge in binding.get("dependency_edges", []):
             edge_id = edge.get("id")
             if not isinstance(edge_id, str) or not edge_id:
@@ -435,6 +449,10 @@ def reconcile_presence(
             suff = _bool_signal(_answer_value(answers, prefix + "evidence_sufficient", "noul"))
             presence = _answer_value(answers, prefix + "presence", "choice")
             delta = _bool_signal(_answer_value(answers, prefix + "usable_delta", "noul"))
+            dependency_context_sufficient = (
+                _bool_signal(_answer_value(answers, prefix + "dependency_context_sufficient", "noul"))
+                if "dependency_context_status" in contribution else None
+            )
             deps = []
             for edge in contribution.get("dependency_edges", []):
                 edge_id = edge.get("id")
@@ -445,6 +463,11 @@ def reconcile_presence(
                 "evidence_sufficient": suff is True, "_suff": suff, "usable_delta": delta,
                 "context_complete": contribution.get("context_complete") is True,
                 "context_limitations": contribution.get("context_limitations", []),
+                "comparison_context_complete": contribution.get("comparison_context_complete") is True,
+                "comparison_context_limitations": contribution.get("comparison_context_limitations", []),
+                "dependency_context_status": contribution.get("dependency_context_status", "unknown"),
+                "dependency_context_limitations": contribution.get("dependency_context_limitations", []),
+                "dependency_context_sufficient": dependency_context_sufficient,
                 "dependencies": deps, "evidence_ids": evidence_ids, "request_sha256": request_sha,
                 "group_id": record.get("group_id")})
 
@@ -473,17 +496,42 @@ def reconcile_presence(
             contradiction = True
         sufficient = bool(observations) and all(item["_suff"] is True for item in observations)
         presence = next(iter(presences)) if len(presences) == 1 else "UNKNOWN"
-        delta = next(iter(deltas)) if len(deltas) == 1 else None
+        model_delta = next(iter(deltas)) if len(deltas) == 1 else None
+        comparison_context_complete = bool(observations) and all(
+            item["comparison_context_complete"] for item in observations
+        )
+        dependency_statuses = {item["dependency_context_status"] for item in observations}
+        dependency_context_status = (
+            "complete" if observations and dependency_statuses == {"complete"}
+            else "incomplete" if "incomplete" in dependency_statuses
+            else "unknown"
+        )
+        dependency_context_sufficient = (
+            True if observations and all(item["dependency_context_sufficient"] is True for item in observations)
+            else False if any(item["dependency_context_sufficient"] is False for item in observations)
+            else None
+        )
+        delta = model_delta if (
+            dependency_context_status == "complete" and dependency_context_sufficient is True
+        ) else None
         dependencies = [{"edge_id": edge_id,
                          "relevant": next(iter(values)) if len(values) == 1 else None}
                         for edge_id, values in sorted(dependencies_by_edge.items())]
         if not sufficient:
             reasons.add("insufficient_evidence_unresolved")
-        if any(not item["context_complete"] for item in observations):
-            reasons.add("group_context_incomplete")
+        if observations and not comparison_context_complete:
+            reasons.add("comparison_context_incomplete")
+        if dependency_context_status == "unknown":
+            reasons.add("dependency_context_unknown")
+        elif dependency_context_status == "incomplete":
+            reasons.add("dependency_context_incomplete")
+        if dependency_context_status == "complete" and dependency_context_sufficient is not True:
+            reasons.add("dependency_context_insufficient")
         if presence == "UNKNOWN":
             reasons.add("presence_unknown")
-        if contradiction or not sufficient or any(not item["context_complete"] for item in observations) or presence == "UNKNOWN" or delta is None:
+        if (contradiction or not sufficient or not comparison_context_complete
+                or dependency_context_status != "complete" or dependency_context_sufficient is not True
+                or presence == "UNKNOWN" or delta is None):
             disposition = "UNRESOLVED"
         elif delta is True and presence in {"PARTIAL", "ABSENT"}:
             disposition = "USABLE_WORK_REMAINS"
@@ -496,7 +544,18 @@ def reconcile_presence(
         suff_value = True if sufficient else False if any(item["_suff"] is False for item in observations) else None
         result_rows.append({"contribution_id": cid, "disposition": disposition,
                             "presence": presence, "evidence_sufficient": suff_value,
-                            "usable_delta": delta, "reasons": sorted(reasons),
+                            "usable_delta": delta, "model_usable_delta": model_delta,
+                            "comparison_context_complete": comparison_context_complete,
+                            "comparison_context_limitations": sorted({reason for item in observations
+                                for reason in item["comparison_context_limitations"]}),
+                            "dependency_context_status": dependency_context_status,
+                            "dependency_context_sufficient": dependency_context_sufficient,
+                            "dependency_context_limitations": sorted({reason for item in observations
+                                for reason in item["dependency_context_limitations"]}),
+                            "group_context_complete": bool(observations) and all(item["context_complete"] for item in observations),
+                            "group_context_limitations": sorted({reason for item in observations
+                                for reason in item["context_limitations"]}),
+                            "reasons": sorted(reasons),
                             "dependencies": dependencies, "evidence_ids": sorted(evidence_ids),
                             "answer_request_ids": sorted({item["request_sha256"] for item in observations}),
                             "routing_scope": "production_review_candidate" if routeable else "advisory_only"})
@@ -544,6 +603,10 @@ def validate_outcome_presence(presence: Mapping[str, Any], contributions: Mappin
             if (presence.get("origin") != "jev" or row.get("evidence_sufficient") is not True
                     or row.get("disposition") == "UNRESOLVED"):
                 raise JgError("presence row does not meet production review routing gates")
+            if (row.get("comparison_context_complete") is not True
+                    or row.get("dependency_context_status") != "complete"
+                    or row.get("dependency_context_sufficient") is not True):
+                raise JgError("presence row lacks complete comparison and dependency context")
             if row.get("disposition") == "LIKELY_PRESERVED" and not (
                 row.get("presence") == "PRESENT" and row.get("usable_delta") is False
             ):

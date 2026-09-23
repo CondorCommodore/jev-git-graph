@@ -18,6 +18,7 @@ from jev_git_graph.presence import (
     validate_outcome_presence,
 )
 from jev_git_graph.presence_calibration import build_presence_calibration
+from jev_git_graph.questions import presence_questions
 from jev_git_graph.safety import digest
 
 
@@ -42,11 +43,17 @@ def _artifact():
     return contribution, groups
 
 
-def _response(request, presence="PRESENT", sufficient=0.95, delta=0.05):
+def _response(request, presence="PRESENT", sufficient=0.95, delta=0.05,
+              dependencies_sufficient=0.95):
     answers = {}
     for qid, question in request["questions"].items():
         if question["type"] == "noul":
-            value = sufficient if qid.endswith(":evidence_sufficient") else delta
+            if qid.endswith(":evidence_sufficient"):
+                value = sufficient
+            elif qid.endswith(":dependency_context_sufficient"):
+                value = dependencies_sufficient
+            else:
+                value = delta
             answers[qid] = {"noul": value}
         else:
             answers[qid] = {
@@ -66,6 +73,24 @@ def _synthetic_result(contributions, groups, plan, choices):
     return preview, reconcile_presence(contributions, groups, artifact)
 
 
+def _add_context_contract(plan, *, comparison_complete=True, dependency_status="complete"):
+    """Exercise new per-unit context metadata without depending on group builder changes."""
+    for request in plan["requests"]:
+        state = request["state"]
+        rebuilt = {}
+        for item in state["contributions"]:
+            item["comparison_context_complete"] = comparison_complete
+            item["comparison_context_limitations"] = [] if comparison_complete else ["range_missing"]
+            item["dependency_context_status"] = dependency_status
+            item["dependency_context_limitations"] = [] if dependency_status == "complete" else ["references_not_extracted"]
+            cid = item["contribution_id"]
+            for question_id, question in presence_questions(
+                cid, item.get("dependency_edges", []), dependency_context_status=dependency_status,
+            ).items():
+                rebuilt[f"{cid}:{question_id}"] = question
+        request["questions"] = rebuilt
+
+
 def test_synthetic_answers_are_advisory_and_origin_cannot_be_overridden():
     contributions, groups = _artifact()
     plan = build_group_requests(contributions, groups)
@@ -75,7 +100,8 @@ def test_synthetic_answers_are_advisory_and_origin_cannot_be_overridden():
         assert result["contributions"][0]["disposition"] == "LIKELY_PRESERVED"
     else:
         assert result["contributions"][0]["disposition"] == "UNRESOLVED"
-        assert "group_context_incomplete" in result["contributions"][0]["reasons"]
+        assert result["contributions"][0]["group_context_complete"] is False
+        assert result["contributions"][0]["dependency_context_status"] == "unknown"
     assert result["contributions"][0]["routing_scope"] == "advisory_only"
     assert validate_outcome_presence(result, contributions) == {}
     with pytest.raises(JgError, match="origin override"):
@@ -105,7 +131,50 @@ def test_overlapping_contradiction_and_incomplete_group_remain_unresolved():
     plan = build_group_requests(contributions, groups)
     _, incomplete = _synthetic_result(contributions, groups, plan, [{}])
     assert incomplete["contributions"][0]["disposition"] == "UNRESOLVED"
-    assert "group_context_incomplete" in incomplete["contributions"][0]["reasons"]
+    assert incomplete["contributions"][0]["group_context_complete"] is False
+    assert incomplete["contributions"][0]["comparison_context_complete"] is False
+
+
+def test_empty_dependency_edges_do_not_claim_complete_dependency_context():
+    contributions, groups = _artifact()
+    plan = build_group_requests(contributions, groups)
+    _add_context_contract(plan, dependency_status="unknown")
+    preview, result = _synthetic_result(contributions, groups, plan, [{"dependencies_sufficient": 0.99}])
+    row = result["contributions"][0]
+    assert row["presence"] == "PRESENT"
+    assert row["model_usable_delta"] is False
+    assert row["usable_delta"] is None
+    assert row["dependency_context_status"] == "unknown"
+    assert row["disposition"] == "UNRESOLVED"
+    assert "dependency_context_unknown" in row["reasons"]
+    assert row["routing_scope"] == "advisory_only"
+
+
+def test_resolved_per_unit_context_can_route_without_global_group_completeness():
+    contributions, groups = _artifact()
+    groups["groups"][0]["context_complete"] = False
+    groups["groups"][0]["limitations"] = ["partition_has_known_cross_group_edges"]
+    groups["groups_digest"] = digest({key: value for key, value in groups.items() if key != "groups_digest"})
+    plan = build_group_requests(contributions, groups)
+    _add_context_contract(plan, comparison_complete=True, dependency_status="complete")
+    _, result = _synthetic_result(contributions, groups, plan, [{}])
+    row = result["contributions"][0]
+    assert row["group_context_complete"] is False
+    assert row["comparison_context_complete"] is True
+    assert row["dependency_context_status"] == "complete"
+    assert "group_context_incomplete" not in row["reasons"]
+    assert row["disposition"] == "LIKELY_PRESERVED"
+
+
+def test_missing_comparison_ranges_keep_presence_advisory():
+    contributions, groups = _artifact()
+    plan = build_group_requests(contributions, groups)
+    _add_context_contract(plan, comparison_complete=False, dependency_status="complete")
+    _, result = _synthetic_result(contributions, groups, plan, [{}])
+    row = result["contributions"][0]
+    assert row["presence"] == "PRESENT"
+    assert row["disposition"] == "UNRESOLVED"
+    assert "comparison_context_incomplete" in row["reasons"]
 
 
 def test_calibration_excludes_unreviewed_labels_and_uses_matched_cases():
