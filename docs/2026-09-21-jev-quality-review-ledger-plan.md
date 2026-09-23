@@ -31,10 +31,18 @@ main. Ask independently:
 1. Is the supplied evidence sufficient to identify this source contribution
    and inspect the relevant destination code? Low sufficiency means **unknown**,
    not false for the remaining questions.
-2. Does the pinned destination implement or contain this contribution? State
-   the specific destination unit and evidence ranges supporting the answer.
-3. Is any usable behavior from this source contribution absent from the pinned
-   destination? State the source unit and evidence ranges supporting the answer.
+2. Does the pinned destination implement or contain this named contribution?
+3. Is any usable behavior from this named source contribution absent from the
+   pinned destination?
+
+Jev returns typed answers, not generated citations. Local code must assign
+stable IDs to source contributions, destination units, and approved evidence
+ranges before the request. A request's shared `state` should include a bounded
+connected relationship group, with its known boundary edges, and its
+`questions` should identify the contribution IDs being judged. Code joins each
+typed answer back to those pinned IDs and hashes. A model answer cannot invent
+an evidence range or prove one was inspected. Compare this group-context form
+with the original pairwise form in the blinded calibration.
 
 The revised code profile must provide approved, bounded **both-source-and-
 destination** excerpts, with blob IDs and range hashes for each. The present
