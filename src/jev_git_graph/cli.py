@@ -29,7 +29,7 @@ from .snapshot import load_snapshot, write_snapshot
 from .contributions import write_contributions
 from .groups import write_groups
 from .outcomes import write_outcomes
-from .study import write_study
+from .study import build_selected_study, write_selected_study_artifacts, write_study
 from .snapshot import load_snapshot
 from .transient_preview import serve_presence_preview
 
@@ -80,9 +80,21 @@ def _build_group_presence_preview(args):
         if len(selected_ids) != len(cases) or len(selected_ids) != len(set(selected_ids)):
             raise JgError("study cases must have unique contribution IDs")
         selection_digest = study["study_digest"]
+        if study.get("selection_policy") == "explicit-validated-case-list-v1":
+            expected_arms = {case["contribution_id"]: case.get("selection_arm") for case in cases}
+            if range_manifest.get("selection_digest") != study.get("selection_manifest_digest"):
+                raise JgError("explicit study and evidence ranges do not share the selection manifest digest")
+            range_items = range_manifest["ranges"]
+            range_arms = {item.get("contribution_id"): item.get("arm")
+                          for item in range_items if isinstance(item, dict)}
+            if len(range_arms) != len(range_items) or range_arms != expected_arms:
+                raise JgError("explicit study and evidence range arms do not match")
     model_settings = read_json(args.model_settings) if args.model_settings else None
     units = {unit["id"]: unit for unit in contributions.get("units", [])}
     evidence_by_contribution = {}
+    source_only_excerpt_count = 0
+    source_only_excerpt_lines = 0
+    source_only_excerpt_bytes = 0
     for item in range_manifest["ranges"]:
         if not isinstance(item, dict) or item.get("contribution_id") not in units:
             raise JgError("evidence range manifest refers to an unknown contribution")
@@ -92,7 +104,46 @@ def _build_group_presence_preview(args):
         approved_ranges = item.get("ranges")
         if not isinstance(approved_ranges, list):
             raise JgError("evidence ranges must be a list")
-        if approved_ranges:
+        if item.get("arm") == "source_only_unknown":
+            if unit.get("destination_ids") or unit.get("dependency_context_status") != "unknown":
+                raise JgError("source-only evidence requires an unknown unit with no destination candidates")
+            if not approved_ranges or source_only_excerpt_count >= 8 or source_only_excerpt_lines >= 240:
+                raise JgError("source-only cohort lacks room for its bounded approved source excerpts")
+            first = approved_ranges[0]
+            source_range = first.get("source_range", {})
+            start_line, end_line = source_range.get("start_line"), source_range.get("end_line")
+            if (not isinstance(start_line, int) or not isinstance(end_line, int)
+                    or start_line < 1 or end_line < start_line):
+                raise JgError("source-only range manifest has invalid line bounds")
+            emitted_lines = min(30, 240 - source_only_excerpt_lines, end_line - start_line + 1)
+            emitted = {"evidence_id": first.get("evidence_id"),
+                       "source_path": first.get("source_path"),
+                       "source_range": {"start_line": start_line,
+                                        "end_line": start_line + emitted_lines - 1}}
+            evidence = build_source_only_evidence(
+                object_repo, item["source_tip"], item["destination_tip"], [emitted],
+                max_total_bytes=24_000 - source_only_excerpt_bytes,
+                max_excerpt_count=8 - source_only_excerpt_count,
+                max_total_lines=240 - source_only_excerpt_lines)
+            omitted_ranges = []
+            if emitted["source_range"]["end_line"] < end_line:
+                omitted_ranges.append({"source_path": first.get("source_path"),
+                                       "source_range": {"start_line": emitted["source_range"]["end_line"] + 1,
+                                                        "end_line": end_line}})
+            omitted_ranges.extend({"source_path": spec.get("source_path"),
+                                   "source_range": spec.get("source_range")}
+                                  for spec in approved_ranges[1:])
+            evidence["excerpt_scope"] = "bounded approved source excerpt only; destination presence and integration remain unknown"
+            evidence["source_context_non_exhaustive"] = True
+            evidence["omitted_source_range_count"] = len(omitted_ranges)
+            evidence["omitted_source_ranges_digest"] = digest(omitted_ranges)
+            evidence["evidence_digest"] = digest({key: value for key, value in evidence.items()
+                                                    if key != "evidence_digest"})
+            evidence_by_contribution[item["contribution_id"]] = evidence
+            source_only_excerpt_count += len(evidence["records"])
+            source_only_excerpt_lines += emitted_lines
+            source_only_excerpt_bytes += evidence["total_bytes"]
+        elif approved_ranges:
             evidence_by_contribution[item["contribution_id"]] = build_two_sided_evidence(
                 object_repo, item["source_tip"], item["destination_tip"], approved_ranges)
         # An explicitly selected case with no approved pair stays in the request
@@ -114,6 +165,20 @@ def _build_group_presence_preview(args):
         # This is a labeled conservative planning heuristic, not a tokenizer
         # measurement: one token per serialized byte plus provider framing headroom.
         estimate = sizing["payload_bytes"] + 256 * sizing["request_count"]
+        if estimate > args.max_provider_tokens:
+            sizes = [len(canonical_json(request)) for request in sizing["requests"]]
+            maps = [len(canonical_json({
+                "case_ids": request.get("state", {}).get("cohort_contribution_ids", []),
+                "edges": request.get("state", {}).get("cohort_relationship_edges", []),
+            })) for request in sizing["requests"]]
+            raise JgError(
+                "serialized_utf8_bytes_plus_256_per_request_v1 estimate "
+                f"{estimate} exceeds max_provider_tokens {args.max_provider_tokens}; "
+                f"serialized_bytes={sizing['payload_bytes']}; requests={sizing['request_count']}; "
+                f"max_request_bytes={max(sizes, default=0)}; "
+                f"mean_request_bytes={(sum(sizes) / len(sizes)) if sizes else 0:.1f}; "
+                f"cohort_map_bytes_max={max(maps, default=0)}"
+            )
         plan = build_group_requests(
             contributions, groups, evidence_by_contribution, **plan_kwargs,
             estimated_input_tokens=estimate, max_provider_tokens=args.max_provider_tokens,
@@ -124,6 +189,20 @@ def _build_group_presence_preview(args):
             estimated_input_tokens=args.estimated_input_tokens,
             max_provider_tokens=args.max_provider_tokens)
     preview = approved_presence_preview(plan)
+    excerpt_stats = []
+    for request in preview["requests"]:
+        cases_with_excerpt, excerpt_count, excerpt_bytes, excerpt_lines = [], 0, 0, 0
+        for item in request.get("state", {}).get("contributions", []):
+            evidence = item.get("evidence") or {}
+            records = evidence.get("records", [])
+            if records:
+                cases_with_excerpt.append(item.get("contribution_id"))
+                excerpt_count += len(records)
+                excerpt_bytes += int(evidence.get("total_bytes", 0))
+                excerpt_lines += sum(len(side.get("text", "").splitlines()) for record in records
+                                     for side in record.values() if isinstance(side, dict) and "text" in side)
+        excerpt_stats.append({"case_ids_with_excerpt": cases_with_excerpt, "excerpt_count": excerpt_count,
+                              "excerpt_bytes": excerpt_bytes, "excerpt_lines": excerpt_lines})
     replay = {
         "kind": "branch-presence-approved-manifest", "schema_version": 1,
         "snapshot_digest": snapshot["snapshot_digest"],
@@ -136,6 +215,24 @@ def _build_group_presence_preview(args):
         "model_settings_digest": preview["model_settings_digest"],
         "request_budgets": preview["request_budgets"],
         "request_count": preview["request_count"], "payload_bytes": preview["payload_bytes"],
+        "request_bytes_by_chunk": preview["request_bytes_by_chunk"],
+        "request_case_ids": [[item.get("contribution_id") for item in request.get("state", {}).get("contributions", [])]
+                             for request in preview["requests"]],
+        "request_question_case_ids": [sorted({key.split(":", 1)[0] for key in request.get("questions", {})})
+                                       for request in preview["requests"]],
+        "request_excerpt_stats": excerpt_stats,
+        "source_only_unknown_ids": sorted(case.get("contribution_id") for case in (study or {}).get("cases", [])
+                                           if case.get("selection_arm") == "source_only_unknown"),
+        "two_sided_control_ids": sorted(case.get("contribution_id") for case in (study or {}).get("cases", [])
+                                         if case.get("selection_arm") == "two_sided_control"),
+        "cohort_case_count": len(selected_ids or []),
+        "cohort_relationship_edge_count": max(
+            (request.get("state", {}).get("cohort_relationship_edge_count", 0) for request in preview["requests"]),
+            default=0),
+        "cohort_relationship_edge_digest": next((request.get("state", {}).get("cohort_relationship_edge_digest")
+                                                  for request in preview["requests"]), None),
+        "cohort_relationships_non_exhaustive": bool(preview["requests"] and
+            preview["requests"][0].get("state", {}).get("cohort_relationships_non_exhaustive")),
         "payload_sha256": preview["payload_sha256"], "plan_digest": preview["plan_digest"],
         "approval_sha256": preview["approval_sha256"],
     }
@@ -173,6 +270,7 @@ def _cleanup_executor_context(repo: str, plan: dict, journal_arg: str | None,
 from .group_requests import (
     approved_presence_preview,
     build_group_requests,
+    build_source_only_evidence,
     build_two_sided_evidence,
 )
 from .presence import (
@@ -265,6 +363,7 @@ def parser() -> argparse.ArgumentParser:
     study.add_argument("--max-per-family", type=int, default=4)
     study.add_argument("--exclude-branch", action="append", default=[])
     study.add_argument("--project-goals", default="")
+    study.add_argument("--selection-manifest", help="digest-bound explicit contribution IDs and evidence arms")
     study.add_argument("--selection-policy", choices=("candidate-availability-24-8-v2", "dependency-complete-majority-v1"),
                        default="candidate-availability-24-8-v2")
 
@@ -479,6 +578,11 @@ def run(args: argparse.Namespace) -> str:
         if contributions.get("repository_id") != opaque_path_id(root):
             raise JgError("contributions belong to a different local repository")
         target = validate_output_path(args.out, [*protected_worktree_paths(args.repo), common])
+        if args.selection_manifest:
+            selection = read_json(args.selection_manifest)
+            groups = read_json(args.groups)
+            result, range_manifest = build_selected_study(contributions, groups, selection)
+            return str(write_selected_study_artifacts(result, range_manifest, target))
         return str(write_study(args.contributions, args.groups, target, args.count,
                                args.max_per_family, args.exclude_branch, args.project_goals, args.selection_policy))
     if args.command == "outcomes":

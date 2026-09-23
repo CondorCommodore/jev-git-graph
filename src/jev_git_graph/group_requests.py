@@ -131,6 +131,50 @@ def build_two_sided_evidence(
     return result
 
 
+def build_source_only_evidence(
+    repo: str | Path,
+    source_tip: str,
+    destination_tip: str,
+    ranges: Iterable[Mapping[str, Any]],
+    *,
+    max_total_bytes: int = DEFAULT_MAX_EVIDENCE_BYTES,
+    max_excerpt_count: int = 8,
+    max_total_lines: int = 320,
+) -> dict[str, Any]:
+    """Build transient source excerpts for an explicit no-destination case."""
+    root = Path(repo).expanduser().resolve()
+    for label, value in (("max_total_bytes", max_total_bytes), ("max_excerpt_count", max_excerpt_count),
+                         ("max_total_lines", max_total_lines)):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise JgError(f"{label} must be a positive integer")
+    range_specs = list(ranges)
+    if any(not isinstance(spec, Mapping) for spec in range_specs):
+        raise JgError("source-only evidence ranges must be objects")
+    if any(spec.get("destination_id") is not None or spec.get("destination_path") is not None
+           or spec.get("destination_range") is not None for spec in range_specs):
+        raise JgError("source-only evidence cannot contain a destination candidate or range")
+    source_tip, destination_tip = _oid(source_tip, "source_tip"), _oid(destination_tip, "destination_tip")
+    for tip, label in ((source_tip, "source"), (destination_tip, "destination")):
+        resolved = _git(root, "rev-parse", "--verify", f"{tip}^{{commit}}")
+        if resolved is None or resolved.decode("ascii", "strict").strip().lower() != tip:
+            raise JgError(f"{label} commit pin is unavailable")
+    records, total_bytes, total_lines = [], 0, 0
+    for spec in range_specs:
+        source = _read_excerpt(root, source_tip, _path(spec.get("source_path")), spec.get("source_range"), "source")
+        total_lines += source["range"]["end_line"] - source["range"]["start_line"] + 1
+        total_bytes += len(source["text"].encode("utf-8"))
+        if len(records) >= max_excerpt_count or total_lines > max_total_lines or total_bytes > max_total_bytes:
+            raise JgError("source-only evidence exceeds its excerpt, line, or byte bound")
+        records.append({"evidence_id": spec.get("evidence_id"), "source": source})
+    if not records:
+        raise JgError("source-only evidence requires an approved source range")
+    result = {"kind": "branch-presence-source-only-evidence", "schema_version": 1,
+              "source_tip": source_tip, "destination_tip": destination_tip,
+              "records": records, "total_bytes": total_bytes}
+    result["evidence_digest"] = digest(result)
+    return result
+
+
 def revalidate_two_sided_evidence(repo: str | Path, evidence: Mapping[str, Any]) -> dict[str, Any]:
     if evidence.get("kind") != "branch-presence-code-evidence" or evidence.get("schema_version") != 1:
         raise JgError("invalid two-sided presence evidence")
@@ -223,6 +267,17 @@ def build_group_requests(
     elif selection_digest is not None:
         raise JgError("selection digest requires selected contribution IDs")
     selected_set = set(selected_ids) if selected_ids is not None else None
+    cohort_edge_rows = []
+    if selected_set is not None:
+        cohort_edge_rows = [
+            {"id": edge.get("id") or "edge-" + digest(edge)[:20],
+             "source_id": edge.get("source_id"), "destination_id": edge.get("destination_id"),
+             "kind": edge.get("kind", edge.get("type", "unknown"))}
+            for edge in edges
+            if edge.get("source_id") in selected_set and edge.get("destination_id") in selected_set
+        ]
+        cohort_edge_rows.sort(key=lambda item: (str(item["source_id"]), str(item["destination_id"]),
+                                                str(item["kind"]), str(item["id"])))
     selected_groups = []
     selected_group_members: dict[str, list[str]] = {}
     for group in group_records:
@@ -275,13 +330,15 @@ def build_group_requests(
                              "neighbor_id": edge.get("destination_id"),
                              "kind": edge.get("kind", edge.get("type", "unknown"))}
                             for edge in unit_edges]
+            candidate_ids = unit.get("destination_ids", [])
             unit_questions = presence_questions(
-                unit_id, dependencies, dependency_context_status=unit.get("dependency_context_status"))
+                unit_id, dependencies, dependency_context_status=unit.get("dependency_context_status"),
+                source_only=(not candidate_ids and unit.get("dependency_context_status") == "unknown"))
             for question_id, question in unit_questions.items():
                 questions[f"{unit_id}:{question_id}"] = question
             evidence = evidence_by_contribution.get(unit_id)
             if evidence is not None:
-                if evidence.get("kind") != "branch-presence-code-evidence":
+                if evidence.get("kind") not in {"branch-presence-code-evidence", "branch-presence-source-only-evidence"}:
                     raise JgError(f"invalid approved evidence for {unit_id}")
                 if evidence.get("evidence_digest") != digest({k: v for k, v in evidence.items() if k != "evidence_digest"}):
                     raise JgError(f"approved evidence digest mismatch for {unit_id}")
@@ -290,11 +347,12 @@ def build_group_requests(
                 _validate_evidence_text(evidence)
                 evidence_ids.extend(record.get("evidence_id") for record in evidence.get("records", [])
                                     if isinstance(record.get("evidence_id"), str))
-            source_metadata = {key: unit.get(key) for key in ("source_tip", "main_tip", "path", "mode", "kind", "name", "range", "source_blob", "limitations") if key in unit}
-            source_metadata["identity"] = dict(unit.get("source", {}))
-            candidate_ids = unit.get("destination_ids", [])
+            source_metadata = {key: unit.get(key) for key in
+                               ("source_tip", "main_tip", "path", "kind", "name", "range", "source_blob")
+                               if key in unit}
             comparison_limitations = []
-            if evidence is None or not evidence.get("records"):
+            source_only_evidence = isinstance(evidence, Mapping) and evidence.get("kind") == "branch-presence-source-only-evidence"
+            if evidence is None or not evidence.get("records") or source_only_evidence:
                 comparison_limitations.append("approved_two_sided_evidence_missing")
             if not candidate_ids:
                 comparison_limitations.append("destination_candidate_missing")
@@ -318,6 +376,8 @@ def build_group_requests(
                 comparison_limitations.append("approved_source_range_does_not_match_unit")
             if set(candidate_ids) - covered_candidates:
                 comparison_limitations.append("approved_destination_ranges_incomplete")
+            if source_only_evidence or (not candidate_ids and unit.get("dependency_context_status") == "unknown"):
+                comparison_limitations.append("source_only_unknown_selection")
             source_item = {"contribution_id": unit_id, "source": source_metadata,
                            "destination_ids": candidate_ids,
                            "dependency_edges": dependencies, "evidence": evidence,
@@ -378,38 +438,54 @@ def build_group_requests(
         if not isinstance(all_group_edges, list):
             raise JgError(f"group {group_id} edges must be a list")
         if selected_ids is not None:
+            if any(not isinstance(edge, Mapping) for edge in all_boundary_edges + all_group_edges):
+                raise JgError(f"group {group_id} edge summaries require object records")
             relevant_boundary_edges = [edge for edge in all_boundary_edges
-                                       if isinstance(edge, Mapping) and
-                                       (edge.get("source_id") in target_set or edge.get("destination_id") in target_set)]
+                                       if edge.get("source_id") in target_set or edge.get("destination_id") in target_set]
             omitted_boundary_edges = [edge for edge in all_boundary_edges if edge not in relevant_boundary_edges]
             relevant_group_edges = [edge for edge in all_group_edges
-                                    if isinstance(edge, Mapping) and
-                                    (edge.get("source_id") in target_set or edge.get("destination_id") in target_set)]
+                                    if edge.get("source_id") in target_set or edge.get("destination_id") in target_set]
             omitted_group_edges = [edge for edge in all_group_edges if edge not in relevant_group_edges]
-            boundary_summary = {
-                "original_count": len(all_boundary_edges),
-                "relevant_count": len(relevant_boundary_edges),
-                "omitted_count": len(omitted_boundary_edges),
-                "omitted_ids": sorted(str(edge.get("id", "")) for edge in omitted_boundary_edges
-                                       if isinstance(edge, Mapping)),
-                "omitted_digest": digest(omitted_boundary_edges),
-            }
-            group_edge_summary = {
-                "original_count": len(all_group_edges),
-                "relevant_count": len(relevant_group_edges),
-                "omitted_count": len(omitted_group_edges),
-                "omitted_ids": sorted(str(edge.get("id", "")) for edge in omitted_group_edges
-                                       if isinstance(edge, Mapping)),
-                "omitted_digest": digest(omitted_group_edges),
-            }
-            boundary_edges = relevant_boundary_edges
+            def typed_counts(items):
+                counts = {}
+                for edge in items:
+                    kind = str(edge.get("kind", edge.get("type", "unknown")))
+                    counts[kind] = counts.get(kind, 0) + 1
+                return dict(sorted(counts.items()))
+            def edge_summary(original, relevant, omitted):
+                return {
+                    "original_count": len(original), "original_type_counts": typed_counts(original),
+                    "original_digest": digest(original),
+                    "relevant_count": len(relevant), "relevant_type_counts": typed_counts(relevant),
+                    "relevant_digest": digest(relevant),
+                    "omitted_count": len(omitted), "omitted_type_counts": typed_counts(omitted),
+                    "omitted_digest": digest(omitted), "non_exhaustive": True,
+                }
+            boundary_summary = edge_summary(all_boundary_edges, relevant_boundary_edges, omitted_boundary_edges)
+            group_edge_summary = edge_summary(all_group_edges, relevant_group_edges, omitted_group_edges)
+            # Direct dependency edges are carried on each selected contribution.
+            # Keep only the cohort-internal relationships here; other graph
+            # rows are represented by typed counts and a digest.
+            boundary_edges = []
+            cohort_ids = set(target_ids)
+            cohort_relation_rows = [
+                {"source_id": edge.get("source_id"), "destination_id": edge.get("destination_id"),
+                 "kind": edge.get("kind", edge.get("type", "unknown"))}
+                for edge in relevant_boundary_edges
+                if edge.get("source_id") in cohort_ids and edge.get("destination_id") in cohort_ids
+            ]
+            cohort_relation_rows = sorted(cohort_relation_rows,
+                                          key=lambda item: (str(item["source_id"]),
+                                                            str(item["destination_id"]), str(item["kind"])))
+            relevant_group_edges = []
             destination_ids_for_request = sorted(selected_destination_ids)
             group_destination_ids_summary = {
                 "original_count": len(group.get("destination_ids", [])),
                 "omitted_count": len(set(group.get("destination_ids", [])) - selected_destination_ids),
-                "omitted_ids": sorted(set(group.get("destination_ids", [])) - selected_destination_ids),
                 "original_ids_digest": digest(group.get("destination_ids", [])),
+                "non_exhaustive": True,
             }
+            group_destination_ids_summary["omitted_digest"] = digest(sorted(set(group.get("destination_ids", [])) - selected_destination_ids))
         else:
             boundary_summary = None
             relevant_group_edges = all_group_edges
@@ -424,29 +500,85 @@ def build_group_requests(
                                          or (boundary_summary and boundary_summary["omitted_count"])
                                          or (group_edge_summary and group_edge_summary["omitted_count"])):
             group_limitations.append("study_request_summarizes_unselected_group_context")
-        state = {"group_id": group_id, "contributions": source_items,
+        if selected_ids is not None:
+            # Keep the complete selected cohort relationship map on every
+            # chunk, while evidence excerpts and question sets stay bounded.
+            chunk_limit = 4
+            chunks = [source_items[index:index + chunk_limit]
+                      for index in range(0, len(source_items), chunk_limit)]
+            all_dependency_rows = cohort_edge_rows
+            cohort_dependencies = [edge for edge in cohort_edge_rows
+                                   if str(edge.get("kind", "")).lower() in
+                                   {"dependency", "depends_on", "requires", "prerequisite"}]
+            unselected_group_ids = sorted(set(unit_ids) - target_set)
+        else:
+            chunks = [source_items]
+            all_dependency_rows = []
+            cohort_dependencies = []
+            unselected_group_ids = []
+        for chunk_index, chunk in enumerate(chunks):
+            chunk_ids = {item["contribution_id"] for item in chunk}
+            chunk_questions = {key: value for key, value in questions.items()
+                               if key.split(":", 1)[0] in chunk_ids}
+            chunk_dest_ids = sorted({destination_id for item in chunk
+                                     for destination_id in item.get("destination_ids", [])})
+            chunk_destinations = [item for item in destination_items
+                                  if item.get("id") in chunk_dest_ids]
+            selected_evidence = [item.get("evidence") for item in chunk if item.get("evidence")]
+            excerpt_count = sum(len(evidence.get("records", [])) for evidence in selected_evidence)
+            excerpt_bytes = sum(int(evidence.get("total_bytes", 0)) for evidence in selected_evidence)
+            excerpt_lines = sum(sum(len(side.get("text", "").splitlines())
+                                    for record in evidence.get("records", [])
+                                    for side in record.values() if isinstance(side, Mapping) and "text" in side)
+                                for evidence in selected_evidence)
+            if excerpt_count > 8 or excerpt_bytes > DEFAULT_MAX_EVIDENCE_BYTES or excerpt_lines > 240:
+                raise JgError("selected request chunk exceeds the hard excerpt count, line, or byte limit")
+            chunk_state = {"group_id": group_id, "request_chunk": chunk_index + 1,
+                 "request_chunk_count": len(chunks), "cohort_contribution_ids": sorted(selected_set or target_set),
+                 "cohort_relationship_edges": all_dependency_rows,
+                 "cohort_relationship_edge_count": len(all_dependency_rows),
+                 "cohort_relationship_edge_types": dict(sorted({
+                     str(edge.get("kind", "unknown")): sum(1 for row in all_dependency_rows
+                                                              if str(row.get("kind", "unknown")) == str(edge.get("kind", "unknown")))
+                     for edge in all_dependency_rows}.items())),
+                 "cohort_relationship_edge_digest": digest(all_dependency_rows),
+                 "cohort_dependency_edges": cohort_dependencies,
+                 "cohort_dependency_edge_count": len(cohort_dependencies),
+                 "cohort_dependency_edge_digest": digest(cohort_dependencies),
+                 "cohort_relationships_non_exhaustive": True,
+                 "contributions": chunk,
                  "context_units": context_items,
-                 "context_contribution_ids": [unit_id for unit_id in unit_ids if unit_id not in target_set],
-                 "destination_ids": destination_ids_for_request,
-                 "destinations": destination_items,
-                 "group_edges": relevant_group_edges,
+                 "context_contribution_ids": [],
+                 "context_contribution_ids_summary": {
+                     "count": len(unselected_group_ids), "digest": digest(unselected_group_ids),
+                     "non_exhaustive": True,
+                 },
+                 "destination_ids": chunk_dest_ids,
+                 "destinations": chunk_destinations,
+                 "group_edges": [],
                  "group_edge_summary": group_edge_summary,
                  "boundary_edges": boundary_edges,
                  "boundary_summary": boundary_summary,
                  "group_destination_ids_summary": group_destination_ids_summary,
-                 "limitations": sorted(set(group_limitations)), "omissions": group_omitted,
+                 "limitations": sorted(set(group_limitations + (["selected_cohort_metadata_compacted_non_exhaustive"] if selected_ids is not None else []))), "omissions": group_omitted,
                  "context_complete": group.get("context_complete") is True and not group_limitations,
-                 "evidence_ids": sorted(set(evidence_ids))}
-        requests.append({"state": state, "model": settings["model"], "questions": questions})
+                 "evidence_ids": sorted({record.get("evidence_id") for item in chunk
+                                           for record in (item.get("evidence") or {}).get("records", [])
+                                           if isinstance(record.get("evidence_id"), str)})}
+            requests.append({"state": chunk_state, "model": settings["model"], "questions": chunk_questions})
     size = len(canonical_json(requests))
-    if size > max_request_bytes:
+    request_sizes = [len(canonical_json(request)) for request in requests]
+    oversized = [index + 1 for index, request_size in enumerate(request_sizes)
+                 if request_size > max_request_bytes]
+    if oversized or (selected_ids is None and size > max_request_bytes) or (selected_ids is not None and size > 1_000_000):
         field_sizes = {key: sum(len(canonical_json(request.get("questions") if key == "questions"
                                                     else request.get("state", {}).get(key)))
                                 for request in requests)
                        for key in ("contributions", "context_units", "destinations", "group_edges",
                                    "group_edge_summary", "boundary_edges", "boundary_summary",
                                    "group_destination_ids_summary", "questions")}
-        raise JgError(f"group request payload is {size} bytes, exceeds max_request_bytes; field_bytes={field_sizes}")
+        raise JgError(f"group request payload sizes={request_sizes} bytes; oversized_chunks={oversized}; "
+                      f"aggregate={size}; field_bytes={field_sizes}")
     return {"kind": "branch-presence-request-plan", "schema_version": 1,
             "question_version": PRESENCE_QUESTION_VERSION,
             "snapshot_digest": contributions.get("snapshot_digest"),
@@ -458,6 +590,7 @@ def build_group_requests(
             "requests": requests, "omitted": omitted,
             "model_settings": settings, "model_settings_digest": digest(settings),
             "request_budgets": {"max_groups": max_groups, "max_request_bytes": max_request_bytes,
+                                "max_aggregate_request_bytes": 1_000_000 if selected_ids is not None else max_request_bytes,
                                 "estimated_input_tokens": estimated_input_tokens,
                                 "max_provider_tokens": max_provider_tokens,
                                 "token_estimator": (token_estimator or "caller_supplied") if estimated_input_tokens is not None else "unavailable",
@@ -471,6 +604,7 @@ def build_group_requests(
                                     "model_settings_digest": digest(settings),
                                     "request_budgets": {"max_groups": max_groups,
                                         "max_request_bytes": max_request_bytes,
+                                        "max_aggregate_request_bytes": 1_000_000 if selected_ids is not None else max_request_bytes,
                                         "estimated_input_tokens": estimated_input_tokens,
                                         "max_provider_tokens": max_provider_tokens,
                                         "token_estimator": (token_estimator or "caller_supplied") if estimated_input_tokens is not None else "unavailable",
@@ -484,6 +618,11 @@ def approved_presence_preview(plan: Mapping[str, Any]) -> dict[str, Any]:
         raise JgError("invalid branch-presence request plan")
     payload_sha = digest(requests)
     request_bytes = canonical_json(requests)
+    request_sizes = [len(canonical_json(request)) for request in requests]
+    if any(size > DEFAULT_MAX_REQUEST_BYTES for size in request_sizes):
+        raise JgError("selected request exceeds the fixed per-request byte limit")
+    if len(request_bytes) > 1_000_000:
+        raise JgError("selected request batch exceeds the 1 MB aggregate preview limit")
     return {"kind": "branch-presence-preview", "schema_version": 1,
             "question_version": PRESENCE_QUESTION_VERSION,
             "snapshot_digest": plan.get("snapshot_digest"),
@@ -492,6 +631,7 @@ def approved_presence_preview(plan: Mapping[str, Any]) -> dict[str, Any]:
             "selected_contribution_ids": plan.get("selected_contribution_ids"),
             "selection_digest": plan.get("selection_digest"),
             "request_count": len(requests), "payload_bytes": len(request_bytes),
+            "request_bytes_by_chunk": request_sizes,
             "payload_sha256": payload_sha, "request_bytes_base64": base64.b64encode(request_bytes).decode("ascii"),
             "requests": requests, "model_settings": plan.get("model_settings"),
             "model_settings_digest": plan.get("model_settings_digest"),
@@ -505,8 +645,11 @@ def approved_presence_preview(plan: Mapping[str, Any]) -> dict[str, Any]:
 
 def _validate_evidence_text(evidence: Mapping[str, Any]) -> None:
     records = evidence.get("records")
+    source_only = evidence.get("kind") == "branch-presence-source-only-evidence"
+    if evidence.get("kind") not in {"branch-presence-code-evidence", "branch-presence-source-only-evidence"}:
+        raise JgError("approved presence evidence has an unsupported kind")
     if not isinstance(records, list) or not records or len(records) > 8:
-        raise JgError("approved presence evidence must contain source and destination excerpts")
+        raise JgError("approved presence evidence must contain bounded source excerpts")
     total = 0
     total_lines = 0
     seen_ids: set[str] = set()
@@ -518,7 +661,7 @@ def _validate_evidence_text(evidence: Mapping[str, Any]) -> None:
             if not isinstance(evidence_id, str) or not evidence_id or evidence_id in seen_ids:
                 raise JgError("approved presence evidence IDs must be unique non-empty strings")
             seen_ids.add(evidence_id)
-        for side_name in ("source", "destination"):
+        for side_name in (("source",) if source_only else ("source", "destination")):
             side = record.get(side_name)
             if not isinstance(side, Mapping):
                 raise JgError("approved presence evidence is missing a side")
@@ -540,6 +683,7 @@ def _validate_evidence_text(evidence: Mapping[str, Any]) -> None:
             total_lines += end - start + 1
             _reject_sensitive(text)
             total += len(encoded)
+    line_limit = 320 if source_only else 240
     if (total != evidence.get("total_bytes") or total > DEFAULT_MAX_EVIDENCE_BYTES
-            or total_lines > 240):
+            or total_lines > line_limit):
         raise JgError("approved presence evidence byte count is invalid")
