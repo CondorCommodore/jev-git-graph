@@ -12,7 +12,7 @@ Jev use is separate and opt-in. Before a live request, the tool shows the exact 
 
 ## Run it
 
-The initial CLI has no runtime dependency beyond Python and Git. Install it into an environment you control, then choose an artifact directory that is outside the repository being inspected:
+Local analysis needs only Python and Git. Live Jev requests also need `curl`; the client passes the API key through a pipe so it does not appear in process arguments. Install the CLI into an environment you control, then choose an artifact directory that is outside the repository being inspected:
 
 ```bash
 python -m pip install -e .

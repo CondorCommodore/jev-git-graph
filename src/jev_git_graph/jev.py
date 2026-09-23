@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import os
+import subprocess
 import tempfile
 import fcntl
 from contextlib import contextmanager
@@ -11,8 +12,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic
 from typing import Any, Callable, Mapping
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
 from .errors import JgError
 from .questions import QUESTION_IDS, QUESTION_VERSION, relationship_questions
@@ -300,20 +299,43 @@ def write_preview(candidates_path: str | Path, output: str | Path, evidence_prof
 
 
 def _default_transport(payload: dict[str, Any], token: str) -> dict[str, Any]:
-    data = canonical_json(payload)
-    request = Request(
-        JEV_ENDPOINT,
-        data=data,
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Accept": "application/json"},
-        method="POST",
-    )
+    if not token or "\n" in token or "\r" in token:
+        raise JgError("Jev credential is unavailable or malformed")
+    # curl reaches TypeSafe from this host; urllib's HTTP fingerprint is denied
+    # by the edge. Pass the secret header through a pipe, never process argv.
+    header_fd, writer = os.pipe()
     try:
-        with urlopen(request, timeout=30) as response:  # nosec B310: explicit operator opt-in
-            return json.loads(response.read().decode("utf-8"))
-    except HTTPError as exc:
-        raise JgError(f"Jev HTTP error: {exc.code}") from None
-    except URLError as exc:
+        os.write(writer, f"Authorization: Bearer {token}\n".encode("utf-8"))
+        os.close(writer)
+        writer = -1
+        completed = subprocess.run(
+            ["curl", "--silent", "--show-error", "--max-time", "30",
+             "--request", "POST", "--header", f"@/dev/fd/{header_fd}",
+             "--header", "Content-Type: application/json", "--header", "Accept: application/json",
+             "--data-binary", "@-", "--write-out", "\n%{http_code}", JEV_ENDPOINT],
+            input=canonical_json(payload), stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, pass_fds=(header_fd,), timeout=35,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
         raise JgError("Jev network error") from None
+    finally:
+        os.close(header_fd)
+        if writer != -1:
+            os.close(writer)
+    if completed.returncode:
+        raise JgError("Jev network error")
+    try:
+        body, status_text = completed.stdout.rsplit(b"\n", 1)
+        status = int(status_text)
+    except (ValueError, TypeError):
+        raise JgError("Jev response framing error") from None
+    if status != 200:
+        raise JgError(f"Jev HTTP error: {status}")
+    try:
+        return json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        raise JgError("Jev JSON response invalid") from None
 
 
 class _ResponseValidationError(Exception):
@@ -504,11 +526,7 @@ def execute_preview(
             "input_tokens": response["usage"]["input_tokens"],
             "output_tokens": response["usage"]["output_tokens"],
         })
-        recorded_response = (
-            sanitize_provider_response(request, response)
-            if evidence_profile == CODE_EVIDENCE_PROFILE
-            else response
-        )
+        recorded_response = sanitize_provider_response(request, response)
         ledger["relations"].append({
             "judgment_id": request_digest,
             "request_sha256": request_digest,
