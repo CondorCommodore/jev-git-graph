@@ -14,7 +14,7 @@ from jev_git_graph.errors import JgError
 from jev_git_graph.snapshot import export_pinned_repository, _git_env
 
 
-def build_contributions(snapshot, repo):
+def build_contributions(snapshot, repo, **kwargs):
     """Use the production independent object-store contract in every fixture."""
     pins = [snapshot['main']['tip']]
     for branch in snapshot['branches']:
@@ -25,7 +25,7 @@ def build_contributions(snapshot, repo):
     with tempfile.TemporaryDirectory(dir='/private/tmp') as temporary:
         store = Path(temporary) / 'objects.git'
         export_pinned_repository(repo, pins, store)
-        return _build_contributions(snapshot, store)
+        return _build_contributions(snapshot, store, **kwargs)
 
 
 def git(repo: Path, *args: str, input_text: str | None = None) -> str:
@@ -167,6 +167,41 @@ def test_alias_ids_are_branch_distinct_and_excluded_or_unpinned_refs_are_not_ana
     assert by_name["unbased"]["analysis_status"] == "unavailable"
     assert "source_merge_base_missing:unbased" in result["limitations"]
     assert all(isinstance(item, str) for item in result["limitations"])
+
+
+def test_parallel_build_checkpoint_resume_and_extractor_binding(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    (repo / "src.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+    base = commit(repo, "base")
+    git(repo, "checkout", "-q", "-b", "source")
+    (repo / "src.py").write_text("def f():\n    return 2\n", encoding="utf-8")
+    source_tip = commit(repo, "source")
+    git(repo, "checkout", "-q", "main")
+    snapshot = {
+        "kind": "git-snapshot", "schema_version": 1, "snapshot_digest": "snapshot-1",
+        "repository_id": "repo-id",
+        "main": {"name": "main", "tip": base, "tree": git(repo, "rev-parse", f"{base}^{{tree}}")},
+        "branches": [
+            {"name": "source", "tip": source_tip, "merge_base": base, "eligible": True, "exclusion_reasons": []},
+            {"name": "source-alias", "tip": source_tip, "merge_base": base, "eligible": True, "exclusion_reasons": []},
+        ],
+    }
+    pins = [base, source_tip]
+    object_repo = tmp_path / "objects.git"
+    export_pinned_repository(repo, pins, object_repo)
+    checkpoint = tmp_path / "contribution-checkpoint.json"
+    checkpoint.parent.chmod(0o700)
+    progress = []
+    parallel = _build_contributions(snapshot, object_repo, workers=2, progress=lambda *item: progress.append(item), checkpoint_path=checkpoint)
+    assert len(progress) == 2
+    serial_resumed = _build_contributions(snapshot, object_repo, workers=1, checkpoint_path=checkpoint)
+    assert parallel == serial_resumed
+    assert checkpoint.stat().st_mode & 0o077 == 0
+    changed_snapshot = {**snapshot, "snapshot_digest": "snapshot-2"}
+    with unittest.TestCase().assertRaisesRegex(JgError, "different snapshot or extractor"):
+        _build_contributions(changed_snapshot, object_repo, checkpoint_path=checkpoint)
 
 
 class ContributionTests(unittest.TestCase):

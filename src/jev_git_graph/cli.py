@@ -124,6 +124,9 @@ def parser() -> argparse.ArgumentParser:
     contributions.add_argument("--repo", required=True)
     contributions.add_argument("--snapshot", required=True)
     contributions.add_argument("--out", required=True)
+    contributions.add_argument("--workers", type=int, help="CPU worker processes for independent branch analysis")
+    contributions.add_argument("--checkpoint", help="private resumable branch-analysis checkpoint file")
+    contributions.add_argument("--max-destination-blobs", type=int)
 
     groups = commands.add_parser("groups", help="build bounded local contribution context groups")
     groups.add_argument("--repo", required=True)
@@ -398,7 +401,15 @@ def run(args: argparse.Namespace) -> str:
         if snapshot.get("repository_id") != opaque_path_id(root):
             raise JgError("snapshot belongs to a different local repository")
         target = validate_output_path(args.out, [*protected_worktree_paths(args.repo), common])
-        return str(write_contributions(args.snapshot, target))
+        checkpoint = (validate_output_path(args.checkpoint,
+                                           [*protected_worktree_paths(args.repo), common])
+                      if args.checkpoint else None)
+        return str(write_contributions(
+            args.snapshot, target, workers=args.workers,
+            progress=lambda done, total, branch: print(
+                f"contributions: {done}/{total} {branch}", file=sys.stderr),
+            checkpoint_path=checkpoint,
+            max_destination_blobs=args.max_destination_blobs))
     if args.command == "code-relate":
         candidates = read_json(args.candidates)
         root, _common, _runner = git.open_repository(args.repo)
