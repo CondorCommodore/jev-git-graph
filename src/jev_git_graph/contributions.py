@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import os
 import re
 import subprocess
 from collections import Counter
@@ -22,13 +23,33 @@ _OID = re.compile(r"\A[0-9a-f]{40,64}\Z")
 
 
 def _git(repo: Path, *args: str, input_bytes: bytes | None = None) -> bytes:
+    try:
+        from .snapshot import run_snapshot_git
+    except ImportError:
+        run_snapshot_git = None
+    if run_snapshot_git is not None:
+        if input_bytes is not None:
+            raise JgError("input is not supported for pinned snapshot object reads")
+        return run_snapshot_git(repo, *args)
     result = subprocess.run(
-        ("git", "-C", str(repo), *args), input=input_bytes,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+        ("git", "--no-replace-objects", "-c", "core.useReplaceRefs=false", "-C", str(repo), *args),
+        input=input_bytes, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+        env=_git_env(),
     )
     if result.returncode:
         raise JgError("unable to inspect pinned contribution objects")
     return result.stdout
+
+
+def _git_env() -> dict[str, str]:
+    """Keep ambient Git directory/config redirection out of object reads."""
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    env["GIT_NO_LAZY_FETCH"] = "1"
+    env["LC_ALL"] = "C"
+    return env
 
 
 def _oid(value: Any) -> str:
@@ -63,7 +84,7 @@ def _blob(repo: Path, entry: dict[str, str] | None) -> bytes | None:
 
 
 def _is_text_python(path: str, entry: dict[str, str] | None, raw: bytes | None) -> bool:
-    if not path.endswith(".py") or entry is None or entry["kind"] != "blob" or raw is None:
+    if not path.endswith(".py") or entry is None or entry["kind"] != "blob" or entry["mode"] not in {"100644", "100755"} or raw is None:
         return False
     if b"\0" in raw:
         return False
@@ -110,7 +131,7 @@ def _identity(prefix: str, value: dict[str, Any]) -> str:
     return prefix + hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def _destination_index(repo: Path, main_tip: str, limitations: list[dict[str, str]]) -> tuple[list[dict[str, Any]], dict[str, list[str]]]:
+def _destination_index(repo: Path, main_tip: str, limitations: list[str]) -> tuple[list[dict[str, Any]], dict[str, list[str]]]:
     listing = _git(repo, "ls-tree", "-r", "-z", "--full-tree", main_tip)
     rows: list[tuple[str, str, str]] = []
     for item in listing.split(b"\0"):
@@ -122,7 +143,7 @@ def _destination_index(repo: Path, main_tip: str, limitations: list[dict[str, st
         if path.endswith(".py") and kind == "blob" and mode in {"100644", "100755"}:
             rows.append((path, oid.lower(), mode))
     if len(rows) > MAX_DESTINATION_BLOBS:
-        limitations.append({"code": "destination_index_limit", "detail": f"Python destination index capped at {MAX_DESTINATION_BLOBS} blobs"})
+        limitations.append(f"destination_index_limit:{MAX_DESTINATION_BLOBS}")
         rows = rows[:MAX_DESTINATION_BLOBS]
     units: list[dict[str, Any]] = []
     by_fingerprint: dict[str, list[str]] = {}
@@ -139,7 +160,7 @@ def _destination_index(repo: Path, main_tip: str, limitations: list[dict[str, st
                 parsed_by_blob[blob_id] = None
         defs = parsed_by_blob[blob_id]
         if defs is None:
-            limitations.append({"code": "destination_python_unparsed", "detail": f"Could not index Python destination blob at {path}"})
+            limitations.append(f"destination_python_unparsed:{path}")
             continue
         for definition in defs:
             uid = _identity("du-", {"blob": blob_id, "path": path, "name": definition["name"], "range": definition["range"], "extractor": EXTRACTOR_VERSION})
@@ -164,7 +185,10 @@ def build_contributions(snapshot: dict, object_repo: Path) -> dict:
     branches = snapshot.get("branches")
     if not isinstance(branches, list):
         raise JgError("snapshot branches are invalid")
-    destinations, destination_by_fingerprint = _destination_index(repo, main_tip, limitations := [])
+    limitations: list[str] = []
+    destinations: list[dict[str, Any]] = []
+    destination_by_fingerprint: dict[str, list[str]] = {}
+    destination_indexed = False
     output_branches: list[dict[str, Any]] = []
     paths: list[dict[str, Any]] = []
     units: list[dict[str, Any]] = []
@@ -175,16 +199,42 @@ def build_contributions(snapshot: dict, object_repo: Path) -> dict:
         name = branch.get("name")
         if not isinstance(name, str) or not name:
             raise JgError("snapshot branch name is invalid")
-        tip = _oid(branch.get("tip"))
+        raw_tip = branch.get("tip")
+        tip = raw_tip.lower() if isinstance(raw_tip, str) else None
         base_value = branch.get("merge_base")
-        base = _oid(base_value) if base_value else main_tip
         eligibility = bool(branch.get("eligible"))
-        output_branches.append({"name": name, "tip": tip, "merge_base": base, "eligible": eligibility, "exclusion_reasons": list(branch.get("exclusion_reasons") or []), "path_count": 0, "unit_ids": []})
+        output_branch = {"name": name, "tip": tip, "merge_base": base_value, "eligible": eligibility, "exclusion_reasons": list(branch.get("exclusion_reasons") or []), "analysis_status": "excluded" if not eligibility else "pending", "path_count": 0, "unit_ids": []}
+        output_branches.append(output_branch)
+        # Excluded refs are recorded exactly as supplied and receive no Git
+        # traversal or destination analysis.
+        if not eligibility:
+            continue
+        try:
+            tip = _oid(raw_tip)
+        except JgError:
+            output_branch["analysis_status"] = "unavailable"
+            limitations.append(f"source_tip_unavailable:{name}")
+            continue
+        try:
+            if not base_value:
+                raise JgError("missing merge base")
+            base = _oid(base_value)
+        except JgError:
+            output_branch["analysis_status"] = "unavailable"
+            limitations.append(f"source_merge_base_missing:{name}")
+            continue
+        output_branch["tip"] = tip
+        output_branch["merge_base"] = base
+        if not destination_indexed:
+            destinations, destination_by_fingerprint = _destination_index(repo, main_tip, limitations)
+            destination_indexed = True
         try:
             changed = _changed_paths(repo, base, tip)
         except JgError:
-            limitations.append({"code": "source_diff_unavailable", "detail": f"Cannot enumerate changed paths for {name}"})
+            output_branch["analysis_status"] = "unavailable"
+            limitations.append(f"source_diff_unavailable:{name}")
             continue
+        output_branch["analysis_status"] = "complete"
         for path in changed:
             base_entry = _tree_entry(repo, base, path)
             source_entry = _tree_entry(repo, tip, path)
@@ -200,7 +250,7 @@ def build_contributions(snapshot: dict, object_repo: Path) -> dict:
             created: list[dict[str, Any]] = []
             fallback_reason: str | None = None
             if not source_python:
-                fallback_reason = "deleted" if source_entry is None else ("unsupported_kind" if source_entry["kind"] != "blob" else ("binary_or_non_utf8" if path.endswith(".py") else "non_python"))
+                fallback_reason = "deleted" if source_entry is None else ("unsupported_kind" if source_entry["kind"] != "blob" or source_entry["mode"] not in {"100644", "100755"} else ("binary_or_non_utf8" if path.endswith(".py") else "non_python"))
             elif source_entry and base_entry and source_entry["mode"] != base_entry["mode"]:
                 fallback_reason = "mode_change"
             else:
@@ -217,23 +267,35 @@ def build_contributions(snapshot: dict, object_repo: Path) -> dict:
                             changed_defs.append(definition)
                     for definition in changed_defs:
                         candidates = destination_by_fingerprint.get(definition["ast_fingerprint"], [])
-                        identity = {"tip": tip, "path": path, "blob": source_entry["blob"], "range": definition["range"], "name": definition["name"], "extractor": EXTRACTOR_VERSION}
-                        created.append({"id": _identity("cu-", identity), "branch": name, "source_tip": tip, "main_tip": main_tip, "path": path, "source_blob": source_entry["blob"], "main_blob": main_entry["blob"] if main_entry and main_entry["kind"] == "blob" else None, "mode": source_entry["mode"], "kind": "python_definition", "name": definition["name"], "range": definition["range"], "ast_fingerprint": definition["ast_fingerprint"], "destination_ids": list(candidates), "limitations": [], "source": {"branch": name, "path": path, "kind": "python_definition", "name": definition["name"], "blob": source_entry["blob"], "ast_fingerprint": definition["ast_fingerprint"]}})
+                        identity = {"branch": name, "tip": tip, "path": path, "blob": source_entry["blob"], "range": definition["range"], "name": definition["name"], "extractor": EXTRACTOR_VERSION}
+                        unit_limitations = ["binding_resolution_unverified"]
+                        if len(candidates) > 1:
+                            unit_limitations.append("ambiguous_destination_match")
+                        created.append({"id": _identity("cu-", identity), "branch": name, "source_tip": tip, "main_tip": main_tip, "path": path, "source_blob": source_entry["blob"], "main_blob": main_entry["blob"] if main_entry and main_entry["kind"] == "blob" else None, "mode": source_entry["mode"], "kind": "python_definition", "name": definition["name"], "range": definition["range"], "ast_fingerprint": definition["ast_fingerprint"], "destination_ids": list(candidates), "limitations": unit_limitations, "source": {"branch": name, "path": path, "kind": "python_definition", "name": definition["name"], "blob": source_entry["blob"], "ast_fingerprint": definition["ast_fingerprint"]}})
+                        limitations.append("binding_resolution_unverified")
+                        if len(candidates) > 1:
+                            limitations.append("ambiguous_destination_match")
                     module_changed = (not base_python) or (_module_fingerprint(source_bytes.decode("utf-8")) != _module_fingerprint(base_bytes.decode("utf-8")))
-                    if module_changed:
+                    source_names = {d["name"] for d in src_defs}
+                    if any(d["name"] not in source_names for d in base_defs):
+                        fallback_reason = "definition_removal"
+                    elif module_changed:
                         fallback_reason = "module_change"
+                    elif not changed_defs and source_bytes != base_bytes:
+                        fallback_reason = "non_definition_change"
                 except (UnicodeError, SyntaxError, ValueError):
                     fallback_reason = "python_parse_unsupported"
             if fallback_reason:
-                identity = {"tip": tip, "path": path, "blob": source_entry["blob"] if source_entry else None, "range": None, "name": None, "extractor": EXTRACTOR_VERSION}
+                identity = {"branch": name, "tip": tip, "path": path, "blob": source_entry["blob"] if source_entry else None, "range": None, "name": None, "extractor": EXTRACTOR_VERSION}
                 created.append({"id": _identity("cu-", identity), "branch": name, "source_tip": tip, "main_tip": main_tip, "path": path, "source_blob": source_entry["blob"] if source_entry else None, "main_blob": main_entry["blob"] if main_entry and main_entry["kind"] == "blob" else None, "mode": source_entry["mode"] if source_entry else None, "kind": "file", "name": None, "range": None, "destination_ids": [], "limitations": [fallback_reason], "source": {"branch": name, "path": path, "kind": "file", "name": None, "blob": source_entry["blob"] if source_entry else None, "ast_fingerprint": None}})
                 if fallback_reason == "python_parse_unsupported":
-                    limitations.append({"code": "source_python_unparsed", "detail": f"Python structure unavailable for {name}:{path}"})
+                    limitations.append(f"source_python_unparsed:{name}:{path}")
             for unit in created:
                 units.append(unit)
                 output_branches[-1]["unit_ids"].append(unit["id"])
                 for destination_id in unit["destination_ids"]:
                     edges.append({"source_id": unit["id"], "destination_id": destination_id, "type": "structural_match", "provenance": "ast_fingerprint"})
+    limitations = sorted(set(limitations))
     result = {"kind": "contributions", "schema_version": CONTRIBUTIONS_SCHEMA_VERSION, "snapshot_digest": snapshot.get("snapshot_digest"), "repository_id": snapshot.get("repository_id"), "main": main, "branches": output_branches, "units": units, "destination_units": destinations, "paths": paths, "edges": edges, "limitations": limitations}
     result["contributions_digest"] = digest(result)
     return result
@@ -244,9 +306,14 @@ def write_contributions(snapshot_path: str | Path, out: str | Path) -> Path:
     from .snapshot import load_snapshot
 
     snapshot, object_repo = load_snapshot(snapshot_path)
-    destination = Path(out).expanduser().resolve(strict=False)
+    destination = Path(out).expanduser()
     if destination.exists() and destination.is_dir():
         destination = destination / "contributions.json"
+    if os.path.lexists(destination):
+        raise JgError("contributions output already exists")
+    destination = destination.resolve(strict=False)
+    if os.path.lexists(destination):
+        raise JgError("contributions output already exists")
     result = build_contributions(snapshot, Path(object_repo))
     write_json(destination, result)
     return destination
