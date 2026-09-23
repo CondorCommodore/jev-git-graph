@@ -99,6 +99,12 @@ def build_outcomes(inventory: dict, snapshot: dict, contributions: dict,
             branch = branches.get(name)
             branch_units = by_branch[name]
             record["contribution_ids"] = [u["id"] for u in branch_units]
+            unresolved_ids = sorted(
+                unit["id"] for unit in branch_units
+                if judgments.get(unit["id"], {}).get("disposition") in {None, "UNRESOLVED"}
+            )
+            record["unresolved_contribution_ids"] = unresolved_ids
+            record["unresolved_contribution_count"] = len(unresolved_ids)
             record["path_count"] = len(paths[name])
             record["exact_path_count"] = sum(p["exact"] for p in paths[name])
             record["remaining_contribution_count"] = len(branch_units)
@@ -114,7 +120,8 @@ def build_outcomes(inventory: dict, snapshot: dict, contributions: dict,
                 record["snapshot_path_coverage"] = "EXACT" if exact else "DISTINCT"
                 if exact:
                     record.update(disposition="EXACT_REVIEW", reasons=["all_net_changed_paths_present_in_pinned_main"],
-                                  next_action="Run fresh strict coverage and cleanup planning")
+                                  next_action=(f"Resolve {len(unresolved_ids)} unresolved contribution cases before cleanup planning"
+                                               if unresolved_ids else "Run fresh strict coverage and cleanup planning"))
                 if cov.get(name, {}).get("verdict") == "EXACT":
                     record["reasons"].append("strict_coverage_exact")
                 useful = [u for u in branch_units if judgments.get(u["id"], {}).get("disposition") == "USABLE_WORK_REMAINS"]
@@ -122,7 +129,8 @@ def build_outcomes(inventory: dict, snapshot: dict, contributions: dict,
                 record["remaining_contribution_count"] = len(branch_units) - len(present)
                 if useful and not exact:
                     record.update(disposition="USABLE_WORK_REMAINS", reasons=["reviewed_evidence_suggests_missing_behavior"],
-                                  next_action="Review proposed integration tasks and required behavior")
+                                  next_action=("Review proposed integration tasks and resolve unresolved cases: "
+                                               + (", ".join(unresolved_ids) if unresolved_ids else "none")))
                     for unit in useful:
                         judgment = judgments[unit["id"]]
                         task_id = "preserve-" + digest({"snapshot": snapshot["snapshot_digest"], "unit": unit["id"]})[:24]
@@ -177,14 +185,25 @@ def render_outcomes(ledger: dict) -> str:
         detail = escape(str(row["human_decision"] or ""))
         key = escape(row["object_id"], quote=True)
         fingerprint = escape(row["source_fingerprint"], quote=True)
+        prior = row["human_decision"] or {}
+        prior_reviewer = escape(str(prior.get("reviewer", "")), quote=True)
+        prior_reason = escape(str(prior.get("reason", "")), quote=True)
+        prior_destination = escape(str(prior.get("destination", "")), quote=True)
+        prior_disposition = prior.get("disposition")
+        selected_options = "".join(
+            f"<option{' selected' if value == prior_disposition else ''}>{value}</option>"
+            for value in ("RETAIN", "INTEGRATE", "ARCHIVE_PROPOSED", "UNRESOLVED"))
+        unresolved_ids = row.get("unresolved_contribution_ids", [])
+        unresolved = (f"<details><summary>{len(unresolved_ids)} unresolved contributions</summary>"
+                      f"{escape(', '.join(unresolved_ids))}</details>" if unresolved_ids else "")
         rows.append("<tr>" + "".join(f"<td>{escape(str(v))}</td>" for v in (
             row["kind"], row["name"], row["disposition"], ", ".join(row["reasons"]),
-            len(row["contribution_ids"]), row["next_action"])) +
-            f"<td data-object='{key}' data-fingerprint='{fingerprint}'>{detail}"
-            "<select aria-label='Disposition'><option value=''>No new decision</option>"
-            "<option>RETAIN</option><option>INTEGRATE</option><option>ARCHIVE_PROPOSED</option>"
-            "<option>UNRESOLVED</option></select><input class='reason' aria-label='Reason' placeholder='Reason'>"
-            "<input class='destination' aria-label='Destination' placeholder='Proposed destination'></td></tr>")
+            f"{len(row['contribution_ids'])} total / {row.get('unresolved_contribution_count', 0)} unresolved")) +
+            f"<td>{escape(str(row['next_action']))}{unresolved}</td>"
+            f"<td data-object='{key}' data-fingerprint='{fingerprint}' data-prior-reviewer='{prior_reviewer}'>{detail}"
+            f"<select aria-label='Disposition'><option value=''>No new decision</option>{selected_options}</select>"
+            f"<input class='reason' aria-label='Reason' placeholder='Reason' value='{prior_reason}'>"
+            f"<input class='destination' aria-label='Destination' placeholder='Proposed destination' value='{prior_destination}'></td></tr>")
     snapshot_js = json.dumps(ledger["snapshot_digest"]).replace("<", "\\u003c")
     return ("<!doctype html><html lang='en'><meta charset='utf-8'><title>Git work disposition</title>"
             "<style>body{font:15px system-ui;margin:2rem}table{border-collapse:collapse;width:100%}"
@@ -201,11 +220,12 @@ def render_outcomes(ledger: dict) -> str:
             "r.hidden=!r.textContent.toLowerCase().includes(q)})});"
             "document.getElementById('export').addEventListener('click',()=>{"
             "const reviewer=document.getElementById('reviewer').value.trim();const decisions=[];"
-            "let invalid=!reviewer;document.querySelectorAll('[data-object]').forEach(cell=>{"
+            "let invalid=false;document.querySelectorAll('[data-object]').forEach(cell=>{"
             "const disposition=cell.querySelector('select').value;if(!disposition)return;"
-            "const reason=cell.querySelector('.reason').value.trim();if(!reason)invalid=true;"
+            "const reason=cell.querySelector('.reason').value.trim();const rowReviewer=reviewer||cell.dataset.priorReviewer;"
+            "if(!reason||!rowReviewer)invalid=true;"
             "decisions.push({object_id:cell.dataset.object,source_fingerprint:cell.dataset.fingerprint,"
-            "disposition,reason,reviewer,destination:cell.querySelector('.destination').value.trim()});});"
+            "disposition,reason,reviewer:rowReviewer,destination:cell.querySelector('.destination').value.trim()});});"
             "if(invalid||!decisions.length){document.getElementById('message').textContent="
             "'Enter reviewer, disposition and reason before exporting.';return;}"
             f"const doc={{kind:'outcome-review',schema_version:1,snapshot_digest:{snapshot_js},decisions}};"
