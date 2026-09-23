@@ -56,8 +56,11 @@ Keep the existing admission rules as the contract for any future coordinator:
 
 ## Remaining coordinator work
 
-The next implementation milestone is a concrete coordinator that participates in
-`jev-git-graph/cooperative-branch-lease-v1`:
+The coordinator milestone follows the accepted review-product pilot in
+[Revision 2](2026-09-23-group-context-revision-plan.md). That revision delivers
+contribution evidence, grouped judgments, measured model utility, and concrete
+preservation tasks before this execution boundary is enabled. The coordinator
+must participate in `jev-git-graph/cooperative-branch-lease-v1`:
 
 * Bind lease acquisition and renewal to every known worktree creator, including
   concurrent branch creation and checkout paths. The coordinator must establish

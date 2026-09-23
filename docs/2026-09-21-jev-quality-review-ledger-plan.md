@@ -1,5 +1,11 @@
 # Jev Judgment Quality and Review Workflow Plan
 
+Historical plan. The uncompleted wider-run and calibration work is superseded
+by [Revision 2: pinned contribution groups](2026-09-23-group-context-revision-plan.md).
+The pilot findings below remain evidence; v3 questions retain their original
+meaning. The proposed presence contract is refined in the new plan and is not
+yet implemented.
+
 ## Goal
 
 Turn Jev Git Graph from a safe exploratory relationship viewer into a measurable

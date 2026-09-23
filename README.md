@@ -49,6 +49,12 @@ Run the next command only after the previous one succeeds. Inventory records loc
 
 Start with the [project specification](docs/spec.md), including the problem statement, five whys, requirements, and acceptance criteria.
 
+The next planned revision is [pinned contribution groups and measured review
+utility](docs/2026-09-23-group-context-revision-plan.md): shared context for typed
+Jev questions, a blinded LLM control, and concrete preservation actions. It
+lists the implementation slices and acceptance gates; grouped requests and
+two-sided code evidence are not implemented yet.
+
 The [local artifact viewer](docs/index.html) starts empty and renders only JSON selected by the operator. It makes no API calls.
 
 ## View local artifacts
