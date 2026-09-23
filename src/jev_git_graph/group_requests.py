@@ -161,6 +161,7 @@ def build_group_requests(
     model_settings: Mapping[str, Any] | None = None,
     estimated_input_tokens: int | None = None,
     max_provider_tokens: int | None = None,
+    token_estimator: str | None = None,
     selected_contribution_ids: Iterable[str] | None = None,
     selection_digest: str | None = None,
 ) -> dict[str, Any]:
@@ -198,6 +199,10 @@ def build_group_requests(
             raise JgError(f"{field} must be a positive integer")
     if (estimated_input_tokens is None) != (max_provider_tokens is None):
         raise JgError("estimated and maximum provider token budgets must be supplied together")
+    if token_estimator is not None and (not isinstance(token_estimator, str) or not token_estimator):
+        raise JgError("token estimator label must be a non-empty string")
+    if estimated_input_tokens is None and token_estimator is not None:
+        raise JgError("token estimator label requires an input token estimate")
     if estimated_input_tokens is not None and estimated_input_tokens > max_provider_tokens:
         raise JgError("estimated input tokens exceed the provider token budget")
     group_records = groups.get("groups", [])
@@ -384,7 +389,7 @@ def build_group_requests(
             "request_budgets": {"max_groups": max_groups, "max_request_bytes": max_request_bytes,
                                 "estimated_input_tokens": estimated_input_tokens,
                                 "max_provider_tokens": max_provider_tokens,
-                                "token_estimator": "caller_supplied" if estimated_input_tokens is not None else "unavailable",
+                                "token_estimator": (token_estimator or "caller_supplied") if estimated_input_tokens is not None else "unavailable",
                                 "token_budget_established": estimated_input_tokens is not None},
             "plan_digest": digest({"requests": requests, "omitted": omitted,
                                     "snapshot_digest": contributions.get("snapshot_digest"),
@@ -397,7 +402,7 @@ def build_group_requests(
                                         "max_request_bytes": max_request_bytes,
                                         "estimated_input_tokens": estimated_input_tokens,
                                         "max_provider_tokens": max_provider_tokens,
-                                        "token_estimator": "caller_supplied" if estimated_input_tokens is not None else "unavailable",
+                                        "token_estimator": (token_estimator or "caller_supplied") if estimated_input_tokens is not None else "unavailable",
                                         "token_budget_established": estimated_input_tokens is not None}})}
 
 

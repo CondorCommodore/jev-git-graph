@@ -89,14 +89,40 @@ def _build_group_presence_preview(args):
         unit = units[item["contribution_id"]]
         if item.get("source_tip") != unit.get("source_tip") or item.get("destination_tip") != unit.get("main_tip"):
             raise JgError("evidence ranges do not match pinned contribution endpoints")
-        evidence_by_contribution[item["contribution_id"]] = build_two_sided_evidence(
-            object_repo, item["source_tip"], item["destination_tip"], item.get("ranges"))
-    plan = build_group_requests(
-        contributions, groups, evidence_by_contribution,
-        max_groups=args.max_groups, max_request_bytes=args.max_request_bytes,
-        model_settings=model_settings, estimated_input_tokens=args.estimated_input_tokens,
-        max_provider_tokens=args.max_provider_tokens,
-        selected_contribution_ids=selected_ids, selection_digest=selection_digest)
+        approved_ranges = item.get("ranges")
+        if not isinstance(approved_ranges, list):
+            raise JgError("evidence ranges must be a list")
+        if approved_ranges:
+            evidence_by_contribution[item["contribution_id"]] = build_two_sided_evidence(
+                object_repo, item["source_tip"], item["destination_tip"], approved_ranges)
+        # An explicitly selected case with no approved pair stays in the request
+        # plan. The builder records missing comparison evidence and reconciliation
+        # fails closed for that contribution.
+    plan_kwargs = {
+        "max_groups": args.max_groups,
+        "max_request_bytes": args.max_request_bytes,
+        "model_settings": model_settings,
+        "selected_contribution_ids": selected_ids,
+        "selection_digest": selection_digest,
+    }
+    if args.auto_estimate_input_tokens:
+        if args.estimated_input_tokens is not None:
+            raise JgError("choose automatic or caller-supplied input token estimate")
+        if args.max_provider_tokens is None:
+            raise JgError("automatic token estimation requires --max-provider-tokens")
+        sizing = build_group_requests(contributions, groups, evidence_by_contribution, **plan_kwargs)
+        # This is a labeled conservative planning heuristic, not a tokenizer
+        # measurement: one token per serialized byte plus provider framing headroom.
+        estimate = sizing["payload_bytes"] + 256 * sizing["request_count"]
+        plan = build_group_requests(
+            contributions, groups, evidence_by_contribution, **plan_kwargs,
+            estimated_input_tokens=estimate, max_provider_tokens=args.max_provider_tokens,
+            token_estimator="serialized_utf8_bytes_plus_256_per_request_v1")
+    else:
+        plan = build_group_requests(
+            contributions, groups, evidence_by_contribution, **plan_kwargs,
+            estimated_input_tokens=args.estimated_input_tokens,
+            max_provider_tokens=args.max_provider_tokens)
     preview = approved_presence_preview(plan)
     replay = {
         "kind": "branch-presence-approved-manifest", "schema_version": 1,
@@ -200,10 +226,12 @@ def parser() -> argparse.ArgumentParser:
     group_relate.add_argument("--model-settings")
     group_relate.add_argument("--out", required=True)
     group_relate.add_argument("--show-preview", action="store_true",
-                              help="render exact transient request content on stdout without storing it")
+                              help="serve exact request content transiently from a loopback no-store page")
     group_relate.add_argument("--max-groups", type=int, default=32)
     group_relate.add_argument("--max-request-bytes", type=int, default=64000)
     group_relate.add_argument("--estimated-input-tokens", type=int)
+    group_relate.add_argument("--auto-estimate-input-tokens", action="store_true",
+                              help="derive a labeled planning estimate from exact serialized request bytes")
     group_relate.add_argument("--max-provider-tokens", type=int)
     group_relate.add_argument("--execute", action="store_true")
     group_relate.add_argument("--approved-payload-sha256")
@@ -382,7 +410,8 @@ def run(args: argparse.Namespace) -> str:
         if args.execute and (not args.approved_payload_sha256 or not args.approved_approval_sha256):
             raise JgError("group presence execution requires approved payload and approval digests")
         if args.execute and (args.estimated_input_tokens is None or args.max_provider_tokens is None):
-            raise JgError("group presence execution requires explicit input and provider token budgets")
+            if not args.auto_estimate_input_tokens or args.max_provider_tokens is None:
+                raise JgError("group presence execution requires input and provider token budgets")
         object_repo, range_manifest, replay, preview = _build_group_presence_preview(args)
         if args.execute and not preview["request_budgets"].get("token_budget_established"):
             raise JgError("provider token budget could not be established")

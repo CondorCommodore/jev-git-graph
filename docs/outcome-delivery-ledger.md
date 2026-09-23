@@ -12,16 +12,30 @@ branches, 622 worktrees and two stashes. Its 1,432 eligible branches produced
 for every eligible changed path. Grouping produced 112,291 incomplete groups,
 which is not accepted as sufficient context for a scaled Jev evaluation.
 
+A new pinned contribution artifact was generated with extractor commit
+`77ec9789570e1eb9dac3be993afd11314d10db59` from the existing snapshot. The
+installed CLI completed all 1,448 branch analyses with two process workers and
+the full 2,917-blob destination index. Artifact SHA-256 is
+`75b831ad5ccc882a755988732aac41adeb95442913478b6559cecb9ebe3fa768`; it is
+stored privately at
+`~/.local/share/jev-git-graph/runs/home-lab/r2-foundation-pilot-twzbuv70/contributions-v2-extractor-77ec978.json`.
+The run took 845 seconds and peaked at 22,699,081,728 bytes RSS (reported peak
+footprint 24,936,040,496 bytes), with no swap use. The 2.0 GB artifact includes
+versioned module bindings, imports, static references, dependency status, and
+observed edges; its new size is a material resource cost. Counts and the
+grouping result are pending. The earlier contributions, groups, and failed
+study artifacts remain intact as historical evidence.
+
 | Requirement | Implementation owner | Acceptance evidence required | State |
 | --- | --- | --- | --- |
 | Immutable evidence, 24-hour exclusion, complete path accounting | Existing snapshot foundation | Pinned Home Lab replay; excluded objects retained | Existing baseline; reverify after changes |
-| Cached parallel analysis with resumable checkpoints | Luna scale_build | Installed CLI repeated run reuses checkpoints; deterministic result | Building |
-| Useful bounded groups with local boundaries | Luna scale_build | Home Lab group size/context report; no missing units | Building |
-| Typed presence questions, two-sided evidence, approved dispatch, strict records | Luna presence_build | Offline synthetic import; privacy and digest rejection; approved real pilot | Building |
+| Cached parallel analysis with resumable checkpoints | Luna scale_build | Installed CLI repeated run reuses checkpoints; deterministic result | Full pinned extraction completed with two process workers and resumable checkpoint; repeat/resume determinism still unverified |
+| Useful bounded groups with local boundaries | Luna scale_build | Home Lab group size/context report; no missing units | Full pinned grouping running against the new artifact; no utility claim yet |
+| Typed presence questions, two-sided evidence, approved dispatch, strict records | Luna presence_build | Offline synthetic import; privacy and digest rejection; approved real pilot | Offline synthetic import/reconcile, digest checks, and no-store preview verified; no live provider call or approval |
 | Blind control and label-based utility measurement | Luna presence_build + parent | 24–40 evidence cards, accepted labels, matched Jev/control report | Building; live payload approval pending preparation |
-| One row per object, actionable preservation tasks and review interface | Parent | Installed outcomes CLI counts match inventory; concrete task fields | Building |
+| One row per object, actionable preservation tasks and review interface | Parent | Installed outcomes CLI counts match inventory; concrete task fields | Disposable installed-CLI outcomes flow and review export round-trip verified; prior decisions retained and unresolved units surfaced |
 | Verified useful-work integration | Parent | Reviewed task, tested PR, merge readback, remaining-unit reassessment | Pending actual dispositions |
-| Creator participation, durable cleanup journal, restore and atomic deletion | Cleanup lane + parent | Creator races and interrupted execution in disposable repo | Building; real integration unproven |
+| Creator participation, durable cleanup journal, restore and atomic deletion | Cleanup lane + parent | Creator races and interrupted execution in disposable repo | Cross-package lease/race proof exists; CLI journal/participation wiring is being integrated; real integration unproven and live gate remains closed |
 | Real cleanup batch | Parent/operator | Exact approved manifest, independent restoration, local ref readback | Pending real plan and approval |
 | Delivered package and clean implementation repository | Parent | Required existing checks, installed-package flow, merged PR readback | Pending integration |
 

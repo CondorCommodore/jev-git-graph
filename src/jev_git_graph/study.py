@@ -11,11 +11,13 @@ from .safety import digest, read_json, write_json, write_private_text
 
 def build_study(contributions: dict, groups: dict, count: int = 32,
                 max_per_family: int = 4, excluded_branches: list[str] | None = None,
-                project_goals: str = "") -> dict:
+                project_goals: str = "", selection_policy: str = "candidate-availability-24-8-v2") -> dict:
     if type(count) is not int or not 24 <= count <= 40:
         raise JgError("pilot study must contain 24 to 40 contributions")
     if type(max_per_family) is not int or not 1 <= max_per_family <= 4:
         raise JgError("max per family must be between 1 and 4")
+    if selection_policy not in {"candidate-availability-24-8-v2", "dependency-complete-majority-v1"}:
+        raise JgError("unsupported study selection policy")
     _, units, destinations = _validate(contributions)
     if (groups.get("contributions_digest") != contributions["contributions_digest"]
             or groups.get("snapshot_digest") != contributions["snapshot_digest"]
@@ -51,9 +53,21 @@ def build_study(contributions: dict, groups: dict, count: int = 32,
         # Units with no destination candidate remain in an explicit uncertainty
         # stratum for review; they are never presented as globally complete.
         candidate_ids = unit.get("destination_ids", [])
-        context_stratum = ("comparison_candidates_available"
-                           if candidate_ids and all(candidate_id in destinations for candidate_id in candidate_ids)
-                           else "uncertainty_no_destination_candidate")
+        comparison_available = bool(candidate_ids) and all(candidate_id in destinations for candidate_id in candidate_ids)
+        if selection_policy == "dependency-complete-majority-v1":
+            # A supported comparison requires a source unit with statically
+            # resolved references, one destination candidate, and a resolved
+            # dependency context for that destination unit. Similarity-only
+            # candidates and unknown extraction status stay in the uncertainty
+            # arm; group-wide context completeness is reported separately.
+            candidate = destinations[candidate_ids[0]] if len(candidate_ids) == 1 and comparison_available else None
+            supported = (unit.get("dependency_context_status") == "complete" and candidate is not None
+                         and candidate.get("dependency_context_status") == "complete")
+            context_stratum = ("dependency_context_supported" if supported
+                               else "uncertainty_dependency_or_destination_context")
+        else:
+            context_stratum = ("comparison_candidates_available" if comparison_available
+                               else "uncertainty_no_destination_candidate")
         buckets[(context_stratum, stratum)].append(unit)
     # Fixed round-robin across evidence strata, capped by task-family labels.
     # Signals select review cases; they never supply reference answers.
@@ -78,6 +92,10 @@ def build_study(contributions: dict, groups: dict, count: int = 32,
                                      "group_id": group["id"], "neighbor_ids": [u for u in group["unit_ids"] if u != unit["id"]],
                                      "group_context_complete": group.get("context_complete") is True,
                                      "dependency_context_status": unit.get("dependency_context_status", "unknown"),
+                                     "destination_dependency_context_statuses": [
+                                         destinations[d].get("dependency_context_status", "unknown")
+                                         for d in unit.get("destination_ids", []) if d in destinations
+                                     ],
                                      "boundary_edges": group.get("boundary_edges", []),
                                      "limitations": group.get("limitations", []), "reference_label_status": "UNREVIEWED"})
                     family_counts[family] += 1
@@ -90,22 +108,35 @@ def build_study(contributions: dict, groups: dict, count: int = 32,
             if not progressed:
                 break
 
-    complete_target = min(count - count // 4, sum(len(v) for (context, _), v in buckets.items()
-                                                   if context == "comparison_candidates_available"))
-    take("comparison_candidates_available", complete_target)
-    take("uncertainty_no_destination_candidate", count - len(selected))
+    if selection_policy == "dependency-complete-majority-v1":
+        supported_context = "dependency_context_supported"
+        uncertainty_context = "uncertainty_dependency_or_destination_context"
+    else:
+        supported_context = "comparison_candidates_available"
+        uncertainty_context = "uncertainty_no_destination_candidate"
+    supported_pool_count = sum(len(v) for (context, _), v in buckets.items() if context == supported_context)
+    supported_target = min(count - count // 4, supported_pool_count)
+    take(supported_context, supported_target)
+    take(uncertainty_context, count - len(selected))
     # If either stratum had too few diverse cases, fill from the other while
     # keeping every selected case's context status explicit.
-    take("comparison_candidates_available", count - len(selected))
-    take("uncertainty_no_destination_candidate", count - len(selected))
+    take(supported_context, count - len(selected))
+    take(uncertainty_context, count - len(selected))
     if len(selected) < count:
         raise JgError(f"only {len(selected)} eligible diverse cases; do not silently shrink the study")
-    result = {"kind": "presence-study", "schema_version": 2,
+    selected_supported_count = sum(case["context_stratum"] == supported_context for case in selected)
+    result = {"kind": "presence-study", "schema_version": 3 if selection_policy == "dependency-complete-majority-v1" else 2,
               "repository_id": contributions["repository_id"], "snapshot_digest": contributions["snapshot_digest"],
               "contributions_digest": contributions["contributions_digest"], "groups_digest": groups["groups_digest"],
+              "selection_policy": selection_policy,
               "project_goals": project_goals, "case_count": len(selected), "family_counts": dict(family_counts),
               "context_stratum_counts": dict(Counter(case["context_stratum"] for case in selected)),
-              "context_scope": "destination candidate availability only; this is not dependency completeness or evidence that behavior is present",
+              "supported_pool_count": supported_pool_count,
+              "supported_case_count": selected_supported_count,
+              "supported_majority_available": selected_supported_count > count // 2,
+              "context_scope": ("source and unique destination dependency extraction both complete; this does not prove behavior presence or runtime integration"
+                                if selection_policy == "dependency-complete-majority-v1"
+                                else "destination candidate availability only; this is not dependency completeness or evidence that behavior is present"),
               "dependency_context_status_counts": dict(Counter(case["dependency_context_status"] for case in selected)),
               "excluded_development_branches": sorted(excluded), "cases": selected,
               "selection_uses_model_answers": False, "provider_dispatch_approved": False,
@@ -116,9 +147,10 @@ def build_study(contributions: dict, groups: dict, count: int = 32,
 
 def write_study(contributions_path: str, groups_path: str, out: str | Path,
                 count: int = 32, max_per_family: int = 4,
-                excluded_branches: list[str] | None = None, project_goals: str = "") -> Path:
+                excluded_branches: list[str] | None = None, project_goals: str = "",
+                selection_policy: str = "candidate-availability-24-8-v2") -> Path:
     result = build_study(read_json(contributions_path), read_json(groups_path), count,
-                         max_per_family, excluded_branches, project_goals)
+                         max_per_family, excluded_branches, project_goals, selection_policy)
     destination = Path(out)
     if destination.exists():
         raise JgError("study output already exists")

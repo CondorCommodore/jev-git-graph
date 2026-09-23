@@ -286,6 +286,19 @@ def test_study_selection_rejects_unassigned_contributions():
                              selection_digest="f" * 64)
 
 
+def test_token_estimator_label_is_bound_into_request_budget():
+    contributions, groups = _artifact()
+    sizing = build_group_requests(contributions, groups)
+    estimate = sizing["payload_bytes"] + 256 * sizing["request_count"]
+    plan = build_group_requests(
+        contributions, groups, estimated_input_tokens=estimate,
+        max_provider_tokens=estimate + 1000,
+        token_estimator="serialized_utf8_bytes_plus_256_per_request_v1")
+    assert plan["request_budgets"]["estimated_input_tokens"] == estimate
+    assert plan["request_budgets"]["token_estimator"] == "serialized_utf8_bytes_plus_256_per_request_v1"
+    assert plan["plan_digest"] != sizing["plan_digest"]
+
+
 def test_resolved_per_unit_context_can_route_without_global_group_completeness():
     contributions, groups = _artifact()
     groups["groups"][0]["context_complete"] = False
