@@ -863,8 +863,16 @@ def reconcile_presence(
     return result
 
 
-def validate_outcome_presence(presence: Mapping[str, Any], contributions: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
-    """Validate parent ledger input and expose only production-eligible rows."""
+def validate_presence_observations(
+    presence: Mapping[str, Any], contributions: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Validate every normalized observation without granting it action scope.
+
+    Advisory synthetic/control answers and unresolved Jev results must remain
+    visible to reviewers. This API validates them but does not promote their
+    routing scope. Consumers that create production recommendations must use
+    :func:`validate_outcome_presence` instead.
+    """
     if presence.get("kind") != "branch-presence-result" or presence.get("schema") != RESULT_SCHEMA:
         raise JgError("outcome presence has an unsupported schema")
     if presence.get("presence_digest") != digest({k: v for k, v in presence.items() if k != "presence_digest"}):
@@ -916,4 +924,13 @@ def validate_outcome_presence(presence: Mapping[str, Any], contributions: Mappin
             ):
                 raise JgError("usable-work row has inconsistent typed answers")
         result[cid] = dict(row)
-    return {cid: row for cid, row in result.items() if row.get("routing_scope") == "production_review_candidate"}
+    return result
+
+
+def validate_outcome_presence(
+    presence: Mapping[str, Any], contributions: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Validate and expose only rows eligible for human preservation review."""
+    observations = validate_presence_observations(presence, contributions)
+    return {cid: row for cid, row in observations.items()
+            if row.get("routing_scope") == "production_review_candidate"}

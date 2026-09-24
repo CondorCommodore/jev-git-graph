@@ -7,7 +7,9 @@ from unittest.mock import patch
 
 from jev_git_graph.cli import parser, run
 from jev_git_graph.errors import JgError
-from jev_git_graph.safety import opaque_path_id
+from jev_git_graph.inventory import build_inventory
+from jev_git_graph.review import object_fingerprint, object_id
+from jev_git_graph.safety import digest, opaque_path_id
 
 
 def git(repo, *args):
@@ -16,6 +18,100 @@ def git(repo, *args):
 
 
 class CodeCliTests(unittest.TestCase):
+    def test_outcome_review_cli_requires_and_binds_exact_digest_approval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            review = {
+                "kind": "outcome-review", "schema_version": 2,
+                "repository_id": "fixture",
+                "provenance": {
+                    "repository_id": "fixture", "inventory_digest": "a" * 64,
+                    "snapshot_digest": "b" * 64, "contributions_digest": "c" * 64,
+                    "presence_digest": None, "coverage_digest": None,
+                },
+                "decisions": [],
+            }
+            review_path = base / "review.json"
+            private_dir = base / "private"
+            private_dir.mkdir(mode=0o700)
+            receipt_path = private_dir / "review-approval.json"
+            review_path.write_text(json.dumps(review), encoding="utf-8")
+            with patch("jev_git_graph.presence._presence_key_path",
+                       return_value=base / "private" / "receipt.key"):
+                preview = parser().parse_args([
+                    "outcome-review-approve", "--review", str(review_path),
+                ])
+                preview_result = json.loads(run(preview))
+                self.assertEqual(preview_result["review_sha256"], digest(review))
+                self.assertTrue(preview_result["approval_required"])
+                self.assertFalse(receipt_path.exists())
+
+                wrong = parser().parse_args([
+                    "outcome-review-approve", "--review", str(review_path),
+                    "--approved-review-sha256", "0" * 64, "--out", str(receipt_path),
+                ])
+                with self.assertRaisesRegex(JgError, "does not match"):
+                    run(wrong)
+
+                approved = parser().parse_args([
+                    "outcome-review-approve", "--review", str(review_path),
+                    "--approved-review-sha256", digest(review), "--out", str(receipt_path),
+                ])
+                run(approved)
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                self.assertEqual(receipt["review_sha256"], digest(review))
+                self.assertEqual(receipt["provenance"], review["provenance"])
+                self.assertEqual(receipt_path.stat().st_mode & 0o777, 0o600)
+
+    def test_preservation_queue_cli_writes_canonical_review_page_offline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            repo = base / "repo"
+            repo.mkdir()
+            git(repo, "init", "-q", "-b", "main")
+            git(repo, "config", "user.name", "Fixture")
+            git(repo, "config", "user.email", "fixture@example.invalid")
+            (repo / "unit.py").write_text("def result():\n    return 1\n")
+            git(repo, "add", ".")
+            git(repo, "commit", "-qm", "base")
+            inventory, _paths, _runner = build_inventory(repo)
+            inventory_path = base / "inventory.json"
+            outcomes_path = base / "outcomes.json"
+            inventory_path.write_text(json.dumps(inventory), encoding="utf-8")
+            outcome_objects = []
+            for kind, field in (("branch", "branches"), ("worktree", "worktrees"), ("stash", "stashes")):
+                for item in inventory[field]:
+                    outcome_objects.append({
+                        "object_id": object_id(kind, item), "kind": kind,
+                        "source_fingerprint": object_fingerprint(kind, item),
+                        "review_status": "unreviewed", "human_decision": None,
+                        "contribution_ids": [], "contribution_reviews": [],
+                    })
+            outcomes = {
+                "kind": "object-outcomes", "schema_version": 1,
+                "repository_id": inventory["repository"]["id"],
+                "inventory_digest": digest(inventory),
+                "snapshot_digest": "a" * 64, "contributions_digest": "b" * 64,
+                "presence_digest": None,
+                "review_provenance": {
+                    "repository_id": inventory["repository"]["id"],
+                    "inventory_digest": digest(inventory), "snapshot_digest": "a" * 64,
+                    "contributions_digest": "b" * 64, "presence_digest": None,
+                    "coverage_digest": None,
+                },
+                "objects": outcome_objects, "integration_tasks": [],
+            }
+            outcomes["outcomes_digest"] = digest(outcomes)
+            outcomes_path.write_text(json.dumps(outcomes), encoding="utf-8")
+            args = parser().parse_args([
+                "preservation-queue", "--repo", str(repo), "--inventory", str(inventory_path),
+                "--outcomes", str(outcomes_path), "--out", str(base / "queue"),
+            ])
+            output = run(args)
+            self.assertTrue(output.endswith("preservation-plan.json"))
+            self.assertTrue((base / "queue" / "index.html").exists())
+            self.assertTrue((base / "queue" / "preservation-plan.json").exists())
+
     def test_preview_prints_exact_bytes_without_artifact_or_network(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
