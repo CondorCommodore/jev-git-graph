@@ -261,14 +261,13 @@ def build_cleanup_plan(repo: str | Path, coverage: Mapping[str, Any] | str | Pat
     if max_branches <= 0 or max_branches > MAX_BRANCHES:
         raise JgError(f"max_branches must be between 1 and {MAX_BRANCHES}")
     artifact = read_json(coverage) if isinstance(coverage, (str, Path)) else dict(coverage)
-    main_name, main_tip, cutoff, recent_hours, records = _validate_coverage(artifact)
+    main_name, coverage_main_tip, cutoff, recent_hours, records = _validate_coverage(artifact)
     root, _common, runner = git.open_repository(repo)
     if artifact.get("repository_id") != opaque_path_id(root):
         raise JgError("coverage belongs to a different local repository")
     live_records = {item["name"]: item for item in git.local_branches(runner)}
     live = {name: item["tip"] for name, item in live_records.items()}
-    if live.get(main_name) != main_tip:
-        raise JgError("coverage default branch tip changed")
+    main_tip = _sha(live.get(main_name), "live main tip")
     holds, linked_stashes = _worktree_holds(runner)
     decisions: list[dict[str, Any]] = []
     eligible: list[dict[str, Any]] = []
@@ -281,9 +280,10 @@ def build_cleanup_plan(repo: str | Path, coverage: Mapping[str, Any] | str | Pat
             reason = "recent_or_unverifiable_activity"
         if live.get(name) != tip:
             reason = "source_tip_changed_or_missing"
-        if name == main_name and reason is None:
+        if name == main_name:
             reason = "default_branch"
         decision = {"name": name, "tip": tip, "main_tip": main_tip,
+                    "coverage_main_tip": coverage_main_tip,
                     "eligible": reason is None, "reason": reason,
                     "last_activity_epoch": current_activity,
                     "paths": list(record.get("paths", []))}
@@ -324,6 +324,7 @@ def build_cleanup_plan(repo: str | Path, coverage: Mapping[str, Any] | str | Pat
         "schema_version": SCHEMA_VERSION,
         "repository_id": artifact["repository_id"],
         "coverage_digest": digest(artifact),
+        "coverage_main_tip": coverage_main_tip,
         "main": {"name": main_name, "tip": main_tip},
         "activity_cutoff_epoch": cutoff,
         "recent_hours": recent_hours,

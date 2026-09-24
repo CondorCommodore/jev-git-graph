@@ -112,6 +112,14 @@ The implemented recovery path restores a missing approved ref only with
 compare-and-create against an absent ref.
 The executor never performs remote operations.
 
+The planner may consume a complete strict coverage snapshot whose main tip has
+since advanced. It considers only branches marked `EXACT` in that snapshot,
+then repeats complete byte-level content proof against the current local main
+before selecting them. The manifest records both main tips. A branch that was
+`DISTINCT` in the snapshot is not reconsidered by this plan; refresh coverage
+to discover newly exact branches. Execution still requires the plan's current
+main tip to remain unchanged.
+
 The CLI exposes `jg cleanup plan`, `jg cleanup approve`, `jg cleanup execute`,
 and interrupted-action reconciliation. Execute resolves the production
 adapter from independently verified creator participation records, or accepts
