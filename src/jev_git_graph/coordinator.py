@@ -225,11 +225,133 @@ def capability_receipt_metadata(
 
 def production_capability_is_current(capability: CreatorLeaseCapability,
                                      repository: str | Path) -> bool:
+    """Compatibility boolean API for fresh production-capability validation."""
+    return production_capability_diagnostic(capability, repository)["ok"]
+
+
+def _capability_diff(expected: CreatorLeaseCapability,
+                     current: CreatorLeaseCapability) -> dict[str, Any]:
+    """Compare capabilities without placing paths or source data in receipts."""
+    changed_fields: list[str] = []
+    for field_name in (
+        "common_dir", "runtime_roots", "lock_root", "train_construction_runtime",
+        "train_construction_commit", "scope",
+    ):
+        if getattr(expected, field_name) != getattr(current, field_name):
+            changed_fields.append(field_name)
+
+    expected_hooks = set(expected.hook_digests)
+    current_hooks = set(current.hook_digests)
+    hook_changes = {
+        "added_count": len(current_hooks - expected_hooks),
+        "removed_count": len(expected_hooks - current_hooks),
+    }
+    if expected_hooks != current_hooks:
+        changed_fields.append("hook_digests")
+
+    expected_jobs = {label: (plist, root, generation)
+                     for label, plist, root, generation in expected.loaded_runtime_jobs}
+    current_jobs = {label: (plist, root, generation)
+                    for label, plist, root, generation in current.loaded_runtime_jobs}
+    changed_jobs: list[dict[str, str]] = []
+    job_contract_changed = False
+    generation_changed = False
+    for label in sorted(set(expected_jobs) | set(current_jobs)):
+        old = expected_jobs.get(label)
+        new = current_jobs.get(label)
+        safe_label = label if label in _REQUIRED_LAUNCHD_SELECTORS else "unknown_creator"
+        if old is None or new is None or old[:2] != new[:2]:
+            job_contract_changed = True
+            changed_jobs.append({"label": safe_label, "change": "job_contract_changed"})
+        elif old[2] != new[2]:
+            generation_changed = True
+            changed_jobs.append({
+                "label": safe_label,
+                "change": "generation_changed",
+                "expected_generation_sha256": old[2],
+                "current_generation_sha256": new[2],
+            })
+    if job_contract_changed:
+        changed_fields.append("loaded_job_contract")
+    if generation_changed:
+        changed_fields.append("loaded_job_generation")
+
+    # Guard future capability fields: equality remains fail-closed, while the
+    # category stays safe and useful if a later field is not explicitly mapped.
+    if not changed_fields and expected != current:
+        changed_fields.append("capability_contract")
+    return {
+        "ok": not changed_fields,
+        "status": "current" if not changed_fields else "changed",
+        "changed_fields": sorted(changed_fields),
+        "changed_jobs": changed_jobs,
+        "hook_changes": hook_changes,
+    }
+
+
+def _safe_validation_failure(exc: BaseException) -> tuple[str, str | None]:
+    """Map resolver failures to a fixed code and an allowlisted service label."""
+    if isinstance(exc, JgError):
+        message = str(exc)
+        if message.startswith("runtime_adoption_unverified:"):
+            code = "runtime_adoption_unverified"
+        elif message.startswith("canonical_creator_unverified:"):
+            code = "canonical_creator_unverified"
+        elif message.startswith("train-construction-runtime_"):
+            code = "train_construction_runtime_unverified"
+        elif message.startswith("runtime selector") or message.startswith("runtime_selector"):
+            code = "runtime_selector_unverified"
+        else:
+            code = "creator_validation_failed"
+    elif isinstance(exc, OSError):
+        code = "local_runtime_read_failed"
+        message = ""
+    else:
+        code = "runtime_probe_failed"
+        message = ""
+    label = next((item for item in _REQUIRED_LAUNCHD_SELECTORS if item in message), None)
+    return code, label
+
+
+def production_capability_diagnostic(
+    capability: CreatorLeaseCapability, repository: str | Path,
+) -> dict[str, Any]:
+    """Resolve once and return an allowlisted explanation of capability drift.
+
+    No exception text, filesystem paths, argv, environment, source, or secrets
+    are returned. Per-process generation hashes are included only for changed
+    allowlisted launchd labels.
+    """
     try:
         current = resolve_production_creator_capability(repository)
-        return current == capability
-    except (JgError, OSError):
-        return False
+    except (JgError, OSError, subprocess.SubprocessError) as exc:
+        failure, label = _safe_validation_failure(exc)
+        return {
+            "ok": False,
+            "status": "validation_failed",
+            "changed_fields": ["current_creator_validation"],
+            "validation_failure": failure,
+            "failed_label": label,
+            "expected_generation_hashes": [
+                {"label": service if service in _REQUIRED_LAUNCHD_SELECTORS else "unknown_creator",
+                 "generation_sha256": generation}
+                for service, _plist, _root, generation in capability.loaded_runtime_jobs
+            ],
+            "current_generation_hashes": [],
+        }
+    diagnostic = _capability_diff(capability, current)
+    if not diagnostic["ok"]:
+        diagnostic["expected_generation_hashes"] = [
+            {"label": service if service in _REQUIRED_LAUNCHD_SELECTORS else "unknown_creator",
+             "generation_sha256": generation}
+            for service, _plist, _root, generation in capability.loaded_runtime_jobs
+        ]
+        diagnostic["current_generation_hashes"] = [
+            {"label": service if service in _REQUIRED_LAUNCHD_SELECTORS else "unknown_creator",
+             "generation_sha256": generation}
+            for service, _plist, _root, generation in current.loaded_runtime_jobs
+        ]
+    return diagnostic
 
 
 def _common_dir(repository: str | Path) -> Path:
@@ -812,6 +934,7 @@ class CooperativeBranchLeaseAdapter:
             raise JgError("cooperative lease requires repository identity")
         self.repository_id = repository_id
         self.capability = capability
+        self.last_capability_diagnostic: dict[str, Any] | None = None
         configured_root = lease_dir or os.environ.get("JEV_BRANCH_LEASE_DIR")
         self.lease_dir = Path(configured_root or Path.home() / ".local" / "state" /
                               "jev-git-graph" / "branch-leases").expanduser().resolve(strict=False)
@@ -1122,6 +1245,7 @@ __all__ = [
     "COOPERATIVE_LEASE_CONTRACT", "REQUIRED_HOME_LAB_CREATORS",
     "CreatorLeaseCapability", "DisposableFixtureLeaseCapability",
     "resolve_production_creator_capability", "capability_receipt_metadata",
+    "production_capability_is_current", "production_capability_diagnostic",
     "build_disposable_fixture_inventory",
     "resolve_disposable_fixture_capability", "default_cleanup_journal_path",
     "CleanupActionJournal", "CooperativeBranchLeaseAdapter",
