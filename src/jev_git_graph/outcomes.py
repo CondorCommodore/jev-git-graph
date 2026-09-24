@@ -114,11 +114,17 @@ def build_outcomes(inventory: dict, snapshot: dict, contributions: dict,
         paths[path["branch"]].append(path)
     presence_observations = {}
     judgments = {}
+    project_utility_assessment = {
+        "status": "UNKNOWN",
+        "reason": "project_requirements_not_provided",
+        "source": "code_only_presence_review",
+    }
     if presence is not None:
         # All validated observations remain visible; only the trusted Jev
         # subset may create integration recommendations.
-        from .presence import validate_presence_observations
+        from .presence import _project_utility_assessment, validate_presence_observations
         presence_observations = validate_presence_observations(presence, contributions)
+        project_utility_assessment = _project_utility_assessment(list(presence_observations.values()))
         judgments = {cid: row for cid, row in presence_observations.items()
                      if row.get("routing_scope") == "production_review_candidate"}
     cov = {}
@@ -224,7 +230,7 @@ def build_outcomes(inventory: dict, snapshot: dict, contributions: dict,
                     "usable_delta": None, "dependencies": [], "evidence_ids": [],
                     "reasons": ["answer_missing"], "routing_scope": "advisory_only",
                 })
-                contribution_reviews.append({
+                contribution_review = {
                     "contribution_id": unit["id"], "name": unit.get("name"),
                     "kind": unit.get("kind"), "path": unit.get("path"),
                     "source": {"tip": unit.get("source_tip"), "blob": unit.get("source_blob"),
@@ -243,7 +249,15 @@ def build_outcomes(inventory: dict, snapshot: dict, contributions: dict,
                     "reasons": list(observation.get("reasons", [])),
                     "routing_scope": observation.get("routing_scope", "advisory_only"),
                     "presence_origin": presence.get("origin") if presence else None,
-                })
+                }
+                if "project_goal_digest" in observation or observation.get("project_goal_context_conflict"):
+                    contribution_review.update({
+                        "project_goal_digest": observation.get("project_goal_digest"),
+                        "project_goal_version": observation.get("project_goal_version"),
+                        "project_relevance": observation.get("project_relevance"),
+                        "project_goal_context_conflict": observation.get("project_goal_context_conflict", False),
+                    })
+                contribution_reviews.append(contribution_review)
             record["contribution_reviews"] = contribution_reviews
             record["presence_origin"] = presence.get("origin") if presence else None
             unresolved_ids = sorted(
@@ -360,11 +374,7 @@ def build_outcomes(inventory: dict, snapshot: dict, contributions: dict,
               "snapshot_digest": snapshot["snapshot_digest"], "inventory_digest": digest(inventory),
               "contributions_digest": contributions["contributions_digest"],
               "presence_digest": digest(presence) if presence else None,
-              "project_utility_assessment": {
-                  "status": "UNKNOWN",
-                  "reason": "project_requirements_not_provided",
-                  "source": "code_only_presence_review",
-              },
+              "project_utility_assessment": project_utility_assessment,
               "review_digest": digest(review) if review else None,
               "human_review_approval": review_approval,
               "human_review_approval_status": (

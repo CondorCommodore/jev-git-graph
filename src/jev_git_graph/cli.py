@@ -68,6 +68,7 @@ def _build_group_presence_preview(args):
     study = read_json(args.study) if args.study else None
     selected_ids = None
     selection_digest = None
+    project_goals = ""
     if study is not None:
         if (study.get("kind") != "presence-study" or study.get("schema_version") not in {2, 3}
                 or study.get("study_digest") != digest({k: v for k, v in study.items() if k != "study_digest"})
@@ -83,6 +84,7 @@ def _build_group_presence_preview(args):
         if len(selected_ids) != len(cases) or len(selected_ids) != len(set(selected_ids)):
             raise JgError("study cases must have unique contribution IDs")
         selection_digest = study["study_digest"]
+        project_goals = study.get("project_goals", "")
         if study.get("selection_policy") == "explicit-validated-case-list-v1":
             validate_selected_range_manifest(study, range_manifest)
     model_settings = read_json(args.model_settings) if args.model_settings else None
@@ -152,6 +154,7 @@ def _build_group_presence_preview(args):
         "model_settings": model_settings,
         "selected_contribution_ids": selected_ids,
         "selection_digest": selection_digest,
+        "project_goals": project_goals,
     }
     if args.auto_estimate_input_tokens:
         if args.estimated_input_tokens is not None:
@@ -233,6 +236,12 @@ def _build_group_presence_preview(args):
         "payload_sha256": preview["payload_sha256"], "plan_digest": preview["plan_digest"],
         "approval_sha256": preview["approval_sha256"],
     }
+    purpose = next((request.get("state", {}).get("project_purpose")
+                    for request in preview["requests"]
+                    if request.get("state", {}).get("project_purpose")), None)
+    if purpose is not None:
+        replay["project_goal_sha256"] = purpose["sha256"]
+        replay["project_goal_version"] = purpose["version"]
     replay["manifest_digest"] = digest(replay)
     return object_repo, range_manifest, replay, preview
 

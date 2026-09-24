@@ -51,6 +51,37 @@ def _bool_signal(value: Any) -> bool | None:
     return None
 
 
+def _project_utility_assessment(rows: list[Mapping[str, Any]]) -> dict[str, Any]:
+    """Summarize typed relevance without claiming measured or actionable utility."""
+    goal_rows = [row for row in rows if "project_goal_context_conflict" in row]
+    if not goal_rows:
+        return {"status": "UNKNOWN", "reason": "project_requirements_not_provided",
+                "source": "code_only_presence_review"}
+    contexts = {(row.get("project_goal_digest"), row.get("project_goal_version"))
+                for row in goal_rows}
+    if len(contexts) != 1 or any(row.get("project_goal_context_conflict") for row in goal_rows):
+        return {"status": "UNKNOWN", "reason": "project_goal_context_conflict",
+                "source": "typed_project_relevance_review"}
+    goal_digest, goal_version = next(iter(contexts))
+    relevant_count = sum(row.get("project_relevance") is True for row in goal_rows)
+    not_relevant_count = sum(row.get("project_relevance") is False for row in goal_rows)
+    unknown_count = len(goal_rows) - relevant_count - not_relevant_count
+    reviewable = any(row.get("evidence_sufficient") is True
+                     and row.get("comparison_context_complete") is True
+                     and row.get("project_relevance") is not None for row in goal_rows)
+    return {
+        "status": "ADVISORY_RELEVANCE_AVAILABLE" if reviewable else "UNKNOWN",
+        "reason": ("relevance_is_not_measured_utility" if reviewable
+                   else "comparison_or_source_evidence_insufficient"),
+        "source": "typed_project_relevance_review",
+        "project_goal_digest": goal_digest,
+        "project_goal_version": goal_version,
+        "relevance_counts": {"relevant": relevant_count,
+                             "not_relevant": not_relevant_count,
+                             "unknown": unknown_count},
+    }
+
+
 def validate_presence_responses(preview: Mapping[str, Any], records: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Validate sanitized request-bound records; unknown/duplicate requests fail closed."""
     if preview.get("kind") != "branch-presence-preview" or preview.get("no_store") is not True:
@@ -113,6 +144,16 @@ def _request_bindings(request: Mapping[str, Any]) -> list[dict[str, Any]]:
                    "context_limitations": list(state.get("limitations", [])),
                    "evidence_ids": sorted({record.get("evidence_id") for record in (item.get("evidence") or {}).get("records", [])
                                            if isinstance(record.get("evidence_id"), str)})}
+        project_purpose = state.get("project_purpose")
+        if project_purpose is not None:
+            goal_digest = project_purpose.get("sha256") if isinstance(project_purpose, Mapping) else None
+            goal_version = project_purpose.get("version") if isinstance(project_purpose, Mapping) else None
+            if not isinstance(goal_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", goal_digest):
+                raise JgError("presence binding has an invalid project goal digest")
+            if goal_version != "project-purpose-v1":
+                raise JgError("presence binding has an unsupported project goal version")
+            binding["project_goal_digest"] = goal_digest
+            binding["project_goal_version"] = goal_version
         evidence = item.get("evidence") or {}
         if evidence.get("kind") == "branch-presence-source-only-evidence":
             binding["presence_scope"] = "bounded_source_unit_usable_delta_only"
@@ -306,6 +347,16 @@ def _validate_sanitized_answers(bindings: list[Mapping[str, Any]], response: Map
         expected[prefix + "evidence_sufficient"] = "noul"
         expected[prefix + "presence"] = "choice"
         expected[prefix + "usable_delta"] = "noul"
+        has_goal_digest = "project_goal_digest" in binding
+        has_goal_version = "project_goal_version" in binding
+        if has_goal_digest != has_goal_version:
+            raise JgError("presence answer has incomplete project goal binding")
+        if has_goal_digest:
+            if (not isinstance(binding.get("project_goal_digest"), str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", binding["project_goal_digest"])
+                    or binding.get("project_goal_version") != "project-purpose-v1"):
+                raise JgError("presence answer has an invalid project goal binding")
+            expected[prefix + "project_relevance"] = "noul"
         if "dependency_context_status" in binding:
             expected[prefix + "dependency_context_sufficient"] = "noul"
         for edge in binding.get("dependency_edges", []):
@@ -739,13 +790,19 @@ def reconcile_presence(
                 _bool_signal(_answer_value(answers, prefix + "dependency_context_sufficient", "noul"))
                 if "dependency_context_status" in contribution else None
             )
+            goal_digest = contribution.get("project_goal_digest")
+            goal_version = contribution.get("project_goal_version")
+            project_relevance = (
+                _bool_signal(_answer_value(answers, prefix + "project_relevance", "noul"))
+                if goal_digest is not None and suff is True else None
+            )
             deps = []
             for edge in contribution.get("dependency_edges", []):
                 edge_id = edge.get("id")
                 relevant = _bool_signal(_answer_value(answers, prefix + "dependency:" + edge_id, "noul"))
                 deps.append({"edge_id": edge_id, "neighbor_id": edge.get("neighbor_id"), "relevant": relevant})
             evidence_ids = [item for item in contribution.get("evidence_ids", []) if isinstance(item, str)]
-            rows_by_id.setdefault(cid, []).append({"presence": presence if presence in PRESENCE_CHOICES else "UNKNOWN",
+            observation = {"presence": presence if presence in PRESENCE_CHOICES else "UNKNOWN",
                 "evidence_sufficient": suff is True, "_suff": suff, "usable_delta": delta,
                 "context_complete": contribution.get("context_complete") is True,
                 "context_limitations": contribution.get("context_limitations", []),
@@ -755,7 +812,12 @@ def reconcile_presence(
                 "dependency_context_limitations": contribution.get("dependency_context_limitations", []),
                 "dependency_context_sufficient": dependency_context_sufficient,
                 "dependencies": deps, "evidence_ids": evidence_ids, "request_sha256": request_sha,
-                "group_id": record.get("group_id")})
+                "group_id": record.get("group_id")}
+            if goal_digest is not None:
+                observation["project_goal_digest"] = goal_digest
+                observation["project_goal_version"] = goal_version
+                observation["project_relevance"] = project_relevance
+            rows_by_id.setdefault(cid, []).append(observation)
 
     result_rows = []
     for cid in sorted(units):
@@ -828,7 +890,7 @@ def reconcile_presence(
             reasons.add("presence_delta_disagreement")
         routeable = effective_origin == "jev" and disposition != "UNRESOLVED"
         suff_value = True if sufficient else False if any(item["_suff"] is False for item in observations) else None
-        result_rows.append({"contribution_id": cid, "disposition": disposition,
+        result_row = {"contribution_id": cid, "disposition": disposition,
                             "presence": presence, "evidence_sufficient": suff_value,
                             "usable_delta": delta, "model_usable_delta": model_delta,
                             "comparison_context_complete": comparison_context_complete,
@@ -844,18 +906,37 @@ def reconcile_presence(
                             "reasons": sorted(reasons),
                             "dependencies": dependencies, "evidence_ids": sorted(evidence_ids),
                             "answer_request_ids": sorted({item["request_sha256"] for item in observations}),
-                            "routing_scope": "production_review_candidate" if routeable else "advisory_only"})
+                            "routing_scope": "production_review_candidate" if routeable else "advisory_only"}
+        goal_contexts = {(item.get("project_goal_digest"), item.get("project_goal_version"))
+                         for item in observations}
+        if any(item.get("project_goal_digest") is not None for item in observations):
+            goal_conflict = len(goal_contexts) != 1 or any(item.get("project_goal_digest") is None
+                                                            for item in observations)
+            goal_digest, goal_version = (next(iter(goal_contexts)) if not goal_conflict
+                                         else (None, None))
+            relevance_values = {item.get("project_relevance") for item in observations}
+            evidence_ok = bool(observations) and all(item["_suff"] is True for item in observations)
+            relevance_conflict = len(relevance_values - {None}) > 1
+            relevance = (next(iter(relevance_values)) if not goal_conflict and evidence_ok
+                         and not relevance_conflict and len(relevance_values) == 1 else None)
+            if goal_conflict:
+                reasons.add("project_goal_context_conflict")
+            if relevance_conflict:
+                reasons.add("project_relevance_answers_contradict")
+            result_row.update({"project_goal_digest": goal_digest,
+                               "project_goal_version": goal_version,
+                               "project_relevance": relevance,
+                               "project_goal_context_conflict": goal_conflict})
+        result_row["reasons"] = sorted(reasons)
+        result_rows.append(result_row)
+    project_utility_assessment = _project_utility_assessment(result_rows)
     result = {"kind": "branch-presence-result", "schema_version": 1,
               "schema": RESULT_SCHEMA, "question_version": PRESENCE_QUESTION_VERSION,
               "origin": effective_origin, "snapshot_digest": contributions.get("snapshot_digest"),
               "groups_digest": groups.get("groups_digest"),
               "contributions_digest": contributions.get("contributions_digest"),
               "contributions": result_rows,
-              "project_utility_assessment": {
-                  "status": "UNKNOWN",
-                  "reason": "project_requirements_not_provided",
-                  "source": "code_only_presence_review",
-              },
+              "project_utility_assessment": project_utility_assessment,
               "network_performed": bool(answer_artifact.get("network_performed"))}
     if verified_receipt is not None:
         result_body_sha = digest(result)
@@ -908,6 +989,23 @@ def validate_presence_observations(
             raise JgError("outcome presence has an invalid disposition")
         if row.get("presence") not in PRESENCE_CHOICES or not isinstance(row.get("reasons"), list):
             raise JgError("outcome presence row has invalid typed fields")
+        goal_fields = {"project_goal_digest", "project_goal_version", "project_relevance",
+                       "project_goal_context_conflict"}
+        present_goal_fields = goal_fields & set(row)
+        if present_goal_fields:
+            if present_goal_fields != goal_fields or not isinstance(row.get("project_goal_context_conflict"), bool):
+                raise JgError("outcome presence row has incomplete project relevance fields")
+            if row["project_goal_context_conflict"]:
+                if row.get("project_goal_digest") is not None or row.get("project_goal_version") is not None or row.get("project_relevance") is not None:
+                    raise JgError("conflicting project goal contexts must remain unknown")
+            elif (not isinstance(row.get("project_goal_digest"), str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", row["project_goal_digest"])
+                    or row.get("project_goal_version") != "project-purpose-v1"
+                    or (row.get("project_relevance") is not None
+                        and type(row.get("project_relevance")) is not bool)):
+                raise JgError("outcome presence row has invalid project relevance")
+            if row.get("evidence_sufficient") is not True and row.get("project_relevance") is not None:
+                raise JgError("insufficient source evidence cannot establish project relevance")
         if presence.get("origin") in {"synthetic", "control"} and row.get("routing_scope") != "advisory_only":
             raise JgError("synthetic/control evidence cannot route production preservation work")
         if row.get("routing_scope") == "production_review_candidate" and presence.get("origin") not in {"jev", "owner_review"}:
