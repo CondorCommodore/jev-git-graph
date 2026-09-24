@@ -14,6 +14,8 @@ from .decisions import _signal
 
 
 LIKELY_TRUE = 0.75
+_OUTCOME_LEDGER_RECEIPT_KIND = "branch-presence-outcome-ledger-receipt"
+_OUTCOME_REVIEW_APPROVAL_KIND = "outcome-human-review-approval"
 
 
 def _require_list(value: Any, label: str) -> list[Any]:
@@ -215,6 +217,48 @@ def _validated_outcomes(inventory: dict[str, Any], outcomes: dict[str, Any] | No
                 or unit.get("dependency_context_sufficient") is not True):
             raise JgError("outcome task lacks matching current trusted contribution evidence")
         tasks_by_object.setdefault(key, []).append(task)
+
+    approval_status = outcomes.get("human_review_approval_status", "none")
+    approval = outcomes.get("human_review_approval")
+    if approval_status not in ("none", "unverified", "verified"):
+        raise JgError("outcome human review approval status is invalid")
+    if approval_status == "verified":
+        from .presence import _verify_signed_record
+        if (not isinstance(approval, dict)
+                or not _verify_signed_record(approval, _OUTCOME_REVIEW_APPROVAL_KIND)
+                or approval.get("review_sha256") != outcomes.get("review_digest")
+                or approval.get("repository_id") != inventory["repository"]["id"]
+                or approval.get("provenance") != outcomes.get("review_document_provenance")):
+            raise JgError("human review approval receipt is missing or invalid")
+    elif approval is not None:
+        raise JgError("outcomes contain an approval receipt without verified status")
+
+    trusted_claim = bool(raw_tasks or approval_status == "verified") or any(
+        unit.get("routing_scope") == "production_review_candidate" or unit.get("presence_origin") == "jev"
+        for record in outcome_by_id.values()
+        for unit in record.get("contribution_reviews", []) if isinstance(unit, dict)
+    )
+    outcome_receipt = outcomes.get("outcome_ledger_receipt")
+    if outcome_receipt is not None or trusted_claim:
+        from .presence import _verify_signed_record
+        body = {key: value for key, value in outcomes.items()
+                if key not in {"outcomes_digest", "outcome_ledger_receipt"}}
+        receipt_valid = (
+            isinstance(outcome_receipt, dict)
+            and _verify_signed_record(outcome_receipt, _OUTCOME_LEDGER_RECEIPT_KIND)
+            and outcome_receipt.get("outcomes_body_sha256") == digest(body)
+            and outcome_receipt.get("repository_id") == inventory["repository"]["id"]
+            and outcome_receipt.get("inventory_digest") == digest(inventory)
+            and outcome_receipt.get("snapshot_digest") == outcomes.get("snapshot_digest")
+            and outcome_receipt.get("contributions_digest") == outcomes.get("contributions_digest")
+            and outcome_receipt.get("presence_digest") == provenance.get("presence_digest")
+            and outcome_receipt.get("trusted_presence_receipt_digest")
+                == outcomes.get("trusted_presence_receipt_digest")
+            and outcome_receipt.get("review_approval_digest")
+                == (digest(approval) if approval is not None else None)
+        )
+        if not receipt_valid:
+            raise JgError("trusted Jev or human review claims lack a matching signed outcome receipt")
     return outcome_by_id, tasks_by_object
 
 
@@ -314,8 +358,12 @@ def build_preservation_plan(
             outcome_disposition = human_decision.get("disposition") if isinstance(human_decision, dict) else None
             for task in outcome_tasks.get(key, []):
                 if (review_status == "current" and outcome_disposition == "INTEGRATE"
-                        and human_decision.get("proposed_destination") == inventory["repository"].get("default_branch")):
+                        and human_decision.get("proposed_destination") == inventory["repository"].get("default_branch")
+                        and outcome.get("review_approval_status") == "verified"):
                     state, blocker = "READY_FOR_IMPLEMENTATION", None
+                elif (review_status == "current" and outcome_disposition == "INTEGRATE"
+                      and outcome.get("review_approval_status") != "verified"):
+                    state, blocker = "PROPOSED_AWAITING_HUMAN_VERIFICATION", "explicit_outcome_review_approval_receipt_required"
                 else:
                     state = "BLOCKED"
                     blocker = ("outcome_review_stale" if review_status in {"stale", "historical-limited"}
@@ -379,6 +427,10 @@ def build_preservation_plan(
                                         for action in integration_actions),
         "blocked_integration_count": sum(action["action_state"] == "BLOCKED"
                                           for action in integration_actions),
+        "awaiting_human_verification_count": sum(
+            action["action_state"] == "PROPOSED_AWAITING_HUMAN_VERIFICATION"
+            for action in integration_actions
+        ),
         "queues": queues,
         "objects": records,
         "cleanup_readiness": "not_verified",
@@ -431,7 +483,8 @@ def render_preservation_plan(plan: dict[str, Any]) -> str:
         "li{margin:.4rem 0}</style><h1>Preservation queue</h1>"
         f"<p>{plan['object_count']} inventory objects; {plan.get('integration_action_count', 0)} proposed integration tasks "
         f"({plan.get('ready_integration_count', 0)} ready for implementation, "
-        f"{plan.get('blocked_integration_count', 0)} blocked). Cleanup readiness: "
+        f"{plan.get('blocked_integration_count', 0)} blocked, "
+        f"{plan.get('awaiting_human_verification_count', 0)} awaiting explicit approval). Cleanup readiness: "
         f"{escape(str(plan['cleanup_readiness']))}. "
         "This queue proposes no Git or filesystem action; integration tasks marked ready still require implementation and package-outcome verification.</p>"
         "<p>Per-unit judgments show typed status, routing scope, and evidence limits only. Source excerpts are not included.</p>"

@@ -23,7 +23,7 @@ from jev_git_graph.presence import (
 from jev_git_graph.presence_calibration import build_presence_calibration
 from jev_git_graph.questions import presence_questions
 from jev_git_graph.safety import digest, read_json, write_json
-from jev_git_graph.outcomes import build_outcomes
+from jev_git_graph.outcomes import approve_outcome_review, build_outcomes
 from jev_git_graph.preservation import build_preservation_plan, write_preservation_plan
 
 
@@ -525,7 +525,6 @@ def test_preservation_queue_requires_current_review_and_trusted_routeable_unit(t
     task = branch["integration_actions"][0]
     assert task["action_state"] == "BLOCKED"
     assert task["blocked_reason"] == "current_human_integration_review_required"
-
     reviewed_branch = next(row for row in unreviewed["objects"]
                            if row["object_id"] == "branch:feature/task")
     review = {
@@ -540,16 +539,47 @@ def test_preservation_queue_requires_current_review_and_trusted_routeable_unit(t
             "proposed_destination": "main", "preservation_proof": None,
         }],
     }
-    current = build_outcomes(inventory, snapshot, contributions, presence=body, review=review)
+    proposed = build_outcomes(inventory, snapshot, contributions, presence=body, review=review)
+    proposed_queue = build_preservation_plan(inventory, outcomes=proposed)
+    proposed_branch = next(row for row in proposed_queue["objects"]
+                           if row["object_id"] == "branch:feature/task")
+    assert proposed_branch["integration_actions"][0]["action_state"] == "PROPOSED_AWAITING_HUMAN_VERIFICATION"
+    assert proposed_branch["integration_actions"][0]["blocked_reason"] == "explicit_outcome_review_approval_receipt_required"
+
+    review_digest = digest(review)
+    review_approval = approve_outcome_review(review, review_digest)
+    forged_review = {**review, "decisions": [{
+        **review["decisions"][0], "proposed_destination": "unverified-branch",
+    }]}
+    with pytest.raises(JgError, match="does not bind the exact v2 review"):
+        build_outcomes(inventory, snapshot, contributions, presence=body,
+                       review=forged_review, review_approval=review_approval)
+
+    current = build_outcomes(inventory, snapshot, contributions, presence=body,
+                             review=review, review_approval=review_approval)
     queue = build_preservation_plan(inventory, outcomes=current)
     branch = next(row for row in queue["objects"] if row["object_id"] == "branch:feature/task")
     assert branch["integration_actions"][0]["action_state"] == "READY_FOR_IMPLEMENTATION"
     assert branch["cleanup_authority"] is False
+
+    forged_outcomes = {**current, "objects": [dict(row) for row in current["objects"]]}
+    forged_branch = next(row for row in forged_outcomes["objects"]
+                         if row["object_id"] == "branch:feature/task")
+    forged_branch["human_decision"] = {
+        **forged_branch["human_decision"], "rationale": "caller-forged current INTEGRATE review",
+    }
+    forged_outcomes.pop("outcomes_digest")
+    forged_outcomes["outcomes_digest"] = digest(forged_outcomes)
+    with pytest.raises(JgError, match="matching signed outcome receipt"):
+        build_preservation_plan(inventory, outcomes=forged_outcomes)
+
     wrong_destination_review = {**review, "decisions": [{
         **review["decisions"][0], "proposed_destination": "unverified-branch",
     }]}
     wrong_destination = build_outcomes(inventory, snapshot, contributions,
-                                       presence=body, review=wrong_destination_review)
+                                       presence=body, review=wrong_destination_review,
+                                       review_approval=approve_outcome_review(
+                                           wrong_destination_review, digest(wrong_destination_review)))
     blocked_queue = build_preservation_plan(inventory, outcomes=wrong_destination)
     blocked_branch = next(row for row in blocked_queue["objects"]
                           if row["object_id"] == "branch:feature/task")
@@ -578,7 +608,8 @@ def test_preservation_queue_requires_current_review_and_trusted_routeable_unit(t
     changed_presence["presence_digest"] = digest({
         key: value for key, value in changed_presence.items() if key != "presence_digest"
     })
-    stale = build_outcomes(inventory, snapshot, contributions, presence=changed_presence, review=review)
+    stale = build_outcomes(inventory, snapshot, contributions, presence=changed_presence,
+                           review=review, review_approval=review_approval)
     stale_queue = build_preservation_plan(inventory, outcomes=stale)
     branch = next(row for row in stale_queue["objects"] if row["object_id"] == "branch:feature/task")
     assert branch["outcome_review"]["status"] == "stale"

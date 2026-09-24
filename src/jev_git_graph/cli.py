@@ -28,7 +28,7 @@ from .residual import analyze_residual
 from .snapshot import load_snapshot, write_snapshot
 from .contributions import write_contributions
 from .groups import write_groups
-from .outcomes import write_outcomes
+from .outcomes import approve_outcome_review, write_outcomes
 from .preservation import write_preservation_plan
 from .study import (build_selected_study, validate_selected_range_manifest,
                     write_selected_study_artifacts, write_study)
@@ -374,7 +374,15 @@ def parser() -> argparse.ArgumentParser:
     outcomes.add_argument("--presence")
     outcomes.add_argument("--coverage")
     outcomes.add_argument("--review")
+    outcomes.add_argument("--review-approval", help="signed local receipt for the exact v2 review document")
     outcomes.add_argument("--out", required=True)
+
+    outcome_review_approve = commands.add_parser(
+        "outcome-review-approve", help="approve one exact v2 human review document by digest"
+    )
+    outcome_review_approve.add_argument("--review", required=True)
+    outcome_review_approve.add_argument("--approved-review-sha256")
+    outcome_review_approve.add_argument("--out")
 
     preservation_queue = commands.add_parser(
         "preservation-queue", help="build the canonical non-destructive queue from pinned outcomes"
@@ -604,7 +612,20 @@ def run(args: argparse.Namespace) -> str:
             raise JgError("inventory belongs to a different local repository")
         target = validate_output_path(args.out, [*protected_worktree_paths(args.repo), common])
         return str(write_outcomes(args.inventory, args.snapshot, args.contributions, target,
-                                  args.presence, args.coverage, args.review))
+                                  args.presence, args.coverage, args.review, args.review_approval))
+    if args.command == "outcome-review-approve":
+        review = read_json(args.review)
+        review_sha256 = digest(review)
+        if args.approved_review_sha256 is None:
+            if args.out is not None:
+                raise JgError("approval output requires the exact --approved-review-sha256")
+            return canonical_json({"review_sha256": review_sha256,
+                                   "approval_required": True}).decode("ascii")
+        if args.out is None:
+            raise JgError("exact-digest approval requires a private --out receipt path")
+        receipt = approve_outcome_review(review, args.approved_review_sha256)
+        write_json(Path(args.out).expanduser().resolve(), receipt)
+        return args.out
     if args.command == "preservation-queue":
         inventory = read_json(args.inventory)
         root, common, _runner = git.open_repository(args.repo)

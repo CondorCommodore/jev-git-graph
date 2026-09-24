@@ -18,6 +18,51 @@ def git(repo, *args):
 
 
 class CodeCliTests(unittest.TestCase):
+    def test_outcome_review_cli_requires_and_binds_exact_digest_approval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            review = {
+                "kind": "outcome-review", "schema_version": 2,
+                "repository_id": "fixture",
+                "provenance": {
+                    "repository_id": "fixture", "inventory_digest": "a" * 64,
+                    "snapshot_digest": "b" * 64, "contributions_digest": "c" * 64,
+                    "presence_digest": None, "coverage_digest": None,
+                },
+                "decisions": [],
+            }
+            review_path = base / "review.json"
+            private_dir = base / "private"
+            private_dir.mkdir(mode=0o700)
+            receipt_path = private_dir / "review-approval.json"
+            review_path.write_text(json.dumps(review), encoding="utf-8")
+            with patch("jev_git_graph.presence._presence_key_path",
+                       return_value=base / "private" / "receipt.key"):
+                preview = parser().parse_args([
+                    "outcome-review-approve", "--review", str(review_path),
+                ])
+                preview_result = json.loads(run(preview))
+                self.assertEqual(preview_result["review_sha256"], digest(review))
+                self.assertTrue(preview_result["approval_required"])
+                self.assertFalse(receipt_path.exists())
+
+                wrong = parser().parse_args([
+                    "outcome-review-approve", "--review", str(review_path),
+                    "--approved-review-sha256", "0" * 64, "--out", str(receipt_path),
+                ])
+                with self.assertRaisesRegex(JgError, "does not match"):
+                    run(wrong)
+
+                approved = parser().parse_args([
+                    "outcome-review-approve", "--review", str(review_path),
+                    "--approved-review-sha256", digest(review), "--out", str(receipt_path),
+                ])
+                run(approved)
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                self.assertEqual(receipt["review_sha256"], digest(review))
+                self.assertEqual(receipt["provenance"], review["provenance"])
+                self.assertEqual(receipt_path.stat().st_mode & 0o777, 0o600)
+
     def test_preservation_queue_cli_writes_canonical_review_page_offline(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

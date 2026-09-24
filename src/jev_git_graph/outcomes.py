@@ -21,6 +21,8 @@ from .safety import digest, read_json, write_json, write_private_text
 
 OUTCOME_REVIEW_VERSION = 2
 OUTCOME_REVIEW_DISPOSITIONS = {"RETAIN", "INTEGRATE", "ARCHIVE_PROPOSED", "UNRESOLVED"}
+OUTCOME_REVIEW_APPROVAL_KIND = "outcome-human-review-approval"
+OUTCOME_LEDGER_RECEIPT_KIND = "branch-presence-outcome-ledger-receipt"
 
 
 def _signed(document: dict, field: str) -> None:
@@ -42,9 +44,51 @@ def _review_timestamp(value: Any) -> bool:
     return parsed.tzinfo is not None
 
 
+def _review_provenance_valid(review: dict[str, Any]) -> bool:
+    provenance = review.get("provenance")
+    if (review.get("kind") != "outcome-review"
+            or review.get("schema_version") != OUTCOME_REVIEW_VERSION
+            or not isinstance(review.get("repository_id"), str)
+            or not isinstance(provenance, dict)
+            or provenance.get("repository_id") != review.get("repository_id")
+            or set(provenance) != {"repository_id", "inventory_digest", "snapshot_digest",
+                                   "contributions_digest", "presence_digest", "coverage_digest"}):
+        return False
+    return (all(_valid_digest(provenance.get(field)) for field in
+                ("inventory_digest", "snapshot_digest", "contributions_digest"))
+            and all(value is None or _valid_digest(value) for field, value in provenance.items()
+                    if field in {"presence_digest", "coverage_digest"}))
+
+
+def approve_outcome_review(review: dict[str, Any], approved_review_sha256: str) -> dict[str, Any]:
+    """Create a local receipt only for an explicitly digest-approved v2 review."""
+    if not _review_provenance_valid(review) or not isinstance(review.get("decisions"), list):
+        raise JgError("only a valid outcome-review v2 document can be approved")
+    review_sha256 = digest(review)
+    if not _valid_digest(approved_review_sha256) or approved_review_sha256 != review_sha256:
+        raise JgError("approved review digest does not match the exact review document")
+    from .presence import _signed_record
+    return _signed_record(OUTCOME_REVIEW_APPROVAL_KIND, {
+        "review_sha256": review_sha256,
+        "repository_id": review["repository_id"],
+        "provenance": review["provenance"],
+    }, create_key=True)
+
+
+def _review_approval_matches(review: dict[str, Any], approval: dict[str, Any] | None) -> bool:
+    if approval is None:
+        return False
+    from .presence import _verify_signed_record
+    return (_verify_signed_record(approval, OUTCOME_REVIEW_APPROVAL_KIND)
+            and approval.get("review_sha256") == digest(review)
+            and approval.get("repository_id") == review.get("repository_id")
+            and approval.get("provenance") == review.get("provenance"))
+
+
 def build_outcomes(inventory: dict, snapshot: dict, contributions: dict,
                    presence: dict | None = None, coverage: dict | None = None,
-                   review: dict | None = None) -> dict:
+                   review: dict | None = None,
+                   review_approval: dict | None = None) -> dict:
     _signed(snapshot, "snapshot_digest")
     validate_contributions(contributions)
     repository_id = inventory.get("repository", {}).get("id")
@@ -148,6 +192,14 @@ def build_outcomes(inventory: dict, snapshot: dict, contributions: dict,
                                            "review_reasons": ["object_missing_from_current_inventory"]})
             else:
                 reviewed[key] = decision
+    if review_approval is not None:
+        if (review is None or review_version != OUTCOME_REVIEW_VERSION
+                or not _review_approval_matches(review, review_approval)):
+            raise JgError("human review receipt does not bind the exact v2 review document")
+    elif review_version == OUTCOME_REVIEW_VERSION:
+        # A browser-exported JSON file is review input, not proof that an
+        # operator explicitly approved that exact document for action.
+        pass
     occupied = {w.get("branch") for w in inventory["worktrees"] if w.get("branch")}
     records, tasks = [], []
     for key, (kind, item) in objects.items():
@@ -286,6 +338,12 @@ def build_outcomes(inventory: dict, snapshot: dict, contributions: dict,
                 human_decision = dict(prior)
             record["human_decision"] = human_decision
             record["review_status"] = status
+            record["review_approval_status"] = (
+                "verified" if review_approval is not None
+                else "unverified" if review_version == OUTCOME_REVIEW_VERSION
+                else "historical-limited" if review_version == 1
+                else "none"
+            )
             record["reviewed_disposition"] = prior["disposition"]
             if current:
                 record["next_action"] = {
@@ -308,11 +366,37 @@ def build_outcomes(inventory: dict, snapshot: dict, contributions: dict,
                   "source": "code_only_presence_review",
               },
               "review_digest": digest(review) if review else None,
+              "human_review_approval": review_approval,
+              "human_review_approval_status": (
+                  "verified" if review_approval is not None
+                  else "unverified" if review_version == OUTCOME_REVIEW_VERSION
+                  else "none"
+              ),
+              "review_document_provenance": (
+                  review.get("provenance") if review_version == OUTCOME_REVIEW_VERSION else None
+              ),
               "review_provenance": review_provenance,
               "orphaned_reviews": historical_reviews,
               "objects": records, "integration_tasks": tasks,
               "counts": dict(Counter(r["disposition"] for r in records)), "object_count": len(records),
               "cleanup_authorized": False, "live_action_state": "NOT_REVALIDATED"}
+    trusted_presence_receipt_digest = None
+    if presence is not None and presence.get("origin") == "jev":
+        trusted_presence_receipt_digest = digest(presence["trusted_provenance"])
+        result["trusted_presence_receipt_digest"] = trusted_presence_receipt_digest
+    if trusted_presence_receipt_digest is not None or review_approval is not None:
+        from .presence import _signed_record
+        body_sha256 = digest(result)
+        result["outcome_ledger_receipt"] = _signed_record(OUTCOME_LEDGER_RECEIPT_KIND, {
+            "outcomes_body_sha256": body_sha256,
+            "repository_id": repository_id,
+            "inventory_digest": digest(inventory),
+            "snapshot_digest": snapshot["snapshot_digest"],
+            "contributions_digest": contributions["contributions_digest"],
+            "presence_digest": review_provenance["presence_digest"],
+            "trusted_presence_receipt_digest": trusted_presence_receipt_digest,
+            "review_approval_digest": digest(review_approval) if review_approval is not None else None,
+        })
     result["outcomes_digest"] = digest(result)
     return result
 
@@ -361,11 +445,13 @@ def render_outcomes(ledger: dict) -> str:
             + "".join(contributions) + "</ul></details>"
         ) if row["kind"] == "branch" else ""
         status = escape(str(row.get("review_status", "unreviewed")))
+        approval_status = escape(str(row.get("review_approval_status", "none")))
         rows.append("<tr>" + "".join(f"<td>{escape(str(v))}</td>" for v in (
             row["kind"], row["name"], row["disposition"], ", ".join(row["reasons"]),
             f"{len(row['contribution_ids'])} total / {row.get('unresolved_contribution_count', 0)} unresolved")) +
             f"<td>{escape(str(row['next_action']))}{unresolved}{contribution_detail}</td>"
-            f"<td><span>Prior review: {status}</span><div data-object='{key}' data-kind='{escape(row['kind'], quote=True)}' "
+            f"<td><span>Prior review: {status}; approval: {approval_status}</span>"
+            f"<div data-object='{key}' data-kind='{escape(row['kind'], quote=True)}' "
             f"data-fingerprint='{fingerprint}' data-evidence-fingerprint='{evidence_fingerprint}' "
             f"data-prior-reviewer='{prior_reviewer}'>"
             f"<select aria-label='Disposition'><option value=''>No new decision</option>{selected_options}</select>"
@@ -381,6 +467,7 @@ def render_outcomes(ledger: dict) -> str:
             " Jev results are advisory and never authorize deletion.</p>"
             "<p>Project utility: UNKNOWN because project requirements were not provided.</p>"
             "<p>Contribution detail contains typed decisions and evidence IDs only; source excerpts are not included.</p>"
+            "<p>An exported review document requires a separate exact-digest local approval before it can route implementation work.</p>"
             "<p><input id='reviewer' aria-label='Reviewer' placeholder='Reviewer name'>"
             "<button id='export'>Export review decisions</button> <span id='message' role='status'></span></p>"
             "<input id='search' aria-label='Filter objects' placeholder='Filter objects'>"
@@ -406,19 +493,21 @@ def render_outcomes(ledger: dict) -> str:
             "const url=URL.createObjectURL(new Blob([JSON.stringify(doc,null,2)],{type:'application/json'}));"
             "const a=document.createElement('a');a.href=url;a.download='outcome-review.json';a.click();"
             "setTimeout(()=>URL.revokeObjectURL(url),1000);document.getElementById('message').textContent="
-            "'Review exported. Import it with jg outcomes --review; no Git action was performed.';"
+            "'Review exported. Inspect the exact file, then run jg outcome-review-approve --review outcome-review.json to see its digest. A second call must supply that digest and --out to approve it.';"
             "});</script></html>")
 
 
 def write_outcomes(inventory_path: str, snapshot_path: str, contributions_path: str,
                    out: str | Path, presence_path: str | None = None,
-                   coverage_path: str | None = None, review_path: str | None = None) -> Path:
+                   coverage_path: str | None = None, review_path: str | None = None,
+                   review_approval_path: str | None = None) -> Path:
     from .snapshot import load_snapshot
     snapshot, _ = load_snapshot(snapshot_path)
     result = build_outcomes(read_json(inventory_path), snapshot, read_json(contributions_path),
                             read_json(presence_path) if presence_path else None,
                             read_json(coverage_path) if coverage_path else None,
-                            read_json(review_path) if review_path else None)
+                            read_json(review_path) if review_path else None,
+                            read_json(review_approval_path) if review_approval_path else None)
     destination = Path(out)
     if destination.exists():
         raise JgError("outcomes directory already exists; preserve the previous review")

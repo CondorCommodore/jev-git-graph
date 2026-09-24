@@ -28,6 +28,34 @@ object-specific fingerprints still match. Otherwise it preserves the decision
 as stale and asks for re-review. Version 1 outcome reviews are retained as
 historical-limited and never override current derived actions.
 
+The exported file is untrusted input, including its reviewer name and claimed
+decision. A current `INTEGRATE` decision remains
+`PROPOSED_AWAITING_HUMAN_VERIFICATION` until the operator explicitly approves
+that exact review file by digest. First ask the CLI to calculate the digest:
+
+```text
+jg outcome-review-approve --review outcome-review.json
+```
+
+Inspect the file and returned SHA-256, then create the owner-only local receipt
+by repeating the command with that exact digest and a new private output path:
+
+```text
+jg outcome-review-approve --review outcome-review.json \
+  --approved-review-sha256 REVIEW_SHA256 --out review-approval.json
+jg outcomes --repo PATH --inventory INVENTORY.json --snapshot SNAPSHOT.json \
+  --contributions CONTRIBUTIONS.json --presence PRESENCE.json \
+  --review outcome-review.json --review-approval review-approval.json \
+  --out NEW_PRIVATE_DIR
+```
+
+The receipt is signed with the local private presence key and binds the review
+digest, repository, and review provenance. The resulting outcome artifact also
+has a signed receipt over its complete body and pinned evidence. Recomputing
+the public JSON digest after changing an outcome cannot make it trusted. A
+receipt for a stale review remains visible as stale and cannot make a task
+ready. Treat the approval receipt as local private data.
+
 Use a new output directory for each refreshed ledger so prior reports remain
 available for comparison. The JSON and HTML outputs are local review artifacts;
 the page does not write Git refs, execute preservation tasks, or call Jev.
@@ -39,11 +67,12 @@ jg preservation-queue --repo PATH --inventory INVENTORY.json \
   --outcomes OUTCOMES.json --out NEW_PRIVATE_DIR
 ```
 
-The queue verifies the outcome digest, repository and inventory pins, object
-fingerprints, and contribution/task bindings. Per-unit evidence with advisory,
-unknown, or unresolved routing is retained as a hold. A Jev task is marked
-`READY_FOR_IMPLEMENTATION` only when its contribution is a validated production
-candidate and the matching object has a current human `INTEGRATE` decision.
+The queue verifies the outcome digest, signed outcome receipt, repository and
+inventory pins, object fingerprints, and contribution/task bindings. Per-unit
+evidence with advisory, unknown, or unresolved routing is retained as a hold.
+A Jev task is marked `READY_FOR_IMPLEMENTATION` only when its contribution is a
+validated production candidate and the matching object has both a current
+human `INTEGRATE` decision and a valid exact-review approval receipt.
 Missing and stale reviews remain visible with a blocked reason. This is a
 proposed implementation task; package tests and outcome verification still
 have to pass before the work can be called integrated or preserved. The queue
