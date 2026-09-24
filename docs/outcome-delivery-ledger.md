@@ -46,6 +46,36 @@ evidence.
 
 ## Verification policy
 
+### September 24 review checkpoint
+
+The pinned full-object ledger now accounts for all 2,073 inventoried objects:
+1,449 local branches, 622 worktrees, and two stashes. Dispositions are 212
+EXACT_REVIEW, 16 EXCLUDED, 625 RETAIN, and 1,220 UNRESOLVED. There are no
+accepted integration tasks. These are snapshot observations, not live cleanup
+authorization.
+
+The first 32-case reference review found mostly fixtures and helpers: two
+substantive production units, two substantive safety test bodies, one unsupported
+shell file, and 27 other units. Its draft labels have not been accepted as owner
+labels. The blind control produced 31 request records with 134 typed answers.
+A source-only dependency-binding defect initially blocked reconciliation; the
+corrected package reconciled all 113,211 contribution rows without inventing
+dependency answers. No Jev utility measurement follows from this offline run.
+
+Three branch dossiers account for ten changed paths. Old actuator tests passed
+93 cases against the pinned-main implementation. The proposed H3 workflow-test
+preservation task was already covered on newer main `c82cea2`; its two targeted
+cases passed, so no duplicate code was added. Occupied worktrees and remaining
+branch evidence still require their own dispositions. No branch was deleted in
+this checkpoint.
+
+Private evidence lives under
+`~/.local/share/jev-git-graph/runs/home-lab/r2-foundation-pilot-twzbuv70/`:
+`outcomes-v3-full-accounting`, `reference-review-v8`, `blind-control-v8`,
+`branch-decisions-v8`, `branch-behavior-verification-v8`, and `integration-task`.
+The earlier delivery table records its original checkpoints; it is not a claim
+that live Jev evaluation, owner acceptance, or real cleanup has completed.
+
 Prioritize complete implementation. Do not target a coverage percentage or add
 large suites of implementation-mirroring mocks. Use installed-package outcomes
 and a small number of adverse checks at source-disclosure and destructive-action

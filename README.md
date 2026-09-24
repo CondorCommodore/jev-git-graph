@@ -58,6 +58,14 @@ source ASTs are collapsed only when their destination context also matches. It
 does not establish project usefulness, semantic behavior, or integration
 readiness; dependency context and bounded excerpt omissions remain explicit.
 
+Supply `jg study --project-goals "..."` to include a bounded statement of project
+purpose in a subsequent `group-relate --study` preview. This adds a separate
+advisory relevance question; the exact new payload needs approval. Goals are
+scanned for sensitive content and limited to 4,000 UTF-8 bytes. Response and
+outcome records retain the goal digest and typed relevance, not the goal text.
+Missing goals leave project usefulness unknown; relevance alone cannot establish
+preservation, integration readiness, or cleanup permission.
+
 Use an owner-only parent directory and a new snapshot output path. Branches with
 activity in the last 24 hours, or unverifiable activity, are excluded. Later main
 movement does not invalidate this advisory snapshot. Groups report omitted
