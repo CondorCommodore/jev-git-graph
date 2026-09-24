@@ -9,21 +9,23 @@ ID, or human disposition does not make a branch removable.
 
 The CLI passes a production lease adapter and durable journal only after the
 capability resolver verifies the closed Home Lab creator-hook digest set, the
-configured and loaded LaunchAgents, and their running process locations. The
-active PID and process start time must be readable, and the process must have
-started after every reviewed hook file in its runtime was last changed; the
-resulting process generation is included in the ephemeral capability digest.
-An idle job, unknown start time, or older process keeps production execution in
-plan-only mode until the creator is relaunched from the reviewed tree. The
-train-construction job loads code from a separate worktree after fetching
-`origin/main`; its live worktree must be clean, registered with the same Git
-common directory, exactly at the current local `origin/main` commit, and match
-the reviewed hook digests. Runtime overrides or drift keep production execution
-in plan-only mode. Capability is rechecked during execution, so changes to the
-creator runtime stop later branch actions. A disposable installed-wheel fixture
-exercises execute and interrupted-action reconciliation, including
-post-delete capability drift; it does not establish production creator
-participation or authorize Home Lab deletion.
+configured and loaded LaunchAgents, and their running process locations. Each
+job must expose an active PID and exact process start time with a private
+per-PID startup receipt. The receipt binds that process generation to the
+runtime root and commit, the reviewed launcher or Python source digest, the
+shared lease-helper digest, and the loaded Python code digest. Missing PID,
+missing or unsafe receipt, source mismatch, or an unsupported creator keeps
+production execution in plan-only mode. Receipts become available only after
+the relevant creator starts with the attestation-enabled launcher; no running
+process is retroactively trusted. The train-construction job loads code from a
+separate worktree after fetching `origin/main`; its live worktree must be clean,
+registered with the same Git common directory, exactly at the current local
+`origin/main` commit, and match the reviewed hook digests. Runtime overrides or
+drift keep production execution in plan-only mode. Capability is rechecked
+during execution, so changes to the creator runtime stop later branch actions.
+A disposable installed-wheel fixture exercises execute and interrupted-action
+reconciliation, including post-delete capability drift; it does not establish
+production creator participation or authorize Home Lab deletion.
 
 ## Plan
 
