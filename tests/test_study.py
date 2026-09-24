@@ -99,6 +99,25 @@ def test_default_study_ranges_cover_changed_definition_without_truncation():
     assert manifest["omissions"] == []
 
 
+def test_default_ranges_omit_denied_paths_and_mark_source_only():
+    contributions, groups = _artifact(complete_count=24, total=32)
+    study = build_study(contributions, groups, count=32,
+                        selection_policy="dependency-complete-majority-v1")
+    for case in study["cases"]:
+        case["source"]["range"] = {"start_line": 1, "end_line": 2}
+        case["destination_candidates"][0]["range"] = {"start_line": 1, "end_line": 2}
+    denied = study["cases"][0]
+    denied["destination_candidates"][0]["path"] = "tests/test_credential.py"
+    source_only = study["cases"][1]
+    source_only["destination_candidates"] = []
+    manifest = build_study_range_manifest(study, contributions["main"]["tip"])
+    assert {item["contribution_id"]: item["reason"] for item in manifest["omissions"]} == {
+        denied["contribution_id"]: "code_evidence_path_denied"}
+    source_only_range = next(item for item in manifest["ranges"]
+                             if item["contribution_id"] == source_only["contribution_id"])
+    assert source_only_range["arm"] == "source_only_unknown"
+
+
 def _explicit_selection_fixture():
     contributions, _ = _artifact(complete_count=23, total=24)
     destination_by_id = {item["id"]: item for item in contributions["destination_units"]}
