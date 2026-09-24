@@ -342,7 +342,7 @@ def test_unsigned_success_checkpoint_cannot_mint_receipt_without_dispatch(tmp_pa
         )
 
 
-def test_pooled_executor_stops_after_first_failure_and_resumes_only_unattempted(tmp_path, monkeypatch):
+def test_pooled_executor_stops_after_first_failure_and_legacy_checkpoint_fails_closed(tmp_path, monkeypatch):
     contributions, groups = _artifact()
     plan = build_group_requests(contributions, groups, estimated_input_tokens=100, max_provider_tokens=1000)
     _add_context_contract(plan)
@@ -380,36 +380,44 @@ def test_pooled_executor_stops_after_first_failure_and_resumes_only_unattempted(
     assert "fixture-secret" not in serialized
     assert '"body"' not in serialized
 
-    prior_attempted = {item["request_sha256"] for item in first_checkpoint["attempts"]}
+    remaining_before_resume = sorted(
+        {digest(request) for request in preview["requests"]}
+        - {item["request_sha256"] for item in first_checkpoint["attempts"]}
+    )
+    failed[0]["error_class"] = "transport_or_validation_error"
+    first_checkpoint.pop("unattempted_request_sha256s")
+    presence_module._seal_checkpoint(first_checkpoint)
+    presence_module._write_checkpoint(checkpoint, first_checkpoint)
     resume_calls = []
 
-    def succeed(payload, token):
+    def must_not_dispatch(payload, token):
         resume_calls.append(digest(payload))
-        response = _response(payload)
-        response["model"] = payload["model"]
-        return response
+        raise AssertionError("uncertain checkpoint must fail closed before transport")
 
-    resumed = execute_presence_preview(
-        preview, preview["payload_sha256"], approved_approval_sha256=preview["approval_sha256"],
-        transport=succeed, token="fixture-only", max_workers=2, checkpoint=checkpoint,
-    )
+    with pytest.raises(JgError, match="uncertain requests; reconcile them before resuming"):
+        execute_presence_preview(
+            preview, preview["payload_sha256"], approved_approval_sha256=preview["approval_sha256"],
+            transport=must_not_dispatch, token="fixture-only", max_workers=2, checkpoint=checkpoint,
+        )
     final_checkpoint = read_json(checkpoint)
-    assert len(resume_calls) == 2
-    assert set(resume_calls).isdisjoint(prior_attempted)
-    assert len(final_checkpoint["attempts"]) == 4
-    assert final_checkpoint["unattempted_request_sha256s"] == []
-    assert any(item["status"] == "uncertain" for item in final_checkpoint["attempts"])
-    assert resumed["actual_budgets"]["input_tokens"] is None
+    assert resume_calls == []
+    assert final_checkpoint["unattempted_request_sha256s"] == remaining_before_resume
+    assert final_checkpoint["actual_budgets"]["input_tokens"] is None
+    assert final_checkpoint["actual_budgets"]["output_tokens"] is None
+    assert next(item for item in final_checkpoint["attempts"] if item["status"] == "uncertain")["error_class"] == \
+        "transport_or_validation_error"
 
 
 def test_null_sdk_usage_stays_uncertain_and_budget_usage_unknown(tmp_path, monkeypatch):
     contributions, groups = _artifact()
     plan = build_group_requests(contributions, groups, estimated_input_tokens=100, max_provider_tokens=1000)
     _add_context_contract(plan)
-    preview = approved_presence_preview(plan)
+    preview = _expand_approved_preview(approved_presence_preview(plan), 4)
     monkeypatch.setattr(presence_module, "_presence_key_path", lambda: tmp_path / "private" / "key")
+    first_calls = []
 
     def missing_usage(payload, token):
+        first_calls.append(digest(payload))
         response = _response(payload)
         response["model"] = payload["model"]
         response["usage"]["input_tokens"] = None
@@ -417,15 +425,32 @@ def test_null_sdk_usage_stays_uncertain_and_budget_usage_unknown(tmp_path, monke
 
     executed = execute_presence_preview(
         preview, preview["payload_sha256"], approved_approval_sha256=preview["approval_sha256"],
-        transport=missing_usage, token="fixture-only", checkpoint=tmp_path / "checkpoint.json",
+        transport=missing_usage, token="fixture-only", max_workers=2, checkpoint=tmp_path / "checkpoint.json",
     )
-    attempt = executed["attempts"][0]
-    assert attempt["status"] == "uncertain"
-    assert attempt["failure_stage"] == "response_validation"
-    assert attempt["error_class"] == "usage_unavailable"
+    assert len(first_calls) == 2
+    assert all(attempt["status"] == "uncertain" for attempt in executed["attempts"])
+    assert all(attempt["failure_stage"] == "response_validation" for attempt in executed["attempts"])
+    assert all(attempt["error_class"] == "usage_unavailable" for attempt in executed["attempts"])
+    assert len(executed["unattempted_request_sha256s"]) == 2
     assert executed["answers"] == []
     assert executed["actual_budgets"]["input_tokens"] is None
     assert executed["actual_budgets"]["output_tokens"] is None
+
+    resume_calls = []
+
+    def must_not_dispatch(payload, token):
+        resume_calls.append(digest(payload))
+        raise AssertionError("unknown usage must fail closed before transport")
+
+    with pytest.raises(JgError, match="uncertain requests; reconcile them before resuming"):
+        execute_presence_preview(
+            preview, preview["payload_sha256"], approved_approval_sha256=preview["approval_sha256"],
+            transport=must_not_dispatch, token="fixture-only", max_workers=2,
+            checkpoint=tmp_path / "checkpoint.json",
+        )
+    assert resume_calls == []
+    checkpoint = read_json(tmp_path / "checkpoint.json")
+    assert len(checkpoint["unattempted_request_sha256s"]) == 2
 
 
 def test_sdk_http_failure_persists_only_allowlisted_status(tmp_path, monkeypatch):

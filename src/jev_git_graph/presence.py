@@ -595,7 +595,8 @@ def execute_presence_preview(
                     or "error_class" in attempt and attempt["error_class"] not in {
                         "sdk_timeout", "sdk_connection_error", "sdk_response_error", "sdk_http_error",
                         "sdk_client_error", "transport_error", "evidence_validation_error",
-                        "response_validation_error", "usage_unavailable", "response_scope_error"}
+                        "response_validation_error", "usage_unavailable", "response_scope_error",
+                        "transport_or_validation_error"}
                     or "http_status" in attempt and (not isinstance(attempt["http_status"], int)
                         or isinstance(attempt["http_status"], bool) or not 100 <= attempt["http_status"] <= 599)):
                 raise JgError("presence checkpoint contains invalid failure diagnostics")
@@ -630,6 +631,24 @@ def execute_presence_preview(
     def update_unattempted() -> None:
         done_ids = {item["request_sha256"] for item in ledger["attempts"]}
         ledger["unattempted_request_sha256s"] = sorted(set(request_index) - done_ids)
+
+    if any(item.get("status") == "uncertain" for item in ledger["attempts"]):
+        # A previously dispatched request may have consumed provider budget.
+        # Preserve remaining identities, but require explicit reconciliation
+        # before any further dispatch can occur.
+        prior_actual = ledger.get("actual_budgets", {})
+        prior_wall = prior_actual.get("wall_time_seconds", 0) if isinstance(prior_actual, Mapping) else 0
+        ledger["actual_budgets"] = {
+            "attempted_requests": sum(item.get("status") != "not_dispatched" for item in ledger["attempts"]),
+            "successful_requests": len(ledger["answers"]),
+            "input_tokens": None,
+            "output_tokens": None,
+            "wall_time_seconds": prior_wall,
+        }
+        update_unattempted()
+        _seal_checkpoint(ledger)
+        _write_checkpoint(Path(checkpoint), ledger)
+        raise JgError("presence checkpoint has uncertain requests; reconcile them before resuming")
 
     def invoke(item: tuple[str, dict[str, Any]]) -> tuple[str, Any, dict[str, Any] | None, bool]:
         request_sha, request = item
@@ -667,12 +686,15 @@ def execute_presence_preview(
         return request_sha, response, None, dispatched
 
     ledger["network_performed"] = bool(ledger.get("network_performed"))
+    prior_actual = ledger.get("actual_budgets", {})
+    initial_wall = prior_actual.get("wall_time_seconds", 0) if isinstance(prior_actual, Mapping) else 0
     elapsed_started = monotonic()
     attempts = {item["request_sha256"]: item for item in ledger["attempts"]}
 
+    def total_wall_time() -> float:
+        return initial_wall + monotonic() - elapsed_started
+
     def persist_progress() -> None:
-        prior_actual = ledger.get("actual_budgets", {})
-        prior_wall = prior_actual.get("wall_time_seconds", 0) if isinstance(prior_actual, Mapping) else 0
         usage_known = all(item.get("status") != "uncertain" for item in ledger["attempts"])
         ledger["actual_budgets"] = {
             "attempted_requests": sum(item.get("status") != "not_dispatched" for item in ledger["attempts"]),
@@ -681,7 +703,7 @@ def execute_presence_preview(
                              if usage_known else None),
             "output_tokens": (sum(item["response"]["usage"]["output_tokens"] for item in ledger["answers"])
                               if usage_known else None),
-            "wall_time_seconds": prior_wall + monotonic() - elapsed_started,
+            "wall_time_seconds": total_wall_time(),
         }
         update_unattempted()
         _seal_checkpoint(ledger)
@@ -734,8 +756,6 @@ def execute_presence_preview(
             if not stop_scheduling:
                 while len(futures) < max_workers and submit_one():
                     pass
-    prior_actual = ledger.get("actual_budgets", {})
-    prior_wall = prior_actual.get("wall_time_seconds", 0) if isinstance(prior_actual, Mapping) else 0
     usage_known = all(item.get("status") != "uncertain" for item in ledger["attempts"])
     ledger["actual_budgets"] = {
         "attempted_requests": sum(item.get("status") != "not_dispatched" for item in ledger["attempts"]),
@@ -744,7 +764,7 @@ def execute_presence_preview(
                          if usage_known else None),
         "output_tokens": (sum(item["response"]["usage"]["output_tokens"] for item in ledger["answers"])
                           if usage_known else None),
-        "wall_time_seconds": prior_wall + monotonic() - elapsed_started,
+        "wall_time_seconds": total_wall_time(),
     }
     update_unattempted()
     _seal_checkpoint(ledger)
