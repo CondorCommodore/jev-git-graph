@@ -260,7 +260,11 @@ API and records remain readable as historical evidence.
 2. **Account for contributions.** Map every changed path to source units,
    destination candidates, or explicit uncertainty. Local Git/AST discovery
    precedes model review; structural similarity cannot establish whole-branch
-   exact preservation. Record unsupported languages and ambiguous references.
+   exact preservation. Match Python definitions by pinned AST fingerprint and
+   by the same path and qualified name even when implementations differ. Bound
+   candidate lists and record each relationship's provenance and truncation.
+   A same-name match is context for review, not evidence of behavior presence.
+   Record unsupported languages and ambiguous references.
 3. **Supply connected context.** Build a local graph across the eligible
    snapshot, then prepare bounded groups with dependencies, known boundary
    edges, and discovery/truncation limits. Shared state supports multiple named
