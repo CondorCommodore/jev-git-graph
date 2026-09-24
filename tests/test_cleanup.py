@@ -15,7 +15,8 @@ from jev_git_graph.coordinator import (CleanupActionJournal,
                                        CooperativeBranchLeaseAdapter,
                                        build_disposable_fixture_inventory,
                                        cleanup_action_id,
-                                       reconcile_interrupted_cleanup)
+                                       reconcile_interrupted_cleanup,
+                                       resolve_production_creator_capability)
 from jev_git_graph.errors import JgError
 from jev_git_graph.inventory import build_inventory
 from jev_git_graph.safety import digest, opaque_path_id
@@ -58,6 +59,10 @@ def build_old_plan(*args, **kwargs):
 
 
 class CleanupTests(unittest.TestCase):
+    def test_production_creator_capability_stays_plan_only_without_loaded_code_proof(self):
+        with self.assertRaisesRegex(JgError, "per-process creator startup attestations"):
+            resolve_production_creator_capability("/uninspected/repository")
+
     def integrated_lease(self, repository: Path) -> CooperativeBranchLeaseAdapter:
         fixture_root = repository.parent
         inventory = build_disposable_fixture_inventory(
