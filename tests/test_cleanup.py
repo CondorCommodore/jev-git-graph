@@ -161,6 +161,9 @@ class CleanupTests(unittest.TestCase):
                 self.assertEqual(_verify_process_startup_attestation(
                     home, runtime, pid, process_start, label, "scripts/entry.py"),
                     digest(receipt))
+                with self.assertRaisesRegex(JgError, "shell source receipts are not authoritative"):
+                    _verify_process_startup_attestation(
+                        home, runtime, pid, process_start, label, "launchd/start.sh")
                 with self.assertRaisesRegex(JgError, "generation mismatch"):
                     _verify_process_startup_attestation(
                         home, runtime, pid, process_start + " stale", label, "scripts/entry.py")

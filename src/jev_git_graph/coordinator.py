@@ -55,7 +55,7 @@ REQUIRED_HOME_LAB_CREATORS = frozenset({
 # Installed runtime metadata and caller-provided creator lists never replace
 # these code-owned expected hashes.
 _REVIEWED_HOOK_FILES = {
-    "scripts/cooperative_branch_lease.py": "bcbbd43656a437843aca9c49a5642255927d88267d566ac144a8034efe718e93",
+    "scripts/cooperative_branch_lease.py": "da39e43b0883cf133a39a76b5a8bfefdc64769f85b92c3ece35aa35046c6b88e",
     "scripts/bootstrap-worktree.sh": "c63745dae3652141ac7687a54aa03bf997de145c018a0460a6952100da928664",
     "scripts/new-worktree.sh": "ee28b1e34af1638f6c39948c39248a3015c9ed2f3a6f9cc0b87172247b4a10c5",
     "scripts/overnight-codex-backlog-round.sh": "e188e7415c68ca318a298c704cc87b710404ed912d781b79b85ea3000e64dddd",
@@ -67,7 +67,7 @@ _REVIEWED_HOOK_FILES = {
     "scripts/merge_train_parts/verdict_lifecycle.py": "eed5e98a608c7998f10d1c9e9a2c8f240d25d08863901438a1dc3e789a4f98c6",
     "scripts/train_builder.py": "289c985aaf9d8b9b00f3934ba767eee9114773240ec67a44207d74625d8ab367",
     "scripts/train_construction_driver.py": "4b9c1631c0b940d6df18ae1987fcef9801776a03ff3a6f1abd98e60059403b70",
-    "launchd/start-train-construction.sh": "913dcc6e38b5705a8819dd27ba72556485a976b44b96c416b55c3ce78067589a",
+    "launchd/start-train-construction.sh": "d7deadf97fdc4976afd5eac5e195af6519abfcdcdd94fe880c276c756e80881a",
     "scripts/l1_drain/self_reported.py": "662d9cbcd86fc021dad1612347e10a9f23f4456e8d482ca3362419ef63e69fae",
     "scripts/l1_drain/workspace.py": "5aecacb06b3322cc64dc729227d45508eb4ffff7cd0504bcf6f46bce20795b70",
     "scripts/pr_repair_loop.py": "2791deaa05197388532898610f3ab3024f617356fcbbfb545724c45782ca108e",
@@ -79,8 +79,8 @@ _REVIEWED_HOOK_FILES = {
     "scripts/merge_safe_pr_wake_producer.py": "00bdb553905418ea8c84e340ee59087cfb2210cdcc1a489067cf93b975661caf",
     "scripts/wip_convergence_entrypoint.py": "c63df09d73b0da24fafb87a9de3b5a6234ff8f88f83cdc397b72c6056650cfb5",
     "scripts/ahc_inventory_alarm.py": "1a5f84b7bf227cb8037c37ce0ecaafb0a467484b1f3d00dd3d2980c809bba6be",
-    "scripts/merge-safe-prs-loop.sh": "d1cf64287ffd7361811ae41a4f1cf54bdce0f1bbebb639de2eea53add69f1531",
-    "watcher/coord-wake.sh": "a873236f7fe2787a6291a15fc44156190384e5fb46e3eb4dbb1c23b62a300ee0",
+    "scripts/merge-safe-prs-loop.sh": "f86769ab3b1d30b6c0122e7fd8041727e6131f7b68c903c0c1884c14f0cf8d9b",
+    "watcher/coord-wake.sh": "5881829968841c08427663f39ab9d6ec2cd3093aa29b58316aa3be5712ccbaed",
     "launchd/com.mikebook.wip-convergence-loop.plist": "af41fa095438701d1aab7127778550e373c8a1e966738f77644f9df7ed5cc7bd",
     "launchd/start-all-health-controller.sh": "26e5e394a4593ed9c05fa30c278c090ecb328c2efb6bd58fcc7ba4a3bcaad517",
     "launchd/start-all-health-coord-wake-consumer.sh": "37fc614e8659c5e0098a5ea85500c157478d35273bc5e7d1be7aa3e400a84ee9",
@@ -369,6 +369,10 @@ def _verify_process_startup_attestation(
     label: str, process_rel: str,
 ) -> str:
     """Require a mode-0600 self-attestation for this exact process generation."""
+    if process_rel.endswith(".sh"):
+        raise JgError(
+            f"runtime_adoption_unverified: shell source receipts are not authoritative: {label}"
+        )
     directory = home / ".local/state/jev-git-graph/creator-runtime-attestations"
     receipt_path = directory / f"{pid}.json"
     if (directory.is_symlink() or not directory.is_dir() or receipt_path.is_symlink()
@@ -418,7 +422,7 @@ def _verify_process_startup_attestation(
     attestations = payload.get("attestations")
     if not isinstance(attestations, list):
         raise JgError(f"runtime_adoption_unverified: startup source attestations missing: {label}")
-    expected_kind = "shell_source" if process_rel.endswith(".sh") else "python_code"
+    expected_kind = "python_code"
     match = next((item for item in attestations if isinstance(item, dict)
                   and item.get("source_path") == process_rel
                   and item.get("creator") == label

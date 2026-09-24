@@ -13,9 +13,12 @@ configured and loaded LaunchAgents, and their running process locations. Each
 job must expose an active PID and exact process start time with a private
 per-PID startup receipt. The receipt binds that process generation to the
 runtime root and commit, the reviewed launcher or Python source digest, the
-shared lease-helper digest, and the loaded Python code digest. Missing PID,
-missing or unsafe receipt, source mismatch, or an unsupported creator keeps
-production execution in plan-only mode. Receipts become available only after
+shared lease-helper digest, and the loaded Python code digest. Shell-only jobs
+currently remain unsupported and keep production execution in plan-only mode:
+caller-supplied shell source and PID arguments are not evidence of which script
+a running process loaded. Missing PID, missing or unsafe receipt, source
+mismatch, or another unsupported creator also keeps production execution in
+plan-only mode. Receipts become available only after
 the relevant creator starts with the attestation-enabled launcher; no running
 process is retroactively trusted. The train-construction job loads code from a
 separate worktree after fetching `origin/main`; its live worktree must be clean,
