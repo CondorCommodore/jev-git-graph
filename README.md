@@ -49,6 +49,15 @@ records cases omitted from excerpt selection. The ranges contain no code and
 do not authorize dispatch; `jg group-relate --evidence-ranges` still scans the
 pinned content and requires the exact request approval before any Jev call.
 
+For a behavior-oriented sample, opt in with
+`--selection-policy behavior-focused-v1`. This deterministic metadata-only policy prioritizes
+moderate production definitions and named test bodies, keeps an uncertainty
+arm, reserves test-body examples when available, and records its ranking
+reasons, context targets, identity key, and limits in `study.json`. Identical
+source ASTs are collapsed only when their destination context also matches. It
+does not establish project usefulness, semantic behavior, or integration
+readiness; dependency context and bounded excerpt omissions remain explicit.
+
 Use an owner-only parent directory and a new snapshot output path. Branches with
 activity in the last 24 hours, or unverifiable activity, are excluded. Later main
 movement does not invalidate this advisory snapshot. Groups report omitted

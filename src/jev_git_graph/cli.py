@@ -370,7 +370,7 @@ def parser() -> argparse.ArgumentParser:
     study.add_argument("--exclude-branch", action="append", default=[])
     study.add_argument("--project-goals", default="")
     study.add_argument("--selection-manifest", help="digest-bound explicit contribution IDs and evidence arms")
-    study.add_argument("--selection-policy", choices=("candidate-availability-24-8-v2", "dependency-complete-majority-v1"),
+    study.add_argument("--selection-policy", choices=("candidate-availability-24-8-v2", "dependency-complete-majority-v1", "behavior-focused-v1"),
                        default="candidate-availability-24-8-v2")
 
     outcomes = commands.add_parser("outcomes", help="account for every object and render preservation tasks and review page")

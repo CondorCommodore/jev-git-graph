@@ -80,6 +80,71 @@ def test_study_includes_changed_same_path_implementations():
     assert all(case["context_stratum"] == "dependency_context_supported" for case in changed)
 
 
+def test_behavior_focused_policy_ranks_production_and_test_bodies_and_keeps_uncertainty():
+    contributions, groups = _artifact(complete_count=24, total=32)
+    for index, unit in enumerate(contributions["units"]):
+        if index < 8 or 24 <= index < 28:
+            unit.update({"path": f"tests/test_flow_{index}.py", "name": f"test_flow_{index}",
+                         "range": {"start_line": 1, "end_line": 18}, "static_references": ["a", "b"]})
+        elif index < 16 or 28 <= index:
+            unit.update({"path": f"src/service_{index}.py", "name": f"run_flow_{index}",
+                         "range": {"start_line": 1, "end_line": 22}, "static_references": ["a", "b"]})
+        else:
+            unit.update({"path": f"tests/fixtures_{index}.py", "name": f"FakeResult_{index}",
+                         "range": {"start_line": 1, "end_line": 2}})
+        unit["source"].update({"path": unit["path"], "name": unit["name"]})
+        if index == 8:
+            unit["destination_candidate_provenance"] = {unit["destination_ids"][0]: "same_path_name"}
+            contributions["destination_units"][index]["ast_fingerprint"] = "f" * 64
+    for destination in contributions["destination_units"]:
+        destination["range"] = {"start_line": 1, "end_line": 22}
+    contributions["contributions_digest"] = digest({k: v for k, v in contributions.items()
+                                                     if k != "contributions_digest"})
+    groups = build_groups(contributions)
+
+    study = build_study(contributions, groups, count=24, selection_policy="behavior-focused-v1")
+
+    assert study["case_count"] == 24
+    assert study["selection_policy"] == "behavior-focused-v1"
+    assert study["context_stratum_counts"]["uncertainty_dependency_or_destination_context"] > 0
+    selected_names = [case["source"]["name"] for case in study["cases"]]
+    assert any(name.startswith("test_flow_") for name in selected_names)
+    assert any(name.startswith("run_flow_") for name in selected_names)
+    assert "run_flow_8" in selected_names
+    assert not any(name.startswith("FakeResult_") for name in selected_names)
+    assert any(case["context_stratum"] == "uncertainty_dependency_or_destination_context"
+               and case["source"]["name"].startswith("test_flow_") for case in study["cases"])
+    assert study["selection_policy_details"]["actual_test_body_count"] >= 3
+    assert study["selection_policy_details"]["supported_target"] == 4
+    assert study["selection_policy_details"]["uncertainty_target"] == 4
+    assert all(case["selection_reasons"] and isinstance(case["selection_rank"], int)
+               for case in study["cases"])
+    details = study["selection_policy_details"]
+    assert details["ledger_contribution_units"] == 32
+    assert details["selected_units"] + details["unselected_contribution_units"] == 32
+    assert "metadata ranking does not establish usefulness" in details["selection_limits"]
+
+
+def test_behavior_focused_deduplicates_same_ast_with_matching_destination_context():
+    contributions, groups = _artifact(complete_count=32, total=32)
+    first, duplicate = contributions["units"][:2]
+    duplicate.update({"path": first["path"], "name": first["name"],
+                      "ast_fingerprint": first["ast_fingerprint"]})
+    first_destination, duplicate_destination = contributions["destination_units"][:2]
+    duplicate_destination.update({"path": first_destination["path"], "blob": first_destination["blob"],
+                                  "ast_fingerprint": first_destination.get("ast_fingerprint")})
+    contributions["contributions_digest"] = digest({k: v for k, v in contributions.items()
+                                                     if k != "contributions_digest"})
+    groups = build_groups(contributions)
+
+    study = build_study(contributions, groups, count=24, selection_policy="behavior-focused-v1")
+
+    duplicates = [case for case in study["cases"] if case["source"]["path"] == first["path"]
+                  and case["source"]["name"] == first["name"]]
+    assert len(duplicates) == 1
+    assert duplicates[0]["source_ast_fingerprint"] == first["ast_fingerprint"]
+
+
 def test_default_study_ranges_cover_changed_definition_without_truncation():
     contributions, groups = _artifact(complete_count=24, total=32)
     study = build_study(contributions, groups, count=32,
