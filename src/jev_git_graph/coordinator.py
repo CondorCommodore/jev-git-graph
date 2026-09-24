@@ -55,7 +55,10 @@ REQUIRED_HOME_LAB_CREATORS = frozenset({
 # Installed runtime metadata and caller-provided creator lists never replace
 # these code-owned expected hashes.
 _REVIEWED_HOOK_FILES = {
-    "scripts/cooperative_branch_lease.py": "da39e43b0883cf133a39a76b5a8bfefdc64769f85b92c3ece35aa35046c6b88e",
+    "scripts/cooperative_branch_lease.py": "4d010c13a996f2bccb4e2f4531f153b3b4093e2f2c22070b5f592718b6f0ed8b",
+    "scripts/attested_shell_supervisor.py": "fd1b2e6134d30e170dcd989f9e2d37726db1a49bfcb7009c3c2c8310cd127e81",
+    "launchd/start-merge-safe-prs-loop.sh": "f557548094370e6c9b6ff3d146d575627f16a070706577fc8baf290057c231cd",
+    "launchd/start-autonomy-drain-loop.sh": "24574909bc9996bbcb35787c9d73346ddfdca6c2a236e33d6452240307bf83a8",
     "scripts/bootstrap-worktree.sh": "c63745dae3652141ac7687a54aa03bf997de145c018a0460a6952100da928664",
     "scripts/new-worktree.sh": "ee28b1e34af1638f6c39948c39248a3015c9ed2f3a6f9cc0b87172247b4a10c5",
     "scripts/overnight-codex-backlog-round.sh": "e188e7415c68ca318a298c704cc87b710404ed912d781b79b85ea3000e64dddd",
@@ -67,7 +70,7 @@ _REVIEWED_HOOK_FILES = {
     "scripts/merge_train_parts/verdict_lifecycle.py": "eed5e98a608c7998f10d1c9e9a2c8f240d25d08863901438a1dc3e789a4f98c6",
     "scripts/train_builder.py": "289c985aaf9d8b9b00f3934ba767eee9114773240ec67a44207d74625d8ab367",
     "scripts/train_construction_driver.py": "4b9c1631c0b940d6df18ae1987fcef9801776a03ff3a6f1abd98e60059403b70",
-    "launchd/start-train-construction.sh": "d7deadf97fdc4976afd5eac5e195af6519abfcdcdd94fe880c276c756e80881a",
+    "launchd/start-train-construction.sh": "561cd176a789f2b2df8b0631bc19f8650ea7238d59752b57fdd477ce5dc18bf1",
     "scripts/l1_drain/self_reported.py": "662d9cbcd86fc021dad1612347e10a9f23f4456e8d482ca3362419ef63e69fae",
     "scripts/l1_drain/workspace.py": "5aecacb06b3322cc64dc729227d45508eb4ffff7cd0504bcf6f46bce20795b70",
     "scripts/pr_repair_loop.py": "2791deaa05197388532898610f3ab3024f617356fcbbfb545724c45782ca108e",
@@ -79,8 +82,8 @@ _REVIEWED_HOOK_FILES = {
     "scripts/merge_safe_pr_wake_producer.py": "00bdb553905418ea8c84e340ee59087cfb2210cdcc1a489067cf93b975661caf",
     "scripts/wip_convergence_entrypoint.py": "c63df09d73b0da24fafb87a9de3b5a6234ff8f88f83cdc397b72c6056650cfb5",
     "scripts/ahc_inventory_alarm.py": "1a5f84b7bf227cb8037c37ce0ecaafb0a467484b1f3d00dd3d2980c809bba6be",
-    "scripts/merge-safe-prs-loop.sh": "f86769ab3b1d30b6c0122e7fd8041727e6131f7b68c903c0c1884c14f0cf8d9b",
-    "watcher/coord-wake.sh": "5881829968841c08427663f39ab9d6ec2cd3093aa29b58316aa3be5712ccbaed",
+    "scripts/merge-safe-prs-loop.sh": "62e7a2183963edf14c41c11db8a6c81287a97b56c875ac04e71bd5eb0cef4a98",
+    "watcher/coord-wake.sh": "cfc21cb11f5ca2509a93d695e3f68219b82fa54c8ba8713247b72eaf7d94f372",
     "launchd/com.mikebook.wip-convergence-loop.plist": "af41fa095438701d1aab7127778550e373c8a1e966738f77644f9df7ed5cc7bd",
     "launchd/start-all-health-controller.sh": "26e5e394a4593ed9c05fa30c278c090ecb328c2efb6bd58fcc7ba4a3bcaad517",
     "launchd/start-all-health-coord-wake-consumer.sh": "37fc614e8659c5e0098a5ea85500c157478d35273bc5e7d1be7aa3e400a84ee9",
@@ -112,16 +115,24 @@ _REQUIRED_LAUNCHD_SELECTORS = {
 _REQUIRED_LAUNCHD_PATHS = {
     "com.mikebook.all-health-controller": ("launchd/start-all-health-controller.sh", "scripts/all_health_controller.py", "runtime"),
     "com.mikebook.all-health-coord-wake-consumer": ("launchd/start-all-health-coord-wake-consumer.sh", "scripts/coord_wake_consumer.py", "runtime"),
-    "com.mikebook.merge-safe-prs-loop": ("launchd/start-merge-safe-prs-loop.sh", "scripts/merge-safe-prs-loop.sh", "runtime"),
+    "com.mikebook.merge-safe-prs-loop": ("launchd/start-merge-safe-prs-loop.sh", "scripts/attested_shell_supervisor.py", "runtime"),
     "com.mikebook.pr-convergence-wake-consumer": ("launchd/start-pr-convergence-wake-consumer.sh", "scripts/merge_safe_pr_wake_consumer.py", "runtime"),
     "com.mikebook.pr-convergence-wake-producer": ("launchd/start-pr-convergence-wake-producer.sh", "scripts/merge_safe_pr_wake_producer.py", "runtime"),
     "com.mikebook.wip-convergence-loop": ("scripts/wip_convergence_entrypoint.py", "scripts/wip_convergence_entrypoint.py", "canonical"),
-    "com.mikebook.train-construction": ("launchd/start-train-construction.sh", "launchd/start-train-construction.sh", "canonical"),
+    "com.mikebook.train-construction": ("launchd/start-train-construction.sh", "scripts/attested_shell_supervisor.py", "canonical"),
     "com.mikebook.pr-repair-loop": ("launchd/start-pr-repair-loop.sh", "scripts/pr_repair_loop.py", "canonical"),
-    "com.condor.autonomy-drain-loop.codex": ("launchd/start-autonomy-drain-loop.sh", "scripts/autonomy_drain_loop.py", "canonical"),
-    "com.condor.autonomy-drain-loop.claude": ("launchd/start-autonomy-drain-loop.sh", "scripts/autonomy_drain_loop.py", "canonical"),
-    "com.tradeengine.coord-wake-codex": ("watcher/coord-wake.sh", "watcher/coord-wake.sh", "canonical"),
+    "com.condor.autonomy-drain-loop.codex": ("launchd/start-autonomy-drain-loop.sh", "scripts/attested_shell_supervisor.py", "canonical"),
+    "com.condor.autonomy-drain-loop.claude": ("launchd/start-autonomy-drain-loop.sh", "scripts/attested_shell_supervisor.py", "canonical"),
+    "com.tradeengine.coord-wake-codex": ("watcher/coord-wake.sh", "scripts/attested_shell_supervisor.py", "canonical"),
     "com.mikebook.ahc-inventory-alarm": ("launchd/start-ahc-inventory-alarm.sh", "scripts/ahc_inventory_alarm.py", "runtime"),
+}
+_SUPERVISED_SHELL_SOURCES = {
+    "com.mikebook.merge-safe-prs-loop": (
+        "launchd/start-merge-safe-prs-loop.sh", "scripts/merge-safe-prs-loop.sh"),
+    "com.mikebook.train-construction": ("launchd/start-train-construction.sh",),
+    "com.condor.autonomy-drain-loop.codex": ("launchd/start-autonomy-drain-loop.sh",),
+    "com.condor.autonomy-drain-loop.claude": ("launchd/start-autonomy-drain-loop.sh",),
+    "com.tradeengine.coord-wake-codex": ("watcher/coord-wake.sh",),
 }
 DISPOSABLE_FIXTURE_ROOT = Path.home() / ".local/state/jev-git-graph/disposable-fixtures"
 
@@ -433,6 +444,19 @@ def _verify_process_startup_attestation(
             or match.get("helper_sha256") != helper_digest
             or not re.fullmatch(r"[0-9a-f]{64}", str(match.get("loaded_code_sha256", "")))):
         raise JgError(f"runtime_adoption_unverified: startup source digest mismatch: {label}")
+    if label in _SUPERVISED_SHELL_SOURCES:
+        for shell_rel in _SUPERVISED_SHELL_SOURCES[label]:
+            shell_sha = _REVIEWED_HOOK_FILES.get(shell_rel)
+            shell_match = next((item for item in attestations if isinstance(item, dict)
+                                and item.get("source_path") == shell_rel
+                                and item.get("creator") == label
+                                and item.get("kind") == "shell_fd"), None)
+            if (shell_sha is None or shell_match is None
+                    or shell_match.get("source_sha256") != shell_sha
+                    or shell_match.get("loaded_code_sha256") != shell_sha
+                    or shell_match.get("helper_path") != "scripts/cooperative_branch_lease.py"
+                    or shell_match.get("helper_sha256") != helper_digest):
+                raise JgError(f"runtime_adoption_unverified: reviewed shell descriptor missing: {label}")
     return digest(payload)
 
 
@@ -492,6 +516,18 @@ def _verify_loaded_runtime_jobs(home: Path, runtime_roots: tuple[Path, ...]) -> 
                                capture_output=True, text=True, check=False, timeout=10)
         if check.returncode or f"path = {plist_path}" not in check.stdout:
             raise JgError(f"creator runtime launchd job is not loaded from the reviewed plist: {label}")
+        loaded_arguments = re.search(r"(?m)^\s*arguments = \{\s*\n(.*?)^\s*\}",
+                                     check.stdout, re.DOTALL)
+        if loaded_arguments is None:
+            raise JgError(f"runtime_adoption_unverified: loaded creator arguments unavailable: {label}")
+        loaded_tokens = [token for line in loaded_arguments.group(1).splitlines()
+                         for token in shlex.split(line.strip())]
+        loaded_launcher = any(
+            (Path(token) if Path(token).is_absolute() else root / token).resolve(strict=False)
+            == expected_launcher for token in loaded_tokens
+        )
+        if not loaded_launcher or not loaded_tokens or loaded_tokens[0] != args[0]:
+            raise JgError(f"runtime_adoption_unverified: loaded creator command differs from reviewed plist: {label}")
         pid = None
         for line in check.stdout.splitlines():
             match = re.match(r"\s*pid = ([0-9]+)\s*$", line)
@@ -499,7 +535,12 @@ def _verify_loaded_runtime_jobs(home: Path, runtime_roots: tuple[Path, ...]) -> 
                 pid = int(match.group(1))
                 break
         if pid is None:
-            raise JgError(f"runtime_adoption_unverified: creator job has no active PID: {label}")
+            # Interval jobs may be idle. Their next invocation loads the
+            # currently reviewed entrypoint. A start during cleanup changes
+            # this capability generation and stops the next ref transaction.
+            jobs.append((label, str(plist_path.resolve()), str(root),
+                         digest({"idle": True, "loaded_arguments": loaded_tokens})))
+            continue
         process = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
                                  capture_output=True, text=True, check=False, timeout=5)
         start_result = subprocess.run(["ps", "-p", str(pid), "-o", "lstart="],

@@ -66,7 +66,7 @@ def build_old_plan(*args, **kwargs):
 
 
 class CleanupTests(unittest.TestCase):
-    def test_runtime_job_without_pid_is_plan_only(self):
+    def test_idle_runtime_job_requires_matching_loaded_command(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / "home"
             runtime = home / "code/home-lab"
@@ -83,7 +83,8 @@ class CleanupTests(unittest.TestCase):
                 "ProgramArguments": ["/bin/sh", str(launcher)],
             }))
             launchctl_result = subprocess.CompletedProcess(
-                ["launchctl"], 0, stdout=f"path = {plist_path}\nstate = running\n", stderr="",
+                ["launchctl"], 0, stdout=(f"path = {plist_path}\nstate = not running\n"
+                    f"arguments = {{\n    /bin/sh\n    {launcher}\n}}\n"), stderr="",
             )
             with patch("jev_git_graph.coordinator._RUNTIME_SELECTORS", (
                     "code/.runtime/releases/home-lab/stable", "code/.runtime/home-lab", "code/home-lab")), \
@@ -92,7 +93,12 @@ class CleanupTests(unittest.TestCase):
                     patch("jev_git_graph.coordinator._REQUIRED_LAUNCHD_PATHS", {
                         "com.example.creator": ("launchd/start.sh", "scripts/entry.py", "runtime")}), \
                     patch("jev_git_graph.coordinator.subprocess.run", return_value=launchctl_result):
-                with self.assertRaisesRegex(JgError, "no active PID"):
+                jobs = _verify_loaded_runtime_jobs(home, (runtime, runtime, runtime))
+                self.assertEqual(len(jobs), 1)
+                self.assertEqual(len(jobs[0][3]), 64)
+                launchctl_result.stdout = (f"path = {plist_path}\nstate = not running\n"
+                    "arguments = {\n    /bin/sh\n    /tmp/unreviewed.sh\n}\n")
+                with self.assertRaisesRegex(JgError, "loaded creator command differs"):
                     _verify_loaded_runtime_jobs(home, (runtime, runtime, runtime))
 
     def test_creator_generation_is_bound_to_pid_and_reviewed_hook_bytes(self):
@@ -121,13 +127,17 @@ class CleanupTests(unittest.TestCase):
             run(runtime, "config", "user.email", "fixture@example.invalid")
             source = runtime / "scripts/entry.py"
             helper = runtime / "scripts/cooperative_branch_lease.py"
+            shell = runtime / "launchd/start.sh"
             source.parent.mkdir()
+            shell.parent.mkdir()
             source.write_text("pass\n")
             helper.write_text('CONTRACT = "jev-git-graph/cooperative-branch-lease-v1"\n')
+            shell.write_text("#!/bin/bash\nexit 0\n")
             run(runtime, "add", ".")
             run(runtime, "commit", "-qm", "reviewed runtime")
             source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
             helper_sha = hashlib.sha256(helper.read_bytes()).hexdigest()
+            shell_sha = hashlib.sha256(shell.read_bytes()).hexdigest()
             label = "com.example.creator"
             process_start = "Wed Sep 24 08:00:00 2026"
             home = root / "home"
@@ -157,7 +167,8 @@ class CleanupTests(unittest.TestCase):
             os.chmod(path, 0o600)
             with patch("jev_git_graph.coordinator._REVIEWED_HOOK_FILES", {
                     "scripts/cooperative_branch_lease.py": helper_sha,
-                    "scripts/entry.py": source_sha}):
+                    "scripts/entry.py": source_sha,
+                    "launchd/start.sh": shell_sha}):
                 self.assertEqual(_verify_process_startup_attestation(
                     home, runtime, pid, process_start, label, "scripts/entry.py"),
                     digest(receipt))
@@ -178,6 +189,22 @@ class CleanupTests(unittest.TestCase):
                 with self.assertRaisesRegex(JgError, "source digest mismatch"):
                     _verify_process_startup_attestation(
                         home, runtime, pid, process_start, label, "scripts/entry.py")
+                path.write_text(json.dumps(receipt))
+                with patch("jev_git_graph.coordinator._SUPERVISED_SHELL_SOURCES", {
+                        label: ("launchd/start.sh",)}):
+                    with self.assertRaisesRegex(JgError, "reviewed shell descriptor missing"):
+                        _verify_process_startup_attestation(
+                            home, runtime, pid, process_start, label, "scripts/entry.py")
+                    receipt["attestations"].append({
+                        "creator": label, "kind": "shell_fd",
+                        "source_path": "launchd/start.sh", "source_sha256": shell_sha,
+                        "loaded_code_sha256": shell_sha,
+                        "helper_path": "scripts/cooperative_branch_lease.py",
+                        "helper_sha256": helper_sha,
+                    })
+                    path.write_text(json.dumps(receipt))
+                    self.assertEqual(_verify_process_startup_attestation(
+                        home, runtime, pid, process_start, label, "scripts/entry.py"), digest(receipt))
 
     def test_unreviewed_creator_hook_digest_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:

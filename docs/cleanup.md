@@ -8,19 +8,21 @@ ID, or human disposition does not make a branch removable.
 ## Current integration status
 
 The CLI passes a production lease adapter and durable journal only after the
-capability resolver verifies the closed Home Lab creator-hook digest set, the
-configured and loaded LaunchAgents, and their running process locations. Each
-job must expose an active PID and exact process start time with a private
-per-PID startup receipt. The receipt binds that process generation to the
-runtime root and commit, the reviewed launcher or Python source digest, the
-shared lease-helper digest, and the loaded Python code digest. Shell-only jobs
-currently remain unsupported and keep production execution in plan-only mode:
-caller-supplied shell source and PID arguments are not evidence of which script
-a running process loaded. Missing PID, missing or unsafe receipt, source
-mismatch, or another unsupported creator also keeps production execution in
-plan-only mode. Receipts become available only after
-the relevant creator starts with the attestation-enabled launcher; no running
-process is retroactively trusted. The train-construction job loads code from a
+capability resolver verifies the closed Home Lab creator-hook digest set and
+the configured and loaded LaunchAgents. Running jobs must expose an active PID,
+exact process start time, reviewed process path, and private per-PID startup
+receipt. The receipt binds that process generation to the runtime root and
+commit, reviewed source and shared lease-helper digests, and loaded Python code.
+The reviewed Python shell supervisor opens each required shell source and
+passes that file descriptor to Bash; its receipt binds the exact bytes held
+open for execution. A Bash-supplied path or PID remains insufficient. Idle
+interval jobs are admitted only when launchd's loaded command matches the
+reviewed plist and source; a start or exit changes the capability generation
+and stops an in-progress cleanup before another ref transaction. A running
+job with a missing or unsafe receipt, stale source, or unreviewed process
+remains plan-only. Receipts become available only after the relevant creator
+starts with the attestation-enabled launcher; no running process is
+retroactively trusted. The train-construction job loads code from a
 separate worktree after fetching `origin/main`; its live worktree must be clean,
 registered with the same Git common directory, exactly at the current local
 `origin/main` commit, and match the reviewed hook digests. Runtime overrides or
