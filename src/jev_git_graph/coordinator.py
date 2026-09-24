@@ -522,11 +522,13 @@ def _verify_loaded_runtime_jobs(home: Path, runtime_roots: tuple[Path, ...]) -> 
             raise JgError(f"runtime_adoption_unverified: loaded creator arguments unavailable: {label}")
         loaded_tokens = [token for line in loaded_arguments.group(1).splitlines()
                          for token in shlex.split(line.strip())]
-        loaded_launcher = any(
-            (Path(token) if Path(token).is_absolute() else root / token).resolve(strict=False)
-            == expected_launcher for token in loaded_tokens
-        )
-        if not loaded_launcher or not loaded_tokens or loaded_tokens[0] != args[0]:
+        configured_tokens = [token for argument in args for token in shlex.split(argument)]
+        loaded_wd = re.search(r"(?m)^\s*working directory = (.+)\s*$", check.stdout)
+        if (loaded_tokens != configured_tokens
+                or (isinstance(wd, str) and wd
+                    and (loaded_wd is None
+                         or Path(loaded_wd.group(1).strip()).resolve(strict=False)
+                         != Path(wd).resolve(strict=False)))):
             raise JgError(f"runtime_adoption_unverified: loaded creator command differs from reviewed plist: {label}")
         pid = None
         for line in check.stdout.splitlines():
