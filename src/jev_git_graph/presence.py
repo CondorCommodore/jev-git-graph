@@ -312,7 +312,12 @@ def _validate_sanitized_answers(bindings: list[Mapping[str, Any]], response: Map
             edge_id = edge.get("id")
             if not isinstance(edge_id, str) or not edge_id:
                 raise JgError("presence answer has an invalid dependency binding")
-            expected[prefix + "dependency:" + edge_id] = "noul"
+            # Source-only requests intentionally carry dependency edges as
+            # bounded metadata but do not ask the model to judge them. Keep
+            # those edges in the reconciled result as unknown; requiring
+            # answers here would make an exact source-only replay impossible.
+            if binding.get("presence_scope") != "bounded_source_unit_usable_delta_only":
+                expected[prefix + "dependency:" + edge_id] = "noul"
     if not isinstance(answers, Mapping) or set(answers) != set(expected):
         raise JgError("presence answer IDs do not match contribution bindings")
     for key, kind in expected.items():

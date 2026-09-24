@@ -716,6 +716,12 @@ def test_source_only_evidence_keeps_destination_unknown_and_transient(tmp_path):
                  "dependency_context_status": "unknown"})
     unit["source"].update({"path": "src.py", "blob": unit["source_blob"]})
     contributions["branches"][0]["tip"] = source_tip
+    contributions["edges"] = [
+        {"id": "edge-source-dep-1", "source_id": "cu-1", "destination_id": "du-1",
+         "kind": "dependency"},
+        {"id": "edge-source-dep-2", "source_id": "cu-1", "destination_id": "du-1",
+         "kind": "dependency"},
+    ]
     contributions["contributions_digest"] = digest({key: value for key, value in contributions.items()
                                                       if key != "contributions_digest"})
     groups = build_groups(contributions)
@@ -738,7 +744,62 @@ def test_source_only_evidence_keeps_destination_unknown_and_transient(tmp_path):
     assert "missing from destination" not in usable_delta_question["instructions"]
     assert "cu-1:dependency_context_sufficient" in plan["requests"][0]["questions"]
     assert "integration readiness remains unassessed" in plan["requests"][0]["questions"]["cu-1:dependency_context_sufficient"]["criteria"]["false"]
+    assert len(binding["dependency_edges"]) == 2
     assert not any(key.startswith("cu-1:dependency:") for key in plan["requests"][0]["questions"])
+
+    preview = approved_presence_preview(plan)
+    request = preview["requests"][0]
+    imported = import_synthetic_answers(preview, [{
+        "request_sha256": digest(request),
+        "response": _response(request, presence="UNKNOWN", dependencies_sufficient=0.05, delta=0.95),
+    }])
+    result = reconcile_presence(contributions, groups, imported)
+    assert result["contributions"][0]["presence"] == "UNKNOWN"
+    assert result["contributions"][0]["usable_delta"] is None
+    assert result["contributions"][0]["disposition"] == "UNRESOLVED"
+    assert result["contributions"][0]["routing_scope"] == "advisory_only"
+    assert result["contributions"][0]["dependencies"] == [
+        {"edge_id": "edge-source-dep-1", "relevant": None},
+        {"edge_id": "edge-source-dep-2", "relevant": None},
+    ]
+
+    full_contributions, _ = _artifact()
+    full_unit = full_contributions["units"][0]
+    source_blob = _git(repo, "rev-parse", f"{source_tip}:src.py")
+    destination_blob = _git(repo, "rev-parse", f"{destination_tip}:src.py")
+    full_unit.update({"source_tip": source_tip, "main_tip": destination_tip, "path": "src.py",
+                      "source_blob": source_blob, "range": {"start_line": 1, "end_line": 2},
+                      "destination_ids": ["du-1"], "dependency_context_status": "complete"})
+    full_unit["source"].update({"path": "src.py", "blob": source_blob})
+    full_contributions["branches"][0]["tip"] = source_tip
+    full_contributions["destination_units"][0].update({
+        "path": "src.py", "blob": destination_blob, "range": {"start_line": 1, "end_line": 2},
+    })
+    full_contributions["edges"] = [
+        {"id": "edge-source-dep-1", "source_id": "cu-1", "destination_id": "du-1",
+         "kind": "dependency"},
+        {"id": "edge-source-dep-2", "source_id": "cu-1", "destination_id": "du-1",
+         "kind": "dependency"},
+    ]
+    full_contributions["contributions_digest"] = digest({key: value for key, value in full_contributions.items()
+                                                           if key != "contributions_digest"})
+    full_groups = build_groups(full_contributions)
+    full_evidence = build_two_sided_evidence(repo, source_tip, destination_tip, [{
+        "evidence_id": "two-sided-1", "source_path": "src.py",
+        "source_range": {"start_line": 1, "end_line": 2},
+        "destination_path": "src.py", "destination_range": {"start_line": 1, "end_line": 2},
+    }])
+    full_plan = build_group_requests(full_contributions, full_groups, {"cu-1": full_evidence})
+    full_preview = approved_presence_preview(full_plan)
+    full_request = full_preview["requests"][0]
+    incomplete_full = import_synthetic_answers(full_preview, [{
+        "request_sha256": digest(full_request), "response": _response(full_request),
+    }])
+    incomplete_full["answers"][0]["response"]["answers"].pop(
+        "cu-1:dependency:edge-source-dep-1")
+    incomplete_full["answers_digest"] = presence_module._answers_digest(incomplete_full)
+    with pytest.raises(JgError, match="presence answer IDs do not match contribution bindings"):
+        reconcile_presence(full_contributions, full_groups, incomplete_full)
 
     mismatched, _ = _artifact()
     mismatched_unit = mismatched["units"][0]
