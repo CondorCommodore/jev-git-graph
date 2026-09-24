@@ -353,6 +353,8 @@ def build_groups(contributions: dict[str, Any], max_units: int = 24, max_edges: 
     output_edge_count = 0
     output_budget_omitted: dict[str, int] = defaultdict(int)
     output_omissions_by_group: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    omitted_required_boundaries_by_group: dict[int, int] = defaultdict(int)
+    omitted_candidate_boundaries_by_group: dict[int, int] = defaultdict(int)
     output_edges_by_group: dict[int, int] = defaultdict(int)
     excluded_neighbor_edges: list[dict[str, Any]] = []
     for edge in all_edges:
@@ -402,9 +404,16 @@ def build_groups(contributions: dict[str, Any], max_units: int = 24, max_edges: 
             raise JgError(f"edge refers to unknown destination id: {target}")
         affected_groups = {group_index for group_index, _, _ in placements}
         if any(output_edges_by_group[group_index] >= max_edges for group_index in affected_groups):
-            output_budget_omitted[edge.get("kind", "unknown")] += 1
+            kind = edge.get("kind", "unknown")
+            output_budget_omitted[kind] += 1
             for group_index in affected_groups:
-                output_omissions_by_group[group_index][edge.get("kind", "unknown")] += 1
+                output_omissions_by_group[group_index][kind] += 1
+            for group_index, field, _ in placements:
+                if field == "boundary_edges":
+                    if kind in _CANDIDATE_EDGE_KINDS:
+                        omitted_candidate_boundaries_by_group[group_index] += 1
+                    else:
+                        omitted_required_boundaries_by_group[group_index] += 1
             continue
         output_edge_count += len(placements)
         for group_index, field, placed_edge in placements:
@@ -424,11 +433,16 @@ def build_groups(contributions: dict[str, Any], max_units: int = 24, max_edges: 
             edge for edge in group["boundary_edges"]
             if edge.get("kind", edge.get("type")) in _CANDIDATE_EDGE_KINDS
         ]
-        if required_boundaries:
+        omitted_required_boundaries = omitted_required_boundaries_by_group[group_index]
+        omitted_candidate_boundaries = omitted_candidate_boundaries_by_group[group_index]
+        if required_boundaries or omitted_required_boundaries:
             group["limitations"].append("partition_has_required_cross_group_edges")
         group["context_scope"] = "dependency_and_non_candidate_relationships"
-        group["required_boundary_edge_count"] = len(required_boundaries)
-        group["candidate_boundary_edge_count"] = len(candidate_boundaries)
+        # These totals include known boundaries omitted from the bounded edge array.
+        group["required_boundary_edge_count"] = len(required_boundaries) + omitted_required_boundaries
+        group["candidate_boundary_edge_count"] = len(candidate_boundaries) + omitted_candidate_boundaries
+        group["omitted_required_boundary_edge_count"] = omitted_required_boundaries
+        group["omitted_candidate_boundary_edge_count"] = omitted_candidate_boundaries
         if any(edge.get("boundary_status") == "excluded_neighbor" for edge in group["boundary_edges"]):
             group["limitations"].append("excluded_neighbor_edges_present")
         if output_omissions_by_group.get(group_index):

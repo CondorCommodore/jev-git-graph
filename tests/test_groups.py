@@ -234,6 +234,44 @@ class TestGroups(unittest.TestCase):
         self.assertTrue(all(not group["context_complete"] for group in result["groups"]))
         self.assertTrue(all(group["required_boundary_edge_count"] == 1 for group in result["groups"]))
 
+    def test_omitted_dependency_boundary_remains_counted(self):
+        branches = [branch(f"feature/{letter}") for letter in "abc"]
+        units = [unit(f"cu-{letter}", f"feature/{letter}", path=f"src/{letter}.py") for letter in "abc"]
+        edges = [
+            {"source_id": "cu-a", "destination_id": "cu-b", "type": "dependency", "provenance": "static_ast"},
+            {"source_id": "cu-b", "destination_id": "cu-c", "type": "dependency", "provenance": "static_ast"},
+        ]
+
+        result = build_groups(contribution_artifact(branches, units, edges=edges), max_units=2, max_edges=1)
+
+        self.assertEqual(result["coverage"]["groups_with_required_boundaries"], 2)
+        self.assertEqual(result["coverage"]["omitted_output_edges_by_type"]["dependency"], 1)
+        for group in result["groups"]:
+            self.assertEqual(group["required_boundary_edge_count"], 1)
+            self.assertEqual(group["omitted_required_boundary_edge_count"], 1)
+            self.assertEqual(group["omitted_edges_by_type"]["dependency"], 1)
+            self.assertIn("partition_has_required_cross_group_edges", group["limitations"])
+            self.assertFalse(group["context_complete"])
+
+    def test_omitted_candidate_boundary_remains_visible_without_dependency_gap(self):
+        branches = [branch(f"feature/{letter}") for letter in "abc"]
+        units = [unit(f"cu-{letter}", f"feature/{letter}", path=f"src/{letter}.py") for letter in "abc"]
+        edges = [
+            {"source_id": "cu-a", "destination_id": "cu-b", "type": "dependency", "provenance": "static_ast"},
+            {"source_id": "cu-b", "destination_id": "cu-c", "type": "path", "provenance": "path_similarity"},
+        ]
+
+        result = build_groups(contribution_artifact(branches, units, edges=edges), max_units=2, max_edges=1)
+
+        self.assertEqual(result["coverage"]["groups_with_candidate_boundaries"], 2)
+        self.assertEqual(result["coverage"]["omitted_output_edges_by_type"]["path"], 1)
+        for group in result["groups"]:
+            self.assertEqual(group["candidate_boundary_edge_count"], 1)
+            self.assertEqual(group["omitted_candidate_boundary_edge_count"], 1)
+            self.assertNotIn("partition_has_required_cross_group_edges", group["limitations"])
+            self.assertNotIn("edge_output_budget_exhausted", group["limitations"])
+            self.assertTrue(group["context_complete"])
+
     def test_structural_match_edge_budget_omission_preserves_destination_context(self):
         branches = [branch("feature/a")]
         destinations = [{"id": "du-a"}, {"id": "du-b"}]
