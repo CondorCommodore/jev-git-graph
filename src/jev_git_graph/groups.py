@@ -18,6 +18,7 @@ _GROUPS_SCHEMA_VERSION = 3
 _CONTEXT_GAP_LIMITATIONS = {
     "candidate_metadata_missing",
     "candidate_discovery_truncated",
+    "python_parse_unsupported",
     "partition_has_known_cross_group_edges",
     "excluded_neighbor_edges_present",
     "edge_output_budget_exhausted",
