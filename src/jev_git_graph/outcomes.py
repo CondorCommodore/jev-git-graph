@@ -13,6 +13,7 @@ import re
 from typing import Any
 
 from .errors import JgError
+from .delivery_observations import validate_delivery_observations
 from .groups import _validate as validate_contributions
 from .preservation import _object_index
 from .review import object_fingerprint
@@ -88,7 +89,8 @@ def _review_approval_matches(review: dict[str, Any], approval: dict[str, Any] | 
 def build_outcomes(inventory: dict, snapshot: dict, contributions: dict,
                    presence: dict | None = None, coverage: dict | None = None,
                    review: dict | None = None,
-                   review_approval: dict | None = None) -> dict:
+                   review_approval: dict | None = None,
+                   delivery_observations: dict | None = None) -> dict:
     _signed(snapshot, "snapshot_digest")
     validate_contributions(contributions)
     repository_id = inventory.get("repository", {}).get("id")
@@ -106,6 +108,11 @@ def build_outcomes(inventory: dict, snapshot: dict, contributions: dict,
     ):
         raise JgError("contribution branch pins differ from snapshot")
     units = {u["id"]: u for u in contributions["units"]}
+    delivery_by_id = {}
+    normalized_delivery = None
+    if delivery_observations is not None:
+        normalized_delivery, delivery_by_id = validate_delivery_observations(
+            delivery_observations, repository_id, snapshot, contributions)
     by_branch: dict[str, list] = defaultdict(list)
     for unit in units.values():
         by_branch[unit["source"]["branch"]].append(unit)
@@ -250,6 +257,8 @@ def build_outcomes(inventory: dict, snapshot: dict, contributions: dict,
                     "routing_scope": observation.get("routing_scope", "advisory_only"),
                     "presence_origin": presence.get("origin") if presence else None,
                 }
+                if unit["id"] in delivery_by_id:
+                    contribution_review["delivery_observation"] = delivery_by_id[unit["id"]]
                 if "project_goal_digest" in observation or observation.get("project_goal_context_conflict"):
                     contribution_review.update({
                         "project_goal_digest": observation.get("project_goal_digest"),
@@ -326,7 +335,10 @@ def build_outcomes(inventory: dict, snapshot: dict, contributions: dict,
         if kind == "branch":
             evidence_context.update({
                 "main_tip": snapshot["main"]["tip"],
-                "contribution_reviews": record.get("contribution_reviews", []),
+                "contribution_reviews": [
+                    {key: value for key, value in unit.items() if key != "delivery_observation"}
+                    for unit in record.get("contribution_reviews", [])
+                ],
                 "path_coverage": {"count": record.get("path_count", 0),
                                   "exact_count": record.get("exact_path_count", 0),
                                   "snapshot_verdict": record.get("snapshot_path_coverage")},
@@ -390,6 +402,8 @@ def build_outcomes(inventory: dict, snapshot: dict, contributions: dict,
               "objects": records, "integration_tasks": tasks,
               "counts": dict(Counter(r["disposition"] for r in records)), "object_count": len(records),
               "cleanup_authorized": False, "live_action_state": "NOT_REVALIDATED"}
+    if normalized_delivery is not None:
+        result["delivery_observations"] = normalized_delivery
     trusted_presence_receipt_digest = None
     if presence is not None and presence.get("origin") == "jev":
         trusted_presence_receipt_digest = digest(presence["trusted_provenance"])
@@ -439,6 +453,26 @@ def render_outcomes(ledger: dict) -> str:
             ) or "none recorded")
             evidence_ids = escape(", ".join(unit.get("evidence_ids", [])) or "none")
             reasons = escape(", ".join(unit.get("reasons", [])) or "none")
+            delivery = unit.get("delivery_observation")
+            delivery_html = ""
+            if isinstance(delivery, dict):
+                pr = delivery["pull_request"]
+                delivery_html = (
+                    "<br><strong>Delivery observation (reported; not provider-verified or preservation proof):</strong> "
+                    + escape(str(pr["status"])) + " · " + escape(str(delivery["observed_at"]))
+                    + " · observer " + escape(str(delivery["observer"]["identity"]))
+                    + " (" + escape(str(delivery["observer"]["kind"])) + ")"
+                    + " · <a rel='noreferrer' href='" + escape(str(pr["url"]), quote=True) + "'>"
+                    + escape(str(pr["repository"])) + "#" + escape(str(pr["number"])) + "</a>"
+                    + " · PR head " + escape(str(pr["head_sha"]))
+                    + " · PR base " + escape(str(pr["base_sha"]))
+                    + " · analysis destination " + escape(str(delivery["destination"]["branch"]))
+                    + "@" + escape(str(delivery["destination"]["tip"]))
+                    + (" · reported merge SHA " + escape(str(pr["merge_sha"]))
+                       if pr["merge_sha"] is not None else "")
+                    + " · evidence " + escape(str(delivery["evidence"]["reference"]))
+                    + " sha256 " + escape(str(delivery["evidence"]["sha256"]))
+                )
             contributions.append(
                 "<li><strong>" + safe_name + "</strong> · " + safe_path
                 + " · " + escape(str(unit.get("disposition", "UNRESOLVED")))
@@ -447,7 +481,7 @@ def render_outcomes(ledger: dict) -> str:
                 + " · route " + escape(str(unit.get("routing_scope", "advisory_only")))
                 + "<br>Dependencies: " + dependencies
                 + "<br>Evidence IDs: " + evidence_ids
-                + "<br>Limits / reasons: " + reasons + "</li>"
+                + "<br>Limits / reasons: " + reasons + delivery_html + "</li>"
             )
         contribution_detail = (
             f"<details><summary>{len(contributions)} contribution judgments · "
@@ -510,14 +544,16 @@ def render_outcomes(ledger: dict) -> str:
 def write_outcomes(inventory_path: str, snapshot_path: str, contributions_path: str,
                    out: str | Path, presence_path: str | None = None,
                    coverage_path: str | None = None, review_path: str | None = None,
-                   review_approval_path: str | None = None) -> Path:
+                   review_approval_path: str | None = None,
+                   delivery_observations_path: str | None = None) -> Path:
     from .snapshot import load_snapshot
     snapshot, _ = load_snapshot(snapshot_path)
     result = build_outcomes(read_json(inventory_path), snapshot, read_json(contributions_path),
                             read_json(presence_path) if presence_path else None,
                             read_json(coverage_path) if coverage_path else None,
                             read_json(review_path) if review_path else None,
-                            read_json(review_approval_path) if review_approval_path else None)
+                            read_json(review_approval_path) if review_approval_path else None,
+                            read_json(delivery_observations_path) if delivery_observations_path else None)
     destination = Path(out)
     if destination.exists():
         raise JgError("outcomes directory already exists; preserve the previous review")

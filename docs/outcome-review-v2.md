@@ -77,3 +77,24 @@ Missing and stale reviews remain visible with a blocked reason. This is a
 proposed implementation task; package tests and outcome verification still
 have to pass before the work can be called integrated or preserved. The queue
 does not execute integration, certify preservation, or authorize cleanup.
+
+## Metadata-only delivery observations
+
+`jg outcomes --delivery-observations delivery-observations.json` accepts an
+optional sidecar with `kind: "delivery-observations"`, schema version 1, and
+exact repository, snapshot, and contribution digests. Each row binds one full
+contribution ID to its source branch/tip/path/blob and the pinned snapshot-main
+branch/tip. PR metadata records the exact GitHub URL, repository, number, head,
+observed base, `OPEN` or `MERGED` status, and a merge SHA for `MERGED` only; the
+row also records an offset-bearing observation time, observer identity/type,
+and evidence reference plus SHA-256. Unknown fields, duplicate or unknown IDs,
+stale pins, malformed URLs/SHAs, and inconsistent merge metadata fail closed.
+
+The sidecar is an observation record. Its `OPEN`/`MERGED` status and PR head/base
+are reported metadata; the CLI does not query GitHub or validate that those refs
+contain the contribution or match the separately pinned analysis destination.
+The outcomes and preservation-queue pages display it under a separate delivery
+observation heading. It does not create a proposed task, change any disposition,
+review fingerprint, readiness gate, or preservation proof. A merge observation
+does not independently verify destination content. No raw source or provider
+request is read by this path.
