@@ -55,7 +55,7 @@ REQUIRED_HOME_LAB_CREATORS = frozenset({
 # Installed runtime metadata and caller-provided creator lists never replace
 # these code-owned expected hashes.
 _REVIEWED_HOOK_FILES = {
-    "scripts/cooperative_branch_lease.py": "4d010c13a996f2bccb4e2f4531f153b3b4093e2f2c22070b5f592718b6f0ed8b",
+    "scripts/cooperative_branch_lease.py": "e76ea4293ea36f2fbfa6c26f92693c630ab84123f53ad775950123b3edf9953f",
     "scripts/attested_shell_supervisor.py": "fd1b2e6134d30e170dcd989f9e2d37726db1a49bfcb7009c3c2c8310cd127e81",
     "launchd/start-merge-safe-prs-loop.sh": "e9eeeb7aea1ccc6ec51ef6b17dcf09a86d4c3c7e47d8ae8065e0b885c2ddfbc4",
     "launchd/start-autonomy-drain-loop.sh": "2a5bb4fab729056a001e2e1dbc5f775ba12668a087efb5fd0e271dd6c88610bd",
