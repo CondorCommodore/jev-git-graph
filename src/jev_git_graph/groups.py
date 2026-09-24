@@ -19,9 +19,12 @@ _CONTEXT_GAP_LIMITATIONS = {
     "candidate_metadata_missing",
     "candidate_discovery_truncated",
     "python_parse_unsupported",
-    "partition_has_known_cross_group_edges",
+    "partition_has_required_cross_group_edges",
     "excluded_neighbor_edges_present",
     "edge_output_budget_exhausted",
+}
+_CANDIDATE_EDGE_KINDS = {
+    "ast_fingerprint", "blob", "branch_family", "path", "same_branch", "structural_match", "symbol",
 }
 
 
@@ -261,43 +264,58 @@ def build_groups(contributions: dict[str, Any], max_units: int = 24, max_edges: 
         "ast_fingerprint": 3,
         "blob": 4,
         "same_branch": 5,
-        "path": 6,
-        "symbol": 7,
-        "branch_family": 8,
+        "branch_family": 6,
+        "path": 7,
+        "symbol": 8,
     }
     all_edges = list(candidate_edges.values()) + normalized_input_edges
     all_edges.sort(key=lambda edge: (
         edge_priority.get(edge.get("kind", "unknown"), 20),
-        edge["id"], edge["source_id"], edge["destination_id"],
+        edge.get("kind", "unknown"), edge["source_id"], edge["destination_id"], edge["id"],
     ))
 
-    # Connected components across source units only. Destination candidates
-    # are attached locally and never act as universal main-branch hubs.
-    adjacency: dict[str, set[str]] = {unit_id: set() for unit_id in eligible_ids}
+    # Form groups by accepting the strongest source-to-source relationships
+    # first, while enforcing the request bound at every merge. Unbounded
+    # connected components followed by unit-ID slicing split the strongest
+    # dependency edges arbitrarily when weak common-name/path signals make a
+    # giant component.
+    parent = {unit_id: unit_id for unit_id in eligible_ids}
+    component_size = {unit_id: 1 for unit_id in eligible_ids}
+    accepted_merges: dict[str, int] = defaultdict(int)
+    rejected_merges: dict[str, int] = defaultdict(int)
+
+    def find(unit_id: str) -> str:
+        root = unit_id
+        while parent[root] != root:
+            root = parent[root]
+        while parent[unit_id] != unit_id:
+            next_id = parent[unit_id]
+            parent[unit_id] = root
+            unit_id = next_id
+        return root
+
     for edge in all_edges:
         left, right = edge["source_id"], edge["destination_id"]
-        if left in adjacency and right in adjacency:
-            adjacency[left].add(right)
-            adjacency[right].add(left)
-    components: list[list[str]] = []
-    unseen = set(eligible_ids)
-    while unseen:
-        root = min(unseen)
-        stack, component = [root], []
-        unseen.remove(root)
-        while stack:
-            current = stack.pop()
-            component.append(current)
-            for neighbor in sorted(adjacency[current] & unseen, reverse=True):
-                unseen.remove(neighbor)
-                stack.append(neighbor)
-        components.append(sorted(component))
-    components.sort(key=lambda component: component[0])
+        if left not in parent or right not in parent:
+            continue
+        left_root, right_root = find(left), find(right)
+        if left_root == right_root:
+            continue
+        kind = str(edge.get("kind", "unknown"))
+        if component_size[left_root] + component_size[right_root] > max_units:
+            rejected_merges[kind] += 1
+            continue
+        # The lexical root makes IDs and artifacts independent of edge
+        # traversal details while edge order still gives evidence priority.
+        root, child = sorted((left_root, right_root))
+        parent[child] = root
+        component_size[root] += component_size.pop(child)
+        accepted_merges[kind] += 1
 
-    partitions: list[list[str]] = []
-    for component in components:
-        for offset in range(0, len(component), max_units):
-            partitions.append(component[offset:offset + max_units])
+    grouped: dict[str, list[str]] = defaultdict(list)
+    for unit_id in eligible_ids:
+        grouped[find(unit_id)].append(unit_id)
+    partitions = sorted((sorted(group) for group in grouped.values()), key=lambda group: group[0])
     groups = []
     destination_id_sets: list[set[str]] = []
     group_index_by_unit = {
@@ -335,6 +353,8 @@ def build_groups(contributions: dict[str, Any], max_units: int = 24, max_edges: 
     output_edge_count = 0
     output_budget_omitted: dict[str, int] = defaultdict(int)
     output_omissions_by_group: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    omitted_required_boundaries_by_group: dict[int, int] = defaultdict(int)
+    omitted_candidate_boundaries_by_group: dict[int, int] = defaultdict(int)
     output_edges_by_group: dict[int, int] = defaultdict(int)
     excluded_neighbor_edges: list[dict[str, Any]] = []
     for edge in all_edges:
@@ -384,9 +404,16 @@ def build_groups(contributions: dict[str, Any], max_units: int = 24, max_edges: 
             raise JgError(f"edge refers to unknown destination id: {target}")
         affected_groups = {group_index for group_index, _, _ in placements}
         if any(output_edges_by_group[group_index] >= max_edges for group_index in affected_groups):
-            output_budget_omitted[edge.get("kind", "unknown")] += 1
+            kind = edge.get("kind", "unknown")
+            output_budget_omitted[kind] += 1
             for group_index in affected_groups:
-                output_omissions_by_group[group_index][edge.get("kind", "unknown")] += 1
+                output_omissions_by_group[group_index][kind] += 1
+            for group_index, field, _ in placements:
+                if field == "boundary_edges":
+                    if kind in _CANDIDATE_EDGE_KINDS:
+                        omitted_candidate_boundaries_by_group[group_index] += 1
+                    else:
+                        omitted_required_boundaries_by_group[group_index] += 1
             continue
         output_edge_count += len(placements)
         for group_index, field, placed_edge in placements:
@@ -398,13 +425,31 @@ def build_groups(contributions: dict[str, Any], max_units: int = 24, max_edges: 
         group["id"] = "grp-" + digest({"unit_ids": group["unit_ids"], "destination_ids": group["destination_ids"]})[:24]
         group["edges"].sort(key=lambda edge: edge["id"])
         group["boundary_edges"].sort(key=lambda edge: edge["id"])
-        if group["boundary_edges"]:
-            group["limitations"].append("partition_has_known_cross_group_edges")
+        required_boundaries = [
+            edge for edge in group["boundary_edges"]
+            if edge.get("kind", edge.get("type")) not in _CANDIDATE_EDGE_KINDS
+        ]
+        candidate_boundaries = [
+            edge for edge in group["boundary_edges"]
+            if edge.get("kind", edge.get("type")) in _CANDIDATE_EDGE_KINDS
+        ]
+        omitted_required_boundaries = omitted_required_boundaries_by_group[group_index]
+        omitted_candidate_boundaries = omitted_candidate_boundaries_by_group[group_index]
+        if required_boundaries or omitted_required_boundaries:
+            group["limitations"].append("partition_has_required_cross_group_edges")
+        group["context_scope"] = "dependency_and_non_candidate_relationships"
+        # These totals include known boundaries omitted from the bounded edge array.
+        group["required_boundary_edge_count"] = len(required_boundaries) + omitted_required_boundaries
+        group["candidate_boundary_edge_count"] = len(candidate_boundaries) + omitted_candidate_boundaries
+        group["omitted_required_boundary_edge_count"] = omitted_required_boundaries
+        group["omitted_candidate_boundary_edge_count"] = omitted_candidate_boundaries
         if any(edge.get("boundary_status") == "excluded_neighbor" for edge in group["boundary_edges"]):
             group["limitations"].append("excluded_neighbor_edges_present")
         if output_omissions_by_group.get(group_index):
-            group["limitations"].append("edge_output_budget_exhausted")
             group["omitted_edges_by_type"] = dict(sorted(output_omissions_by_group[group_index].items()))
+            if any(kind not in _CANDIDATE_EDGE_KINDS
+                   for kind in output_omissions_by_group[group_index]):
+                group["limitations"].append("edge_output_budget_exhausted")
         group["limitations"] = sorted(set(group["limitations"]))
         group["analysis_observations"] = sorted(set(group["analysis_observations"]))
         group["context_complete"] = not any(
@@ -420,6 +465,8 @@ def build_groups(contributions: dict[str, Any], max_units: int = 24, max_edges: 
         "candidate_metadata_unknown_units": metadata_unknown_ids,
         "eligible_branches_without_units": sorted(name for name in eligible_branches if name not in set(unit_branches.values())),
         "candidate_edges_discovered": len(candidate_edges),
+        "accepted_group_merges_by_type": dict(sorted(accepted_merges.items())),
+        "rejected_group_merges_by_type": dict(sorted(rejected_merges.items())),
         "input_edges_considered": len(normalized_input_edges),
         "excluded_neighbor_edge_ids": sorted(edge["id"] for edge in excluded_neighbor_edges),
         "excluded_neighbor_edge_count": len(excluded_neighbor_edges),
@@ -427,6 +474,13 @@ def build_groups(contributions: dict[str, Any], max_units: int = 24, max_edges: 
         "unexpanded_pairwise_candidates_by_type": dict(sorted(unexpanded_pairwise.items())),
         "discovery_scope": "one deterministic spanning chain per shared indexed signal; remaining pairwise relationships were not enumerated",
         "pairwise_relationships_exhaustive": False,
+        "context_scope": "dependency and non-candidate relationships; candidate boundaries remain visible but do not imply dependency",
+        "groups_with_required_boundaries": sum(
+            group["required_boundary_edge_count"] > 0 for group in groups
+        ),
+        "groups_with_candidate_boundaries": sum(
+            group["candidate_boundary_edge_count"] > 0 for group in groups
+        ),
         "omitted_output_edges_by_type": dict(sorted(output_budget_omitted.items())),
         "unresolved_candidate_count": sum(omitted.values()) + sum(output_budget_omitted.values()),
         "output_edges_emitted": output_edge_count,
