@@ -88,6 +88,11 @@ dispatch and destructive cleanup remain approval- and gate-bound. See the
 [delivery ledger](docs/outcome-delivery-ledger.md) for the exact tested and
 pending evidence.
 
+The local outcomes page now includes contribution-level presence observations
+and exports a fingerprinted, versioned human review ledger. See the
+[outcome review v2 contract](docs/outcome-review-v2.md) for stale-review and
+preservation-proof handling.
+
 The [local artifact viewer](docs/index.html) starts empty and renders only JSON selected by the operator. It makes no API calls.
 
 ## View local artifacts

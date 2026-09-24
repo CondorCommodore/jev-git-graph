@@ -23,6 +23,7 @@ from jev_git_graph.presence import (
 from jev_git_graph.presence_calibration import build_presence_calibration
 from jev_git_graph.questions import presence_questions
 from jev_git_graph.safety import digest
+from jev_git_graph.outcomes import build_outcomes
 
 
 def _artifact():
@@ -382,6 +383,80 @@ def test_missing_comparison_ranges_keep_presence_advisory():
     assert row["presence"] == "PRESENT"
     assert row["disposition"] == "UNRESOLVED"
     assert "comparison_context_incomplete" in row["reasons"]
+
+
+def test_control_presence_flows_to_outcomes_review_and_stales_on_evidence_change():
+    contributions, groups = _artifact()
+    contributions["branches"][0]["analysis_status"] = "complete"
+    contributions["branches"].append({"name": "main", "tip": "b" * 40,
+                                      "eligible": True, "unit_ids": [],
+                                      "exclusion_reasons": [], "analysis_status": "complete"})
+    contributions["contributions_digest"] = digest({
+        key: value for key, value in contributions.items() if key != "contributions_digest"
+    })
+    groups = build_groups(contributions)
+    inventory = {
+        "repository": {"id": "fixture"},
+        "branches": [{"name": "main", "tip": "b" * 40},
+                     {"name": "feature/task", "tip": "c" * 40}],
+        "worktrees": [], "stashes": [],
+    }
+    snapshot = {
+        "repository_id": "fixture", "inventory_digest": digest(inventory),
+        "main": {"name": "main", "tip": "b" * 40},
+        "branches": [{"name": "main", "tip": "b" * 40, "eligible": True},
+                     {"name": "feature/task", "tip": "c" * 40, "eligible": True}],
+    }
+    snapshot["snapshot_digest"] = digest(snapshot)
+    contributions["snapshot_digest"] = snapshot["snapshot_digest"]
+    contributions["contributions_digest"] = digest({
+        key: value for key, value in contributions.items() if key != "contributions_digest"
+    })
+    groups = build_groups(contributions)
+    plan = build_group_requests(contributions, groups)
+    _, presence = _synthetic_result(contributions, groups, plan, [{}])
+    presence["contributions"][0]["reasons"].append("overlapping_answers_contradict")
+    presence["presence_digest"] = digest({
+        key: value for key, value in presence.items() if key != "presence_digest"
+    })
+
+    initial = build_outcomes(inventory, snapshot, contributions, presence=presence)
+    branch = next(row for row in initial["objects"] if row["object_id"] == "branch:feature/task")
+    unit = branch["contribution_reviews"][0]
+    assert unit["routing_scope"] == "advisory_only"
+    assert "overlapping_answers_contradict" in unit["reasons"]
+    assert initial["integration_tasks"] == []
+    assert initial["cleanup_authorized"] is False
+    assert initial["project_utility_assessment"]["status"] == "UNKNOWN"
+
+    review = {
+        "kind": "outcome-review", "schema_version": 2, "repository_id": "fixture",
+        "provenance": initial["review_provenance"],
+        "decisions": [{
+            "object_id": branch["object_id"], "kind": "branch",
+            "source_fingerprint": branch["source_fingerprint"],
+            "evidence_fingerprint": branch["review_evidence_fingerprint"],
+            "disposition": "UNRESOLVED", "rationale": "Contradictory pilot evidence",
+            "reviewer_id": "operator", "reviewed_at": "2026-09-24T12:00:00Z",
+            "proposed_destination": None, "preservation_proof": None,
+        }],
+    }
+    current = build_outcomes(inventory, snapshot, contributions, presence=presence, review=review)
+    current_branch = next(row for row in current["objects"] if row["object_id"] == branch["object_id"])
+    assert current_branch["review_status"] == "current"
+    assert current["review_provenance"]["presence_digest"] == digest(presence)
+    malformed_review = {**review, "decisions": [{**review["decisions"][0], "kind": "stash"}]}
+    with pytest.raises(JgError, match="malformed or claims unsupported"):
+        build_outcomes(inventory, snapshot, contributions, presence=presence, review=malformed_review)
+
+    presence["contributions"][0]["reasons"].append("new_evidence_limit")
+    presence["presence_digest"] = digest({
+        key: value for key, value in presence.items() if key != "presence_digest"
+    })
+    stale = build_outcomes(inventory, snapshot, contributions, presence=presence, review=review)
+    stale_branch = next(row for row in stale["objects"] if row["object_id"] == branch["object_id"])
+    assert stale_branch["review_status"] == "stale"
+    assert "review_evidence_stale" in stale_branch["reasons"]
 
 
 def test_calibration_excludes_unreviewed_labels_and_uses_matched_cases(tmp_path, monkeypatch):
