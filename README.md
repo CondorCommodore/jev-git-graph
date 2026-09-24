@@ -43,6 +43,12 @@ jg contributions --repo PATH --snapshot PRIVATE_DIR/snapshot/snapshot.json --out
 jg groups --repo PATH --contributions PRIVATE_DIR/contributions.json --out PRIVATE_DIR/groups
 ```
 
+`jg study` writes `evidence-ranges.json` alongside its review cards. It includes
+complete Python definition ranges within the per-request excerpt bounds and
+records cases omitted from excerpt selection. The ranges contain no code and
+do not authorize dispatch; `jg group-relate --evidence-ranges` still scans the
+pinned content and requires the exact request approval before any Jev call.
+
 Use an owner-only parent directory and a new snapshot output path. Branches with
 activity in the last 24 hours, or unverifiable activity, are excluded. Later main
 movement does not invalidate this advisory snapshot. Groups report omitted

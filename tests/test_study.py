@@ -3,7 +3,7 @@ import pytest
 from jev_git_graph.groups import build_groups
 from jev_git_graph.errors import JgError
 from jev_git_graph.safety import digest
-from jev_git_graph.study import (build_selected_study, build_study,
+from jev_git_graph.study import (build_selected_study, build_study, build_study_range_manifest,
                                  validate_selected_range_manifest)
 
 
@@ -78,6 +78,25 @@ def test_study_includes_changed_same_path_implementations():
     changed = [case for case in study["cases"] if case["selection_stratum"] == "changed_implementation_candidate"]
     assert changed
     assert all(case["context_stratum"] == "dependency_context_supported" for case in changed)
+
+
+def test_default_study_ranges_cover_changed_definition_without_truncation():
+    contributions, groups = _artifact(complete_count=24, total=32)
+    study = build_study(contributions, groups, count=32,
+                        selection_policy="dependency-complete-majority-v1")
+    first = study["cases"][0]
+    first["source"]["range"] = {"start_line": 10, "end_line": 99}
+    first["destination_candidates"][0]["range"] = {"start_line": 20, "end_line": 109}
+    for case in study["cases"][1:]:
+        case["source"]["range"] = {"start_line": 1, "end_line": 2}
+        case["destination_candidates"][0]["range"] = {"start_line": 1, "end_line": 2}
+    manifest = build_study_range_manifest(study, contributions["main"]["tip"])
+    selected = manifest["ranges"][0]
+    assert len(selected["ranges"]) == 2
+    assert selected["ranges"][0]["source_range"] == {"start_line": 10, "end_line": 89}
+    assert selected["ranges"][1]["source_range"] == {"start_line": 90, "end_line": 99}
+    assert selected["ranges"][1]["destination_range"] == {"start_line": 100, "end_line": 109}
+    assert manifest["omissions"] == []
 
 
 def _explicit_selection_fixture():
