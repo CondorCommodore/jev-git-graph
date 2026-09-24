@@ -114,6 +114,21 @@ class TestGroups(unittest.TestCase):
         self.assertTrue(boundary_id_sets[1] & boundary_id_sets[2])
         self.assertTrue(all(not group["context_complete"] for group in groups))
 
+    def test_unparsed_python_marks_only_its_group_context_incomplete(self):
+        branches = [branch("feature/parsed"), branch("feature/unparsed")]
+        units = [
+            unit("cu-parsed", "feature/parsed", path="src/parsed.py"),
+            unit("cu-unparsed", "feature/unparsed", path="src/unparsed.py",
+                 limitations=["python_parse_unsupported"]),
+        ]
+
+        result = build_groups(contribution_artifact(branches, units))
+
+        groups_by_unit = {group["unit_ids"][0]: group for group in result["groups"]}
+        self.assertTrue(groups_by_unit["cu-parsed"]["context_complete"])
+        self.assertFalse(groups_by_unit["cu-unparsed"]["context_complete"])
+        self.assertIn("python_parse_unsupported", groups_by_unit["cu-unparsed"]["limitations"])
+
     def test_common_path_candidate_discovery_uses_linear_edges_and_accounts_for_every_unit(self):
         branches = [branch(f"independent/{index:03}") for index in range(300)]
         units = [unit(f"cu-{index:03}", f"independent/{index:03}", path="shared/common.py") for index in range(300)]

@@ -309,6 +309,13 @@ def resolve_production_creator_capability(repository: str | Path) -> CreatorLeas
     Every execute attempt calls this resolver again, so symlink/release drift fails
     closed before another branch lease is acquired.
     """
+    # Disk hashes and launchd plist paths cannot prove which hook code an already
+    # running creator loaded. Keep production cleanup in plan-only mode until a
+    # Jev release verifies the per-process startup attestation contract.
+    raise JgError(
+        "runtime_adoption_unverified: production cleanup remains plan-only until "
+        "per-process creator startup attestations are verified"
+    )
     common_dir = _common_dir(repository)
     lock_root = _fixed_lock_root()
     runtime_roots = _runtime_selector_targets()
