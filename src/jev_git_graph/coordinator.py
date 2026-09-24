@@ -607,13 +607,17 @@ def resolve_production_creator_capability(repository: str | Path) -> CreatorLeas
     canonical = (Path.home() / "code/home-lab").resolve(strict=True)
     if canonical != runtime_roots[-1]:
         raise JgError("canonical_creator_unverified: Home Lab source selector changed")
-    try:
-        digests = tuple(record for root in runtime_roots
-                        for record in _verify_runtime_hook_files(root))
-    except JgError as exc:
-        if runtime_roots[-1] in str(exc) or "hook digest mismatch" in str(exc):
-            raise JgError("canonical_creator_unverified: canonical Home Lab source does not match reviewed hooks") from exc
-        raise
+    digests_list: list[tuple[str, str, str]] = []
+    for root in runtime_roots:
+        try:
+            digests_list.extend(_verify_runtime_hook_files(root))
+        except JgError as exc:
+            if root == canonical:
+                raise JgError(
+                    f"canonical_creator_unverified: canonical Home Lab source does not match reviewed hooks: {exc}"
+                ) from exc
+            raise
+    digests = tuple(digests_list)
     home = Path.home()
     jobs = _verify_loaded_runtime_jobs(home, runtime_roots)
     train_runtime, train_commit, train_digests = _verify_train_construction_runtime(home, common_dir)
