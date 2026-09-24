@@ -391,6 +391,7 @@ def parser() -> argparse.ArgumentParser:
     outcomes.add_argument("--coverage")
     outcomes.add_argument("--review")
     outcomes.add_argument("--review-approval", help="signed local receipt for the exact v2 review document")
+    outcomes.add_argument("--delivery-observations", help="pinned metadata-only PR delivery observations")
     outcomes.add_argument("--out", required=True)
 
     outcome_review_approve = commands.add_parser(
@@ -635,7 +636,8 @@ def run(args: argparse.Namespace) -> str:
             raise JgError("inventory belongs to a different local repository")
         target = validate_output_path(args.out, [*protected_worktree_paths(args.repo), common])
         return str(write_outcomes(args.inventory, args.snapshot, args.contributions, target,
-                                  args.presence, args.coverage, args.review, args.review_approval))
+                                  args.presence, args.coverage, args.review, args.review_approval,
+                                  args.delivery_observations))
     if args.command == "outcome-review-approve":
         review = read_json(args.review)
         review_sha256 = digest(review)

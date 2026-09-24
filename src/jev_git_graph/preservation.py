@@ -451,12 +451,29 @@ def render_preservation_plan(plan: dict[str, Any]) -> str:
         decision_state = f"{outcome.get('status', 'not supplied')} / {decision.get('disposition', 'none')}"
         units = []
         for unit in outcome.get("contribution_reviews", []):
+            delivery = unit.get("delivery_observation")
+            delivery_html = ""
+            if isinstance(delivery, dict):
+                pr = delivery.get("pull_request", {})
+                delivery_html = (
+                    "<br><strong>Delivery observation (reported only):</strong> "
+                    + escape(str(pr.get("status", "unknown")))
+                    + " · " + escape(str(delivery.get("observed_at", "unknown")))
+                    + " · <a rel='noreferrer' href='" + escape(str(pr.get("url", "")), quote=True) + "'>"
+                    + escape(str(pr.get("repository", "unknown"))) + "#"
+                    + escape(str(pr.get("number", "unknown"))) + "</a>"
+                    + " · PR head " + escape(str(pr.get("head_sha", "unknown")))
+                    + " · PR base " + escape(str(pr.get("base_sha", "unknown")))
+                    + " · analysis destination remains pinned separately"
+                    + " · not provider-verified or preservation proof"
+                )
             units.append(
                 "<li>" + escape(str(unit.get("name") or unit.get("contribution_id")))
                 + " · " + escape(str(unit.get("path") or "path unavailable"))
                 + " · " + escape(str(unit.get("disposition", "UNRESOLVED")))
                 + " · " + escape(str(unit.get("routing_scope", "advisory_only")))
-                + " · " + escape(", ".join(unit.get("reasons", []))) + "</li>"
+                + " · " + escape(", ".join(unit.get("reasons", [])))
+                + delivery_html + "</li>"
             )
         tasks = []
         for task in record.get("integration_actions", []):
