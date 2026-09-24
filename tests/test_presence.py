@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import base64
+import copy
 import hashlib
 import subprocess
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -98,6 +101,34 @@ def _add_context_contract(plan, *, comparison_complete=True, dependency_status="
             ).items():
                 rebuilt[f"{cid}:{question_id}"] = question
         request["questions"] = rebuilt
+
+
+def _expand_approved_preview(preview, count):
+    """Create a multi-request approved fixture without changing request semantics."""
+    requests = []
+    for index in range(count):
+        request = copy.deepcopy(preview["requests"][0])
+        request["state"]["group_id"] = f"fixture-group-{index}"
+        requests.append(request)
+    preview = copy.deepcopy(preview)
+    preview["requests"] = requests
+    preview["request_count"] = count
+    budgets = dict(preview["request_budgets"])
+    budgets.update({"max_requests": max(count, budgets["max_requests"]),
+                    "max_groups": max(count, budgets["max_groups"]),
+                    "estimated_input_tokens": max(count * 100, budgets["estimated_input_tokens"]),
+                    "max_provider_tokens": max(count * 100, budgets["max_provider_tokens"])})
+    preview["request_budgets"] = budgets
+    payload = canonical_json(requests)
+    preview["payload_sha256"] = digest(requests)
+    preview["payload_bytes"] = len(payload)
+    preview["request_bytes_base64"] = base64.b64encode(payload).decode("ascii")
+    preview["request_bytes_by_chunk"] = [len(canonical_json(request)) for request in requests]
+    preview["approval_sha256"] = digest({"payload_sha256": preview["payload_sha256"],
+                                         "plan_digest": preview["plan_digest"],
+                                         "request_count": count,
+                                         "request_budgets": budgets})
+    return preview
 
 
 def test_synthetic_answers_are_advisory_and_origin_cannot_be_overridden():
@@ -309,6 +340,121 @@ def test_unsigned_success_checkpoint_cannot_mint_receipt_without_dispatch(tmp_pa
             approved_approval_sha256=preview["approval_sha256"],
             token="fixture-only", checkpoint=checkpoint,
         )
+
+
+def test_pooled_executor_stops_after_first_failure_and_resumes_only_unattempted(tmp_path, monkeypatch):
+    contributions, groups = _artifact()
+    plan = build_group_requests(contributions, groups, estimated_input_tokens=100, max_provider_tokens=1000)
+    _add_context_contract(plan)
+    preview = _expand_approved_preview(approved_presence_preview(plan), 4)
+    monkeypatch.setattr(presence_module, "_presence_key_path", lambda: tmp_path / "private" / "key")
+    checkpoint = tmp_path / "checkpoint.json"
+    calls = []
+    lock = threading.Lock()
+
+    def fail_once(payload, token):
+        with lock:
+            first = not calls
+            calls.append(digest(payload))
+        if first:
+            raise RuntimeError("fixture-secret must never enter checkpoint")
+        response = _response(payload)
+        response["model"] = payload["model"]
+        return response
+
+    first_run = execute_presence_preview(
+        preview, preview["payload_sha256"], approved_approval_sha256=preview["approval_sha256"],
+        transport=fail_once, token="fixture-only", max_workers=2, checkpoint=checkpoint,
+    )
+    first_checkpoint = read_json(checkpoint)
+    assert len(calls) == 2
+    assert len(first_checkpoint["attempts"]) == 2
+    assert len(first_checkpoint["unattempted_request_sha256s"]) == 2
+    assert first_run["actual_budgets"]["input_tokens"] is None
+    assert first_run["actual_budgets"]["output_tokens"] is None
+    failed = [item for item in first_checkpoint["attempts"] if item["status"] == "uncertain"]
+    assert len(failed) == 1
+    assert failed[0]["failure_stage"] == "sdk_transport"
+    assert failed[0]["error_class"] == "transport_error"
+    serialized = canonical_json(first_checkpoint).decode("utf-8")
+    assert "fixture-secret" not in serialized
+    assert '"body"' not in serialized
+
+    prior_attempted = {item["request_sha256"] for item in first_checkpoint["attempts"]}
+    resume_calls = []
+
+    def succeed(payload, token):
+        resume_calls.append(digest(payload))
+        response = _response(payload)
+        response["model"] = payload["model"]
+        return response
+
+    resumed = execute_presence_preview(
+        preview, preview["payload_sha256"], approved_approval_sha256=preview["approval_sha256"],
+        transport=succeed, token="fixture-only", max_workers=2, checkpoint=checkpoint,
+    )
+    final_checkpoint = read_json(checkpoint)
+    assert len(resume_calls) == 2
+    assert set(resume_calls).isdisjoint(prior_attempted)
+    assert len(final_checkpoint["attempts"]) == 4
+    assert final_checkpoint["unattempted_request_sha256s"] == []
+    assert any(item["status"] == "uncertain" for item in final_checkpoint["attempts"])
+    assert resumed["actual_budgets"]["input_tokens"] is None
+
+
+def test_null_sdk_usage_stays_uncertain_and_budget_usage_unknown(tmp_path, monkeypatch):
+    contributions, groups = _artifact()
+    plan = build_group_requests(contributions, groups, estimated_input_tokens=100, max_provider_tokens=1000)
+    _add_context_contract(plan)
+    preview = approved_presence_preview(plan)
+    monkeypatch.setattr(presence_module, "_presence_key_path", lambda: tmp_path / "private" / "key")
+
+    def missing_usage(payload, token):
+        response = _response(payload)
+        response["model"] = payload["model"]
+        response["usage"]["input_tokens"] = None
+        return response
+
+    executed = execute_presence_preview(
+        preview, preview["payload_sha256"], approved_approval_sha256=preview["approval_sha256"],
+        transport=missing_usage, token="fixture-only", checkpoint=tmp_path / "checkpoint.json",
+    )
+    attempt = executed["attempts"][0]
+    assert attempt["status"] == "uncertain"
+    assert attempt["failure_stage"] == "response_validation"
+    assert attempt["error_class"] == "usage_unavailable"
+    assert executed["answers"] == []
+    assert executed["actual_budgets"]["input_tokens"] is None
+    assert executed["actual_budgets"]["output_tokens"] is None
+
+
+def test_sdk_http_failure_persists_only_allowlisted_status(tmp_path, monkeypatch):
+    contributions, groups = _artifact()
+    plan = build_group_requests(contributions, groups, estimated_input_tokens=100, max_provider_tokens=1000)
+    _add_context_contract(plan)
+    preview = approved_presence_preview(plan)
+    monkeypatch.setattr(presence_module, "_presence_key_path", lambda: tmp_path / "private" / "key")
+
+    class TypeSafeAPIError(Exception):
+        def __init__(self):
+            self.status = 429
+            self.body = "fixture-secret response body"
+            super().__init__("fixture-secret exception text")
+
+    def http_failure(payload, token):
+        raise TypeSafeAPIError()
+
+    executed = execute_presence_preview(
+        preview, preview["payload_sha256"], approved_approval_sha256=preview["approval_sha256"],
+        transport=http_failure, token="fixture-only", checkpoint=tmp_path / "checkpoint.json",
+    )
+    attempt = executed["attempts"][0]
+    assert attempt["error_class"] == "sdk_http_error"
+    assert attempt["failure_stage"] == "sdk_transport"
+    assert attempt["http_status"] == 429
+    serialized = canonical_json(read_json(tmp_path / "checkpoint.json")).decode("utf-8")
+    assert "fixture-secret" not in serialized
+    assert '"body"' not in serialized
 
 
 def test_overlapping_contradiction_and_incomplete_group_remain_unresolved():
