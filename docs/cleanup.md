@@ -1,9 +1,25 @@
 # Guarded local branch cleanup
 
-`jev_git_graph.cleanup` is the narrow execution boundary for the strict
-`branch-coverage` artifact. It is intentionally separate from the CLI and
-from Jev review decisions. A relationship judgment, ancestry result, patch
+`jev_git_graph.cleanup` is the narrow execution boundary wrapped by the CLI
+for the strict `branch-coverage` artifact. It remains separate from Jev review
+decisions. A relationship judgment, ancestry result, patch
 ID, or human disposition does not make a branch removable.
+
+## Current integration status
+
+The production creator gate remains closed. The package now has a concrete
+lease capability resolver and `jg cleanup execute` passes that adapter and a
+durable journal to the executor. The known Home Lab checkout has not yet
+demonstrated all required creator hooks, so production execution fails closed.
+The required integration files are `scripts/bootstrap-worktree.sh` (also the L1 path through
+`scripts/l1_drain/workspace.py`), `scripts/new-worktree.sh`,
+`scripts/overnight-codex-backlog-round.sh`, `scripts/ahc_app/coord_wake.py`,
+`scripts/process-safe-prs.sh`, `scripts/pr_gate/guard_execution.py`,
+`scripts/merge_train_parts/prescreen.py`, and
+`scripts/train_construction_driver.py`. A disposable installed-wheel fixture
+has exercised execute and interrupted-action reconciliation, including
+post-delete capability drift; that fixture does not establish production
+creator participation or authorize Home Lab deletion.
 
 ## Plan
 
@@ -32,15 +48,33 @@ covering the complete approved or unapproved plan.
 
 ## Execution gates
 
-`execute_cleanup(repo, plan, approved_digest=..., lease_contract=...)` checks
-the exact plan digest and the bundle hash and approval first. If the lease
-contract is missing or not established, it returns a deletion-ready
+`execute_cleanup` accepts a `CooperativeBranchLeaseAdapter` and an explicit
+`journal_path`. The adapter uses a cross-process lock keyed by repository and
+branch. Each creator registers its exact adapter id at startup and holds
+`creator_operation(creator_id, branch, expected_tip)` around the whole operation,
+starting before any branch/ref creation, worktree creation, or checkout and
+ending after publication. Cleanup holds `cleanup_operation` across reproof,
+intent journaling, compare-and-delete, result journaling, and release. A callback
+or registration made after the operation does not count as creator participation.
+
+The `CleanupActionJournal` is owner-only append-only JSONL. It fsyncs an intent
+before each ref mutation and a result afterward. Keep its path outside every
+inspected worktree, alongside the recovery bundle. After interruption, call
+`reconcile_interrupted_cleanup(repo, approved_plan, journal, lease)` before a
+new execution. Reconciliation checks the exact branch under the cooperative
+lock, restores an absent branch from the verified bundle only with
+compare-and-create, and records moved or recreated refs without replacing them.
+It never retries deletion.
+
+`execute_cleanup(repo, plan, approved_digest=..., lease_contract=...,
+journal_path=...)` checks the exact plan digest and bundle hash and approval
+first. If the lease contract is missing or not established, it returns a
 plan-only result and makes no ref change. A lease must be the concrete
-`CooperativeLease` adapter with the
-`jev-git-graph/cooperative-branch-lease-v1` contract marker, an established
-state, and cooperative `acquire(name, tip)` and `release(name, tip)` hooks
-bound to the coordinator that creates the lease. A loose mapping or boolean
-cannot authorize deletion. Acquisition must succeed for each branch.
+`CooperativeBranchLeaseAdapter` with the
+`jev-git-graph/cooperative-branch-lease-v1` contract marker, complete creator
+registration, and cooperative `acquire(name, tip)` and `release(name, tip)`
+hooks. A loose mapping or boolean cannot authorize deletion. Acquisition must
+succeed for each branch.
 
 Immediately before each removal, the executor rereads refs, worktrees,
 statuses, stash links, and current commit/reflog activity against the recent
@@ -51,14 +85,15 @@ Removal uses one Git `update-ref --stdin` transaction containing a destination
 destination and source still equal their approved SHAs. The destination tip is
 also checked in the live reproof. After deletion the source ref is checked;
 if it reappears, the executor records uncertainty and never overwrites it.
-Any future recovery path must use compare-and-create against an absent ref.
+The implemented recovery path restores a missing approved ref only with
+compare-and-create against an absent ref.
 The executor never performs remote operations.
 
-The CLI exposes `jg cleanup plan`, `jg cleanup approve`, and `jg cleanup execute`.
-It does not provide a worktree-creator lease adapter, so its execute command
-stops without changing refs. The library also hard-gates deletion until known
-worktree creators participate in the lease contract; a caller-supplied callback
-alone cannot enable it. Operators must review the plan, preserve any
-required work, and approve its exact digest. A future integrated coordinator
-must supply the cooperative lease contract before local branch deletion can
-run.
+The CLI exposes `jg cleanup plan`, `jg cleanup approve`, `jg cleanup execute`,
+and interrupted-action reconciliation. Execute resolves the production
+adapter from independently verified creator participation records, or accepts
+an explicit disposable-fixture inventory for a disposable repository. Missing
+or stale production participant proof leaves the plan-only gate in place. The
+library hard-gates deletion until known worktree creators participate in the
+lease contract; a caller-supplied callback alone cannot enable it. Operators
+must review the plan, preserve any required work, and approve its exact digest.

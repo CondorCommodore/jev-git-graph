@@ -114,16 +114,34 @@ class TestGroups(unittest.TestCase):
         self.assertTrue(boundary_id_sets[1] & boundary_id_sets[2])
         self.assertTrue(all(not group["context_complete"] for group in groups))
 
-    def test_common_path_candidate_discovery_has_a_hard_budget_and_omission_count(self):
+    def test_unparsed_python_marks_only_its_group_context_incomplete(self):
+        branches = [branch("feature/parsed"), branch("feature/unparsed")]
+        units = [
+            unit("cu-parsed", "feature/parsed", path="src/parsed.py"),
+            unit("cu-unparsed", "feature/unparsed", path="src/unparsed.py",
+                 limitations=["python_parse_unsupported"]),
+        ]
+
+        result = build_groups(contribution_artifact(branches, units))
+
+        groups_by_unit = {group["unit_ids"][0]: group for group in result["groups"]}
+        self.assertTrue(groups_by_unit["cu-parsed"]["context_complete"])
+        self.assertFalse(groups_by_unit["cu-unparsed"]["context_complete"])
+        self.assertIn("python_parse_unsupported", groups_by_unit["cu-unparsed"]["limitations"])
+
+    def test_common_path_candidate_discovery_uses_linear_edges_and_accounts_for_every_unit(self):
         branches = [branch(f"independent/{index:03}") for index in range(300)]
         units = [unit(f"cu-{index:03}", f"independent/{index:03}", path="shared/common.py") for index in range(300)]
         result = build_groups(contribution_artifact(branches, units), max_units=24)
-        self.assertLessEqual(result["coverage"]["candidate_edges_discovered"], 256)
-        self.assertEqual(result["coverage"]["omitted_candidates_by_type"]["path"], 300 * 299 // 2 - 256)
-        self.assertTrue(result["coverage"]["truncated"])
+        self.assertEqual(result["coverage"]["candidate_edges_discovered"], 299)
+        self.assertEqual(result["coverage"]["omitted_candidates_by_type"], {})
+        self.assertEqual(result["coverage"]["unexpanded_pairwise_candidates_by_type"], {"path": 44551})
+        self.assertFalse(result["coverage"]["pairwise_relationships_exhaustive"])
+        self.assertFalse(result["coverage"]["truncated"])
         self.assertEqual(sum(len(group["unit_ids"]) for group in result["groups"]), 300)
+        self.assertEqual(len(result["groups"]), 13)
 
-    def test_destination_edges_count_against_actual_output_edge_budget(self):
+    def test_destination_edges_use_per_group_output_budget(self):
         branches = [branch("feature/a"), branch("feature/b")]
         units = [unit("cu-a", "feature/a"), unit("cu-b", "feature/b")]
         destinations = [{"id": "du-a"}, {"id": "du-b"}]
@@ -134,11 +152,33 @@ class TestGroups(unittest.TestCase):
         result = build_groups(contribution_artifact(branches, units, destinations, edges), max_edges=1)
         emitted = sum(len(group["edges"]) + len(group["boundary_edges"]) for group in result["groups"])
         self.assertEqual(emitted, result["coverage"]["output_edges_emitted"])
-        self.assertLessEqual(emitted, 1)
-        self.assertTrue(result["coverage"]["truncated"])
-        self.assertTrue(all(not group["context_complete"] for group in result["groups"]))
+        self.assertLessEqual(max(len(group["edges"]) + len(group["boundary_edges"]) for group in result["groups"]), 1)
+        self.assertFalse(result["coverage"]["truncated"])
+        self.assertTrue(all("edge_output_budget_exhausted" not in group["limitations"] for group in result["groups"]))
         for group in result["groups"]:
             self.assertEqual(group["id"], "grp-" + digest({"unit_ids": group["unit_ids"], "destination_ids": group["destination_ids"]})[:24])
+
+    def test_candidate_connectivity_is_not_cut_by_the_output_edge_budget(self):
+        branches = [branch(f"feature/{index:03}") for index in range(80)]
+        units = [unit(f"cu-{index:03}", f"feature/{index:03}", path="shared/task.py") for index in range(80)]
+        result = build_groups(contribution_artifact(branches, units), max_units=20, max_edges=1)
+        self.assertEqual([len(group["unit_ids"]) for group in result["groups"]], [20, 20, 20, 20])
+        self.assertEqual(result["coverage"]["grouped_source_units"], 80)
+        self.assertTrue(result["coverage"]["truncated"])
+        self.assertTrue(all(group.get("omitted_edges_by_type") for group in result["groups"]))
+
+    def test_output_budget_keeps_stronger_destination_evidence_first(self):
+        branches = [branch("feature/a")]
+        units = [unit("cu-a", "feature/a"), unit("cu-b", "feature/a")]
+        destinations = [{"id": "du-a"}]
+        edges = [{
+            "source_id": "cu-a", "destination_id": "du-a",
+            "type": "structural_match", "provenance": "ast_fingerprint",
+        }]
+        result = build_groups(contribution_artifact(branches, units, destinations, edges), max_edges=1)
+        self.assertEqual(result["schema_version"], 3)
+        self.assertEqual([edge["kind"] for edge in result["groups"][0]["edges"]], ["structural_match"])
+        self.assertEqual(result["groups"][0]["omitted_edges_by_type"], {"same_branch": 1})
 
     def test_edge_to_excluded_source_is_retained_as_one_sided_boundary(self):
         branches = [branch("feature/eligible"), branch("feature/excluded", False, ["active_within_cutoff"])]
@@ -159,14 +199,31 @@ class TestGroups(unittest.TestCase):
         self.assertFalse(group["context_complete"])
         self.assertEqual(result["coverage"]["excluded_neighbor_edge_count"], 1)
 
-    def test_input_limitations_make_context_incomplete(self):
+    def test_input_limitations_are_visible_without_claiming_group_context_is_missing(self):
         artifact = contribution_artifact(
-            [branch("feature/a")], [unit("cu-a", "feature/a")],
+            [branch("feature/a")], [unit("cu-a", "feature/a", path="a.py")],
             limitations=["source_diff_unavailable:feature/a"],
         )
         result = build_groups(artifact)
-        self.assertIn("source_diff_unavailable:feature/a", result["groups"][0]["limitations"])
-        self.assertFalse(result["groups"][0]["context_complete"])
+        self.assertIn("source_diff_unavailable:feature/a", result["groups"][0]["analysis_observations"])
+        self.assertTrue(result["groups"][0]["context_complete"])
+        self.assertIn("source_diff_unavailable:feature/a", result["groups"][0]["analysis_observations"])
+
+    def test_static_ast_limitations_are_visible_without_marking_context_missing(self):
+        artifact = contribution_artifact(
+            [branch("feature/a")],
+            [unit("cu-a", "feature/a", path="a.py", limitations=[
+                "binding_resolution_unverified", "ambiguous_destination_match"
+            ])],
+            limitations=["binding_resolution_unverified", "ambiguous_destination_match"],
+        )
+        result = build_groups(artifact)
+        group = result["groups"][0]
+        self.assertTrue(group["context_complete"])
+        self.assertEqual(group["analysis_observations"], [
+            "ambiguous_destination_match", "binding_resolution_unverified"
+        ])
+        self.assertEqual(group["limitations"], [])
 
     def test_write_groups_preserves_existing_artifact(self):
         artifact = contribution_artifact([branch("feature/a")], [unit("cu-a", "feature/a", path="a.py")])

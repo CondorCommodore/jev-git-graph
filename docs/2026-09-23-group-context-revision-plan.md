@@ -1,9 +1,13 @@
 # Revision 2: pinned contribution groups and measured review utility
 
-Status: planned; grouped judgments and the revised calibration are not implemented.
-This is the next implementation plan after the snapshot work in PR #9. It
-supersedes the uncompleted wider-run direction in the September 21 quality plan.
-Historical v2/v3 artifacts and their question meanings remain unchanged.
+Status: implementation in progress; see the
+[delivery ledger](outcome-delivery-ledger.md) for current verification. The
+bounded contribution extractor, groups, evidence, typed presence requests,
+offline imports, reconciliation, and outcomes review are implemented. Owner
+labels, measured utility, accepted real provider execution, verified integration,
+and creator-gated cleanup remain pending. This plan records the design and
+acceptance criteria; historical v2/v3 artifacts and question meanings remain
+unchanged.
 
 ## Outcome and scope
 

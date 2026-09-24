@@ -27,6 +27,11 @@ from typing import Any
 
 from . import git
 from .coverage import _tree
+from .coordinator import (COOPERATIVE_LEASE_CONTRACT, CleanupActionJournal,
+                          CooperativeBranchLeaseAdapter, CreatorLeaseCapability,
+                          DisposableFixtureLeaseCapability, _fixed_lock_root,
+                          _common_dir, production_capability_is_current,
+                          cleanup_action_id)
 from .errors import JgError
 from .equivalence import _activity
 from .inventory import protected_worktree_paths
@@ -35,9 +40,7 @@ from .safety import digest, opaque_path_id, read_json, validate_output_path, wri
 
 SCHEMA_VERSION = 1
 MAX_BRANCHES = 25
-COOPERATIVE_LEASE_CONTRACT = "jev-git-graph/cooperative-branch-lease-v1"
-# No automated worktree creator currently participates in this contract.
-# Keep ref deletion unavailable until that integration is implemented and tested.
+# Retained only for compatibility with old offline tests; never grants authority.
 CREATOR_LEASE_INTEGRATED = False
 _SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 
@@ -372,19 +375,28 @@ def write_cleanup_plan(repo: str | Path, coverage_path: str | Path, out: str | P
     return path
 
 
-def _lease_established(contract: Any) -> bool:
-    if not CREATOR_LEASE_INTEGRATED:
+def _lease_established(contract: Any, repository: Path | None = None) -> bool:
+    if not isinstance(contract, CooperativeBranchLeaseAdapter):
         return False
-    if contract is None or isinstance(contract, Mapping):
+    if repository is None or contract.common_dir is None or contract.capability is None:
         return False
-    if getattr(contract, "contract", None) != COOPERATIVE_LEASE_CONTRACT:
+    try:
+        canonical_common = _common_dir(repository)
+        if canonical_common != contract.common_dir:
+            return False
+        if contract.lease_dir != _fixed_lock_root():
+            return False
+        if isinstance(contract.capability, CreatorLeaseCapability):
+            if not production_capability_is_current(contract.capability, repository):
+                return False
+        elif isinstance(contract.capability, DisposableFixtureLeaseCapability):
+            if not contract.capability.is_current(repository):
+                return False
+        else:
+            return False
+    except (JgError, OSError, subprocess.SubprocessError):
         return False
-    if not callable(getattr(contract, "acquire", None)) or not callable(getattr(contract, "release", None)):
-        return False
-    value = getattr(contract, "established", None)
-    if callable(value):
-        value = value()
-    return bool(value)
+    return True
 
 
 def _lease_call(contract: Any, method: str, name: str, tip: str) -> bool:
@@ -476,6 +488,14 @@ def _ref_presence(root: Path, name: str) -> bool | None:
     return None
 
 
+def _read_ref_tip(root: Path, name: str) -> str | None:
+    result = _git(root, "rev-parse", "--verify", f"refs/heads/{name}", check=False)
+    if result.returncode:
+        return None
+    value = _out(result).strip()
+    return value or None
+
+
 def _safe_release(contract: Any, name: str, tip: str) -> bool:
     try:
         return _lease_call(contract, "release", name, tip)
@@ -485,7 +505,8 @@ def _safe_release(contract: Any, name: str, tip: str) -> bool:
 
 def execute_cleanup(repo: str | Path, plan: Mapping[str, Any] | str | Path,
                     *, approved_digest: str | None = None,
-                    lease_contract: Any = None) -> dict[str, Any]:
+                    lease_contract: Any = None,
+                    journal_path: str | Path | None = None) -> dict[str, Any]:
     """Execute a plan only after digest, bundle, lease, and live reproof gates.
 
     With no established cooperative lease this returns a deletion-ready plan
@@ -505,76 +526,159 @@ def execute_cleanup(repo: str | Path, plan: Mapping[str, Any] | str | Path,
     if not bundle_path.is_file() or hashlib.sha256(bundle_path.read_bytes()).hexdigest() != bundle.get("sha256"):
         raise JgError("cleanup bundle is missing or changed")
     root, _common, runner = git.open_repository(repo)
+    scope = (lease_contract.capability.scope
+             if isinstance(lease_contract, CooperativeBranchLeaseAdapter)
+             and lease_contract.capability is not None else "production")
     if loaded.get("repository_id") != opaque_path_id(root):
         raise JgError("cleanup plan belongs to a different local repository")
     if (loaded.get("manifest_approved") is not True
             or bundle.get("manifest_approved") is not True):
         raise JgError("cleanup plan manifest is not approved")
-    if not _lease_established(lease_contract):
+    if not _lease_established(lease_contract, root):
         return {"kind": "cleanup-execution", "plan_digest": expected,
+                "scope": scope,
                 "deletion_ready": False, "mode": "deletion-ready-plan-only",
                 "deleted": [], "stopped": "cooperative_lease_unestablished",
                 "network_performed": False, "destructive_action_authorized": False}
+    if journal_path is None:
+        return {"kind": "cleanup-execution", "plan_digest": expected,
+                "scope": scope,
+                "deletion_ready": False, "mode": "deletion-ready-plan-only",
+                "deleted": [], "stopped": "cleanup_journal_required",
+                "network_performed": False, "destructive_action_authorized": False}
+    journal_destination = validate_output_path(
+        journal_path, [*protected_worktree_paths(root), _common_dir(root)],
+    )
+    journal = CleanupActionJournal(journal_destination)
+    if journal.pending_intents():
+        return {"kind": "cleanup-execution", "plan_digest": expected,
+                "scope": scope,
+                "deletion_ready": False, "mode": "deletion-ready-plan-only",
+                "deleted": [], "stopped": "interrupted_cleanup_reconciliation_required",
+                "network_performed": False, "destructive_action_authorized": False}
     deleted: list[dict[str, str]] = []
-    for candidate in loaded.get("candidates", []):
+    if isinstance(lease_contract.capability, DisposableFixtureLeaseCapability):
+        planned = tuple(sorted(str(item.get("name")) for item in loaded.get("candidates", [])))
+        if planned != lease_contract.capability.branches:
+            return {"kind": "cleanup-execution", "plan_digest": expected,
+                    "scope": scope, "deletion_ready": False, "deleted": [],
+                    "stopped": "fixture_branch_inventory_mismatch",
+                    "network_performed": False, "destructive_action_authorized": False}
+    for index, candidate in enumerate(loaded.get("candidates", [])):
         name, tip = str(candidate["name"]), str(candidate["tip"])
+        if not _lease_established(lease_contract, root):
+            return {"kind": "cleanup-execution", "plan_digest": expected,
+                    "scope": scope, "deletion_ready": False, "deleted": deleted,
+                    "stopped": "creator_capability_changed", "branch": name,
+                    "network_performed": False, "destructive_action_authorized": False}
         if not _lease_call(lease_contract, "acquire", name, tip):
             return {"kind": "cleanup-execution", "plan_digest": expected,
+                    "scope": scope,
                     "deletion_ready": False, "deleted": deleted,
                     "stopped": "lease_not_acquired", "branch": name,
                     "network_performed": False, "destructive_action_authorized": False}
         acquired = True
         delete_committed = False
         outcome: dict[str, Any] | None = None
+        action_id = cleanup_action_id(expected, index, name, tip)
+        intent_written = False
+        operation_exception = False
         try:
-            reason = _live_reproof(root, candidate, loaded["main"], runner,
-                                   float(loaded.get("recent_hours", 0)))
+            reason = (None if _lease_established(lease_contract, root) else "creator_capability_changed")
+            if reason is None:
+                reason = _live_reproof(root, candidate, loaded["main"], runner,
+                                       float(loaded.get("recent_hours", 0)))
             if reason:
                 outcome = {"kind": "cleanup-execution", "plan_digest": expected,
                            "deletion_ready": False, "deleted": deleted,
                            "stopped": reason, "branch": name,
                            "network_performed": False, "destructive_action_authorized": False}
-            elif not _atomic_delete(root, name, tip,
-                                    str(loaded["main"]["name"]),
-                                    str(loaded["main"]["tip"])):
-                outcome = {"kind": "cleanup-execution", "plan_digest": expected,
-                           "deletion_ready": False, "deleted": deleted,
-                           "stopped": "source_delete_race", "branch": name,
-                           "network_performed": False, "destructive_action_authorized": False}
             else:
-                delete_committed = True
-                # A normal readback proves absence.  If the normal inventory
-                # read fails, probe the exact ref with a bounded command and
-                # restore only after proving it is absent.
-                try:
-                    live_after = {item["name"]: item["tip"] for item in git.local_branches(runner)}
-                except JgError:
-                    presence = _ref_presence(root, name)
-                    if presence is not True:
-                        restored = _atomic_restore(root, name, tip)
-                        outcome = {"kind": "cleanup-execution", "plan_digest": expected,
-                                   "deletion_ready": False, "deleted": deleted,
-                                   "stopped": "delete_readback_uncertain",
-                                   "restoration_attempted": True, "restored": restored,
-                                   "branch": name, "network_performed": False,
-                                   "destructive_action_authorized": False}
-                    else:
-                        outcome = {"kind": "cleanup-execution", "plan_digest": expected,
-                                   "deletion_ready": False, "deleted": deleted,
-                                   "stopped": "delete_readback_uncertain",
-                                   "restoration_attempted": False, "branch": name,
-                                   "network_performed": False, "destructive_action_authorized": False}
+                destination = str(loaded["main"]["name"])
+                destination_tip = str(loaded["main"]["tip"])
+                journal.append({
+                    "event": "intent", "action_id": action_id,
+                    "scope": scope,
+                    "plan_digest": expected, "approved_digest": approved_digest,
+                    "candidate_index": index, "branch": name, "tip": tip,
+                    "destination": destination, "destination_tip": destination_tip,
+                    "bundle_sha256": bundle.get("sha256"),
+                })
+                intent_written = True
+                if not _lease_established(lease_contract, root):
+                    outcome = {"kind": "cleanup-execution", "plan_digest": expected,
+                               "deletion_ready": False, "deleted": deleted,
+                               "stopped": "creator_capability_changed", "branch": name,
+                               "network_performed": False, "destructive_action_authorized": False}
+                elif not _atomic_delete(root, name, tip, destination, destination_tip):
+                    outcome = {"kind": "cleanup-execution", "plan_digest": expected,
+                               "deletion_ready": False, "deleted": deleted,
+                               "stopped": "source_delete_race", "branch": name,
+                               "network_performed": False, "destructive_action_authorized": False}
                 else:
-                    if name in live_after:
-                        outcome = {"kind": "cleanup-execution", "plan_digest": expected,
-                                   "deletion_ready": False, "deleted": deleted,
-                                   "stopped": "delete_verification_uncertain",
-                                   "restoration_attempted": False, "branch": name,
-                                   "network_performed": False, "destructive_action_authorized": False}
+                    delete_committed = True
+                    # A normal readback proves absence.  If the normal inventory
+                    # read fails, probe the exact ref with a bounded command and
+                    # restore only after proving it is absent.
+                    try:
+                        live_after = {item["name"]: item["tip"] for item in git.local_branches(runner)}
+                    except JgError:
+                        presence = _ref_presence(root, name)
+                        if presence is not True:
+                            restored = _atomic_restore(root, name, tip)
+                            outcome = {"kind": "cleanup-execution", "plan_digest": expected,
+                                       "deletion_ready": False, "deleted": deleted,
+                                       "stopped": "delete_readback_uncertain",
+                                       "restoration_attempted": True, "restored": restored,
+                                       "branch": name, "network_performed": False,
+                                       "destructive_action_authorized": False}
+                        else:
+                            outcome = {"kind": "cleanup-execution", "plan_digest": expected,
+                                       "deletion_ready": False, "deleted": deleted,
+                                       "stopped": "delete_readback_uncertain",
+                                       "restoration_attempted": False, "branch": name,
+                                       "network_performed": False, "destructive_action_authorized": False}
                     else:
-                        deleted.append({"name": name, "tip": tip})
+                        if name in live_after:
+                            outcome = {"kind": "cleanup-execution", "plan_digest": expected,
+                                       "deletion_ready": False, "deleted": deleted,
+                                       "stopped": "delete_verification_uncertain",
+                                       "restoration_attempted": False, "branch": name,
+                                       "network_performed": False, "destructive_action_authorized": False}
+                        elif not _lease_established(lease_contract, root):
+                            restored = _atomic_restore(root, name, tip)
+                            outcome = {"kind": "cleanup-execution", "plan_digest": expected,
+                                       "deletion_ready": False, "deleted": deleted,
+                                       "stopped": "creator_capability_changed_after_delete",
+                                       "restoration_attempted": True, "restored": restored,
+                                       "branch": name, "network_performed": False,
+                                       "destructive_action_authorized": False}
+                        else:
+                            deleted.append({"name": name, "tip": tip})
+        except BaseException:
+            operation_exception = True
+            raise
         finally:
-            if acquired and not _safe_release(lease_contract, name, tip):
+            try:
+                if not operation_exception:
+                    event_status = (
+                        str(outcome.get("stopped")) if outcome is not None else
+                        ("deleted" if any(item["name"] == name for item in deleted) else
+                         ("intent_recorded_no_delete" if intent_written else "precondition_blocked"))
+                    )
+                    journal.append({
+                        "event": "result", "action_id": action_id,
+                        "scope": scope,
+                        "plan_digest": expected, "branch": name, "tip": tip,
+                        "destination": str(loaded["main"]["name"]),
+                        "destination_tip": str(loaded["main"]["tip"]),
+                        "observed_source_tip": _read_ref_tip(root, name),
+                        "observed_destination_tip": _read_ref_tip(root, str(loaded["main"]["name"])),
+                        "status": event_status,
+                    })
+            finally:
+                released = not acquired or _safe_release(lease_contract, name, tip)
+            if acquired and not released:
                 presence = _ref_presence(root, name) if delete_committed else True
                 restoration_attempted = delete_committed and presence is not True
                 restored = _atomic_restore(root, name, tip) if restoration_attempted else False
@@ -593,9 +697,22 @@ def execute_cleanup(repo: str | Path, plan: Mapping[str, Any] | str | Path,
                                "lease_release_failed": True,
                                "restoration_attempted": restoration_attempted,
                                "restored": restored}
+                journal.append({
+                    "event": "result", "action_id": action_id,
+                    "scope": scope,
+                    "plan_digest": expected, "branch": name, "tip": tip,
+                    "destination": str(loaded["main"]["name"]),
+                    "destination_tip": str(loaded["main"]["tip"]),
+                    "observed_source_tip": _read_ref_tip(root, name),
+                    "observed_destination_tip": _read_ref_tip(root, str(loaded["main"]["name"])),
+                    "status": "lease_release_failed",
+                    "restoration_attempted": restoration_attempted,
+                    "restored": restored,
+                })
         if outcome is not None:
             return outcome
     return {"kind": "cleanup-execution", "plan_digest": expected,
+            "scope": scope,
             "deletion_ready": True, "deleted": deleted, "stopped": None,
             "network_performed": False, "destructive_action_authorized": True}
 

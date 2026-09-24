@@ -25,11 +25,18 @@ def fixture():
     }
     candidates = {"kind": "candidates", "schema_version": 1, "repository_id": "repo-1", "candidates": [candidate]}
     candidates["content_digest"] = digest({"repository_id": "repo-1", "inventory_digest": None, "candidates": [candidate]})
-    relations = {"kind": "relations", "relations": [{"candidate_id": "pair-1", "response": {"answers": {"same_intent": {"noul": 0.9}}}}]}
+    relations = {"kind": "relations", "relations": [{"candidate_id": "pair-1", "response": {"answers": {"evidence_sufficient": {"noul": 0.9}, "same_intent": {"noul": 0.9}}}}]}
     return inventory, candidates, relations
 
 
 class PreservationPlanTests(unittest.TestCase):
+    def test_insufficient_evidence_never_routes_semantic_preservation(self):
+        inventory, candidates, relations = fixture()
+        relations["relations"][0]["response"]["answers"]["evidence_sufficient"]["noul"] = 0.2
+        plan = build_preservation_plan(inventory, candidates, relations)
+        self.assertFalse(any(s["queue"].startswith("SEMANTIC_")
+                             for row in plan["objects"] for s in row["suggestions"]))
+
     def test_every_object_is_accounted_for_once_and_risks_are_separate(self):
         inventory, candidates, relations = fixture()
         plan = build_preservation_plan(inventory, candidates, relations)

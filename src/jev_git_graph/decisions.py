@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import math
 from pathlib import Path
 from typing import Any
 
@@ -20,11 +21,15 @@ def _signal(response: dict[str, Any]) -> str | None:
         choice = relationship.get("choice")
         return choice if isinstance(choice, str) and choice not in {"UNKNOWN", "INSUFFICIENT_EVIDENCE", "UNRELATED"} else None
     evidence = answers.get("evidence_sufficient")
-    if not isinstance(evidence, dict) or evidence.get("noul", 0) < 0.75:
+    def likely(answer: Any) -> bool:
+        value = answer.get("noul") if isinstance(answer, dict) else None
+        return (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and math.isfinite(value) and 0.75 <= value <= 1)
+    if not likely(evidence):
         return None
     for field in ("a_supersedes_b", "b_supersedes_a", "same_intent", "partial_overlap", "a_depends_on_b", "b_depends_on_a"):
         answer = answers.get(field)
-        if isinstance(answer, dict) and isinstance(answer.get("noul"), (int, float)) and answer["noul"] >= 0.75:
+        if likely(answer):
             return field.upper()
     return None
 
@@ -76,7 +81,7 @@ def build_decisions(inventory: dict[str, Any], candidates: dict[str, Any], relat
         elif branch.get("merged_into_default") is True and unique == []:
             decision, reason = ("CLEANUP_CANDIDATE", "merged_without_unique_commits") if complete else ("HOLD", "incomplete_inventory")
         elif unique:
-            decision, reason = "HOLD", "unique_work_present"
+            decision, reason = "HOLD", "unique_commits_require_content_review"
         else:
             decision, reason = "HOLD", "integration_unproven"
         records.append({

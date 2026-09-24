@@ -47,8 +47,20 @@ Use an owner-only parent directory and a new snapshot output path. Branches with
 activity in the last 24 hours, or unverifiable activity, are excluded. Later main
 movement does not invalidate this advisory snapshot. Groups report omitted
 relationships and cross-group boundaries; they cannot authorize deletion.
-Grouped Jev requests, two-sided excerpt previews, and the blinded control
-experiment remain planned and are not enabled by these commands.
+
+To build an exact bounded preview for reviewed study cases, prepare a
+schema-versioned `presence-study` from the same pinned snapshot, contributions,
+and groups, plus an explicit two-sided range manifest. Run `jg group-relate`
+with `--study PATH --evidence-ranges PATH --show-preview` and inspect the JSON
+served from a tokenized loopback URL with `Cache-Control: no-store`; standard
+output contains only that URL. Keep the preview server open while reviewing,
+then stop it before recording approval of its payload and approval digests.
+The preview contains exact request content but is transient; the owner-only
+output stores only digests, selected IDs, settings, budgets, and the range
+manifest. Rebuild with the same pinned inputs and `--answers PATH
+--answer-origin synthetic|control` for offline imports. This path does not
+make provider calls unless `--execute` and matching explicit approval values
+are supplied.
 
 ### Large, active repositories
 
@@ -67,11 +79,14 @@ Run the next command only after the previous one succeeds. Inventory records loc
 
 Start with the [project specification](docs/spec.md), including the problem statement, five whys, requirements, and acceptance criteria.
 
-The next planned revision is [pinned contribution groups and measured review
-utility](docs/2026-09-23-group-context-revision-plan.md): shared context for typed
-Jev questions, a blinded LLM control, and concrete preservation actions. It
-lists the implementation slices and acceptance gates; grouped requests and
-two-sided code evidence are not implemented yet.
+The [pinned contribution groups and measured review utility plan](docs/2026-09-23-group-context-revision-plan.md)
+tracks the current implementation and acceptance gates. Contribution snapshots,
+scalable groups, two-sided evidence, typed presence requests, synthetic/control
+imports, reconciliation, and the local outcomes review path are implemented.
+Home Lab measurements and owner-labeled utility remain in progress; live Jev
+dispatch and destructive cleanup remain approval- and gate-bound. See the
+[delivery ledger](docs/outcome-delivery-ledger.md) for the exact tested and
+pending evidence.
 
 The [local artifact viewer](docs/index.html) starts empty and renders only JSON selected by the operator. It makes no API calls.
 

@@ -10,11 +10,12 @@ from unittest.mock import patch
 from pathlib import Path
 
 from jev_git_graph.contributions import build_contributions as _build_contributions, write_contributions
+from jev_git_graph.contributions import _definitions
 from jev_git_graph.errors import JgError
 from jev_git_graph.snapshot import export_pinned_repository, _git_env
 
 
-def build_contributions(snapshot, repo):
+def build_contributions(snapshot, repo, **kwargs):
     """Use the production independent object-store contract in every fixture."""
     pins = [snapshot['main']['tip']]
     for branch in snapshot['branches']:
@@ -25,7 +26,7 @@ def build_contributions(snapshot, repo):
     with tempfile.TemporaryDirectory(dir='/private/tmp') as temporary:
         store = Path(temporary) / 'objects.git'
         export_pinned_repository(repo, pins, store)
-        return _build_contributions(snapshot, store)
+        return _build_contributions(snapshot, store, **kwargs)
 
 
 def git(repo: Path, *args: str, input_text: str | None = None) -> str:
@@ -113,8 +114,83 @@ def test_ast_ambiguity_keeps_every_candidate(tmp_path: Path) -> None:
     result = build_contributions(snapshot, repo)
     unit = next(unit for unit in result["units"] if unit["kind"] == "python_definition")
     assert len(unit["destination_ids"]) == 2
+    assert unit["source_dependency_context_status"] == "complete"
+    assert unit["dependency_context_status"] == "complete"
     assert result["branches"][0]["eligible"] is True
     assert result["branches"][0]["exclusion_reasons"] == []
+
+
+def test_static_same_module_references_are_explicit_and_incomplete_references_abstain(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    (repo / "src.py").write_text(
+        "def len(value):\n    return value\n\ndef run(value):\n    return value\n",
+        encoding="utf-8")
+    base = commit(repo, "base")
+    git(repo, "checkout", "-q", "-b", "source")
+    (repo / "src.py").write_text(
+        "def len(value):\n    return value\n\ndef run(value):\n    return len(value)\n",
+        encoding="utf-8")
+    source_tip = commit(repo, "source")
+    snapshot = {"kind": "git-snapshot", "schema_version": 1, "snapshot_digest": "s",
+                "repository_id": "r", "main": {"name": "main", "tip": base},
+                "branches": [{"name": "source", "tip": source_tip, "merge_base": base,
+                              "eligible": True, "exclusion_reasons": []}]}
+    result = build_contributions(snapshot, repo)
+    caller = next(unit for unit in result["units"] if unit.get("name") == "run")
+    helper = next(unit for unit in result["destination_units"] if unit.get("name") == "len")
+    dependency = next(edge for edge in result["edges"] if edge.get("type") == "dependency")
+    assert dependency["source_id"] == caller["id"]
+    assert dependency["destination_id"] == helper["id"]
+    assert dependency["provenance"] == "static_ast_symbol_reference"
+    assert caller["source_dependency_context_status"] == "complete"
+    assert caller["dependency_context_status"] == "unknown"
+    assert "destination_dependency_context_unavailable" in caller["dependency_context_limitations"]
+    assert result["dependency_extraction"]["status"] == "partial_unknown"
+
+
+def test_attribute_calls_keep_dependency_context_unknown(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    (repo / "src.py").write_text("def run(value):\n    return value\n", encoding="utf-8")
+    base = commit(repo, "base")
+    git(repo, "checkout", "-q", "-b", "source")
+    (repo / "src.py").write_text("def run(value):\n    return value.process()\n", encoding="utf-8")
+    source_tip = commit(repo, "source")
+    snapshot = {"kind": "git-snapshot", "schema_version": 1, "snapshot_digest": "s",
+                "repository_id": "r", "main": {"name": "main", "tip": base},
+                "branches": [{"name": "source", "tip": source_tip, "merge_base": base,
+                              "eligible": True, "exclusion_reasons": []}]}
+    result = build_contributions(snapshot, repo)
+    unit = next(unit for unit in result["units"] if unit.get("name") == "run")
+    assert unit["dependency_context_status"] == "unknown"
+    assert "attribute_call_unresolved" in unit["dynamic_reference_observations"]
+
+
+def test_nested_dynamic_references_cannot_be_shadowed_by_nested_bindings(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    (repo / "src.py").write_text("def run():\n    return 1\n", encoding="utf-8")
+    base = commit(repo, "base")
+    git(repo, "checkout", "-q", "-b", "source")
+    (repo / "src.py").write_text(
+        "def run():\n"
+        "    def inner(module, name):\n"
+        "        return getattr(module, name)\n"
+        "    return inner(object(), 'work')\n",
+        encoding="utf-8")
+    source_tip = commit(repo, "source")
+    snapshot = {"kind": "git-snapshot", "schema_version": 1, "snapshot_digest": "s",
+                "repository_id": "r", "main": {"name": "main", "tip": base},
+                "branches": [{"name": "source", "tip": source_tip, "merge_base": base,
+                              "eligible": True, "exclusion_reasons": []}]}
+    result = build_contributions(snapshot, repo)
+    unit = next(unit for unit in result["units"] if unit.get("name") == "run")
+    assert unit["dependency_context_status"] == "unknown"
+    assert "nested_scope_unanalyzed" in unit["dynamic_reference_observations"]
 
 
 def test_removal_and_comment_only_change_always_have_file_units(tmp_path: Path) -> None:
@@ -167,6 +243,173 @@ def test_alias_ids_are_branch_distinct_and_excluded_or_unpinned_refs_are_not_ana
     assert by_name["unbased"]["analysis_status"] == "unavailable"
     assert "source_merge_base_missing:unbased" in result["limitations"]
     assert all(isinstance(item, str) for item in result["limitations"])
+
+
+def test_parallel_build_checkpoint_resume_and_extractor_binding(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    (repo / "src.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+    base = commit(repo, "base")
+    git(repo, "checkout", "-q", "-b", "source")
+    (repo / "src.py").write_text("def f():\n    return 2\n", encoding="utf-8")
+    source_tip = commit(repo, "source")
+    git(repo, "checkout", "-q", "main")
+    snapshot = {
+        "kind": "git-snapshot", "schema_version": 1, "snapshot_digest": "snapshot-1",
+        "repository_id": "repo-id",
+        "main": {"name": "main", "tip": base, "tree": git(repo, "rev-parse", f"{base}^{{tree}}")},
+        "branches": [
+            {"name": "source", "tip": source_tip, "merge_base": base, "eligible": True, "exclusion_reasons": []},
+            {"name": "source-alias", "tip": source_tip, "merge_base": base, "eligible": True, "exclusion_reasons": []},
+        ],
+    }
+    pins = [base, source_tip]
+    object_repo = tmp_path / "objects.git"
+    export_pinned_repository(repo, pins, object_repo)
+    checkpoint = tmp_path / "contribution-checkpoint.json"
+    checkpoint.parent.chmod(0o700)
+    progress = []
+    parallel = _build_contributions(snapshot, object_repo, workers=2, progress=lambda *item: progress.append(item), checkpoint_path=checkpoint)
+    assert len(progress) == 2
+    serial_resumed = _build_contributions(snapshot, object_repo, workers=1, checkpoint_path=checkpoint)
+    assert parallel == serial_resumed
+    assert checkpoint.stat().st_mode & 0o077 == 0
+    changed_snapshot = {**snapshot, "snapshot_digest": "snapshot-2"}
+    with unittest.TestCase().assertRaisesRegex(JgError, "different snapshot or extractor"):
+        _build_contributions(changed_snapshot, object_repo, checkpoint_path=checkpoint)
+
+
+def test_conditional_module_builtin_shadow_and_star_import_stay_unknown(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    (repo / "src.py").write_text(
+        "def subject(values):\n    return len(values)\n", encoding="utf-8")
+    base = commit(repo, "base")
+    git(repo, "checkout", "-q", "-b", "source")
+    (repo / "src.py").write_text(
+        "if configure_custom_builtins():\n    len = custom_length\n"
+        "def subject(values):\n    return len(values) + 1\n", encoding="utf-8")
+    source_tip = commit(repo, "conditional module binding")
+    snapshot = {"kind": "git-snapshot", "schema_version": 1, "snapshot_digest": "s",
+                "repository_id": "r", "main": {"name": "main", "tip": base},
+                "branches": [{"name": "source", "tip": source_tip, "merge_base": base,
+                              "eligible": True, "exclusion_reasons": []}]}
+    result = build_contributions(snapshot, repo)
+    unit = next(unit for unit in result["units"] if unit.get("name") == "subject")
+    assert "len" in unit["module_value_bindings"]
+    assert "conditional_module_binding_unanalyzed" in unit["module_dynamic_reference_observations"]
+    assert unit["source_dependency_context_status"] == "unknown"
+    assert unit["dependency_context_status"] == "unknown"
+
+    (repo / "src.py").write_text(
+        "from package import *\n\ndef subject(values):\n    return len(values) + 2\n",
+        encoding="utf-8")
+    star_tip = commit(repo, "star import")
+    star_snapshot = {**snapshot, "snapshot_digest": "star",
+                     "branches": [{"name": "source", "tip": star_tip, "merge_base": base,
+                                   "eligible": True, "exclusion_reasons": []}]}
+    star_result = build_contributions(star_snapshot, repo)
+    star_unit = next(unit for unit in star_result["units"] if unit.get("name") == "subject")
+    assert "module_star_import_unresolved" in star_unit["module_dynamic_reference_observations"]
+    assert star_unit["source_dependency_context_status"] == "unknown"
+
+
+def test_module_value_reference_does_not_fall_back_to_destination_definition(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    (repo / "src.py").write_text(
+        "def helper():\n    return 1\ndef subject():\n    return 1\n", encoding="utf-8")
+    base = commit(repo, "base")
+    git(repo, "checkout", "-q", "-b", "source")
+    (repo / "src.py").write_text(
+        "helper = 3\ndef subject():\n    return helper()\n", encoding="utf-8")
+    source_tip = commit(repo, "module value reference")
+    snapshot = {"kind": "git-snapshot", "schema_version": 1, "snapshot_digest": "s",
+                "repository_id": "r", "main": {"name": "main", "tip": base},
+                "branches": [{"name": "source", "tip": source_tip, "merge_base": base,
+                              "eligible": True, "exclusion_reasons": []}]}
+    result = build_contributions(snapshot, repo)
+    unit = next(unit for unit in result["units"] if unit.get("name") == "subject")
+    assert "helper" in unit["module_value_bindings"]
+    assert "helper" in unit["dependency_observations"]["unresolved_reference_samples"]
+    assert unit["source_dependency_context_status"] == "unknown"
+    assert unit["dependency_context_status"] == "unknown"
+
+
+def test_unknown_dependency_status_propagates_to_callers(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    (repo / "src.py").write_text(
+        "import builtins\n"
+        "def mutate():\n    return 0\n"
+        "def subject(values):\n    return values\n", encoding="utf-8")
+    base = commit(repo, "base")
+    git(repo, "checkout", "-q", "-b", "source")
+    subject = "def subject(values):\n    mutate()\n    return len(values) + 1\n"
+    (repo / "src.py").write_text(
+        "import builtins\n"
+        "def mutate():\n    builtins.len = custom_length\n    return 0\n"
+        + subject, encoding="utf-8")
+    source_tip = commit(repo, "dynamic dependency")
+    git(repo, "checkout", "-q", "main")
+    (repo / "dst.py").write_text(subject, encoding="utf-8")
+    commit(repo, "destination subject candidate")
+    main_tip = git(repo, "rev-parse", "HEAD")
+    snapshot = {"kind": "git-snapshot", "schema_version": 1, "snapshot_digest": "s",
+                "repository_id": "r", "main": {"name": "main", "tip": main_tip},
+                "branches": [{"name": "source", "tip": source_tip, "merge_base": base,
+                              "eligible": True, "exclusion_reasons": []}]}
+    result = build_contributions(snapshot, repo)
+    caller = next(unit for unit in result["units"] if unit.get("name") == "subject")
+    mutator = next(unit for unit in result["units"] if unit.get("name") == "mutate")
+    assert any(edge["source_id"] == caller["id"] and edge["destination_id"] == mutator["id"]
+               for edge in result["edges"])
+    assert mutator["source_dependency_context_status"] == "unknown"
+    assert caller["source_dependency_context_status"] == "unknown"
+    assert "transitive_dependency_context_unknown" in caller["dependency_context_limitations"]
+
+
+def test_match_capture_and_global_statement_keep_module_resolution_unknown() -> None:
+    match_unit = _definitions(
+        "match value:\n"
+        "    case len:\n"
+        "        pass\n"
+        "def subject(values):\n"
+        "    return len(values) + 1\n")[0]
+    assert "len" in match_unit["module_value_bindings"]
+    assert "conditional_module_binding_unanalyzed" in match_unit["module_dynamic_reference_observations"]
+
+    global_unit = _definitions(
+        "def mutate():\n"
+        "    global len\n"
+        "    len = custom_length\n"
+        "def subject(values):\n"
+        "    return len(values) + 1\n")[1]
+    assert "module_global_write_unanalyzed" in global_unit["module_dynamic_reference_observations"]
+
+    for expression, signal in (
+        ("exec('len = custom_length')", "module_dynamic_namespace_call:exec"),
+        ("globals()['len'] = custom_length", "module_dynamic_namespace_call:globals"),
+        ("builtins.len = custom_length", "module_attribute_binding_write_unanalyzed"),
+        ("__builtins__['len'] = custom_length", "module_subscript_binding_write_unanalyzed"),
+    ):
+        dynamic_unit = _definitions(
+            f"{expression}\n"
+            "def subject(values):\n"
+            "    return len(values) + 1\n")[0]
+        assert signal in dynamic_unit["module_dynamic_reference_observations"]
+
+    class_unit = _definitions(
+        "import builtins\n"
+        "class C:\n"
+        "    builtins.len = custom_length\n"
+        "def subject(values):\n"
+        "    return len(values) + 1\n")[1]
+    assert "module_attribute_binding_write_unanalyzed" in class_unit["module_dynamic_reference_observations"]
 
 
 class ContributionTests(unittest.TestCase):

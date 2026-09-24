@@ -46,7 +46,7 @@
     const dimensions = Object.fromEntries(["evidence_sufficient", "same_intent", "partial_overlap", "a_depends_on_b", "b_depends_on_a", "a_supersedes_b", "b_supersedes_a"].map((key) => [key, typeof object(answers[key]).noul === "number" ? object(answers[key]).noul : null]));
     const v3 = dimensions.evidence_sufficient !== null;
     const strongest = Object.entries(dimensions).filter(([key, value]) => key !== "evidence_sufficient" && typeof value === "number").sort((a, b) => b[1] - a[1])[0];
-    const choice = text(relationship.choice) || (v3 && strongest && strongest[1] >= .75 ? strongest[0].toUpperCase() : v3 ? "MULTIDIMENSIONAL" : "");
+    const choice = text(relationship.choice) || (v3 && dimensions.evidence_sufficient < .75 ? "INSUFFICIENT_EVIDENCE" : v3 && strongest && strongest[1] >= .75 ? strongest[0].toUpperCase() : v3 ? "MULTIDIMENSIONAL" : "");
     const confidence = typeof relationship.confidence === "number" ? relationship.confidence : null;
     const sameIntentValue = typeof sameIntent.noul === "number" ? sameIntent.noul : text(sameIntent.noul);
     const parts = [];

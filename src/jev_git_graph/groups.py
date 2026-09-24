@@ -14,9 +14,15 @@ from .errors import JgError
 from .safety import digest, read_json, write_json
 
 
-_SCHEMA_VERSION = 1
-_SIGNAL_BUCKET_LIMIT = 64
-_SIGNAL_EDGE_LIMIT = 256
+_GROUPS_SCHEMA_VERSION = 3
+_CONTEXT_GAP_LIMITATIONS = {
+    "candidate_metadata_missing",
+    "candidate_discovery_truncated",
+    "python_parse_unsupported",
+    "partition_has_known_cross_group_edges",
+    "excluded_neighbor_edges_present",
+    "edge_output_budget_exhausted",
+}
 
 
 def _require_text(value: Any, label: str) -> str:
@@ -50,7 +56,7 @@ def _unit_branch(unit: dict[str, Any]) -> str:
 def _validate(contributions: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
     if not isinstance(contributions, dict):
         raise JgError("contributions artifact must be an object")
-    if contributions.get("kind") != "contributions" or contributions.get("schema_version") != _SCHEMA_VERSION:
+    if contributions.get("kind") != "contributions" or contributions.get("schema_version") not in {1, 2}:
         raise JgError("contributions artifact has an unsupported kind or schema")
     repository_id = _require_text(contributions.get("repository_id"), "repository_id")
     _digest_text(contributions.get("snapshot_digest"), "snapshot_digest")
@@ -190,10 +196,12 @@ def build_groups(contributions: dict[str, Any], max_units: int = 24, max_edges: 
         )
     )
 
-    # Discover bounded candidate relationships via indexed keys, never an
-    # unrestricted all-pairs comparison. Each generated link has its signal.
+    # Discover relationships through indexed keys and a spanning chain per
+    # signal. This is linear in the number of indexed observations, instead
+    # of generating every pair in a common-symbol bucket.
     candidate_edges: dict[tuple[str, str, str], dict[str, Any]] = {}
     omitted: dict[str, int] = defaultdict(int)
+    unexpanded_pairwise: dict[str, int] = defaultdict(int)
     indexes: dict[tuple[str, str], list[str]] = defaultdict(list)
     branch_indexes: dict[str, list[str]] = defaultdict(list)
     for unit_id in eligible_ids:
@@ -219,20 +227,16 @@ def build_groups(contributions: dict[str, Any], max_units: int = 24, max_edges: 
             add(left, right, "same_branch", branch)
     for (signal_type, signal), ids in sorted(indexes.items()):
         ids = sorted(set(ids))
-        # A wide signal's first unit is a deterministic representative. The
-        # remaining units are accounted as omitted candidate comparisons.
-        allowed = ids[:_SIGNAL_BUCKET_LIMIT]
-        possible = len(ids) * (len(ids) - 1) // 2
-        pairs_added = 0
-        for i, first in enumerate(allowed):
-            for second in allowed[i + 1:]:
-                if pairs_added >= _SIGNAL_EDGE_LIMIT:
-                    break
-                add(first, second, signal_type, signal)
-                pairs_added += 1
-            if pairs_added >= _SIGNAL_EDGE_LIMIT:
-                break
-        omitted[signal_type] += max(0, possible - pairs_added)
+        # A chain preserves connectedness without materializing quadratic
+        # pair sets. The shared key is retained as edge provenance. Other
+        # pairwise edges in the bucket are intentionally unexpanded and are
+        # reported separately from truncated or dropped candidates.
+        possible_pairs = len(ids) * (len(ids) - 1) // 2
+        unexpanded_count = max(0, possible_pairs - max(0, len(ids) - 1))
+        if unexpanded_count:
+            unexpanded_pairwise[signal_type] += unexpanded_count
+        for left, right in zip(ids, ids[1:]):
+            add(left, right, signal_type, signal)
 
     known_source_edges = [
         edge for edge in contributions["edges"]
@@ -249,13 +253,23 @@ def build_groups(contributions: dict[str, Any], max_units: int = 24, max_edges: 
         normalized.setdefault("provenance", "contribution_edge")
         normalized_input_edges.append(normalized)
 
+    edge_priority = {
+        "ancestry": 0,
+        "dependency": 1,
+        "dependency_candidate": 1,
+        "structural_match": 2,
+        "ast_fingerprint": 3,
+        "blob": 4,
+        "same_branch": 5,
+        "path": 6,
+        "symbol": 7,
+        "branch_family": 8,
+    }
     all_edges = list(candidate_edges.values()) + normalized_input_edges
-    all_edges.sort(key=lambda edge: (edge["id"], edge["source_id"], edge["destination_id"]))
-    globally_omitted_edges = max(0, len(all_edges) - max_edges)
-    if globally_omitted_edges:
-        for edge in all_edges[max_edges:]:
-            omitted[edge.get("kind", "unknown")] += 1
-        all_edges = all_edges[:max_edges]
+    all_edges.sort(key=lambda edge: (
+        edge_priority.get(edge.get("kind", "unknown"), 20),
+        edge["id"], edge["source_id"], edge["destination_id"],
+    ))
 
     # Connected components across source units only. Destination candidates
     # are attached locally and never act as universal main-branch hubs.
@@ -285,6 +299,7 @@ def build_groups(contributions: dict[str, Any], max_units: int = 24, max_edges: 
         for offset in range(0, len(component), max_units):
             partitions.append(component[offset:offset + max_units])
     groups = []
+    destination_id_sets: list[set[str]] = []
     group_index_by_unit = {
         unit_id: group_index
         for group_index, partition in enumerate(partitions)
@@ -292,8 +307,11 @@ def build_groups(contributions: dict[str, Any], max_units: int = 24, max_edges: 
     }
     for partition in partitions:
         destination_ids = sorted({dest_id for unit_id in partition for dest_id in units[unit_id].get("destination_ids", [])})
-        limitations = sorted({limitation for unit_id in partition for limitation in units[unit_id].get("limitations", [])})
-        limitations.extend(contributions.get("limitations", []))
+        analysis_observations = sorted({
+            limitation for unit_id in partition for limitation in units[unit_id].get("limitations", [])
+        } | set(contributions.get("limitations", [])))
+        limitations = sorted(item for item in analysis_observations
+                             if item in _CONTEXT_GAP_LIMITATIONS)
         if any(unit_id in metadata_unknown_ids for unit_id in partition):
             limitations.append("candidate_metadata_missing")
         if omitted:
@@ -304,16 +322,20 @@ def build_groups(contributions: dict[str, Any], max_units: int = 24, max_edges: 
             "destination_ids": destination_ids,
             "edges": [],
             "boundary_edges": [],
+            "analysis_observations": analysis_observations,
             "limitations": sorted(set(limitations)),
-            "context_complete": not limitations,
+            "context_complete": not any(item in _CONTEXT_GAP_LIMITATIONS for item in limitations),
         })
+        destination_id_sets.append(set(destination_ids))
 
-    # Emit edges under a second, artifact-wide budget. A cross-partition edge
-    # costs two records because both endpoint groups need the boundary ID.
-    # Edges are admitted atomically so context is never complete on only one
-    # side of a known boundary.
+    # max_edges is a per-group output budget. A global cap made later groups
+    # look unrelated, so connectivity is retained and omitted edges are
+    # charged to the affected groups. Cross-partition edges are admitted
+    # atomically on both sides.
     output_edge_count = 0
     output_budget_omitted: dict[str, int] = defaultdict(int)
+    output_omissions_by_group: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    output_edges_by_group: dict[int, int] = defaultdict(int)
     excluded_neighbor_edges: list[dict[str, Any]] = []
     for edge in all_edges:
         source = edge["source_id"]
@@ -354,19 +376,24 @@ def build_groups(contributions: dict[str, Any], max_units: int = 24, max_edges: 
                 continue
             source_group = group_index_by_unit[source]
             placements = [(source_group, "edges", edge)]
-            if target not in groups[source_group]["destination_ids"]:
+            if target not in destination_id_sets[source_group]:
                 groups[source_group]["destination_ids"].append(target)
+                destination_id_sets[source_group].add(target)
         else:
             # Validation rejects this, but retain the fail-closed boundary.
             raise JgError(f"edge refers to unknown destination id: {target}")
-        if output_edge_count + len(placements) > max_edges:
+        affected_groups = {group_index for group_index, _, _ in placements}
+        if any(output_edges_by_group[group_index] >= max_edges for group_index in affected_groups):
             output_budget_omitted[edge.get("kind", "unknown")] += 1
+            for group_index in affected_groups:
+                output_omissions_by_group[group_index][edge.get("kind", "unknown")] += 1
             continue
         output_edge_count += len(placements)
         for group_index, field, placed_edge in placements:
             groups[group_index][field].append(placed_edge)
+            output_edges_by_group[group_index] += 1
 
-    for group in groups:
+    for group_index, group in enumerate(groups):
         group["destination_ids"] = sorted(set(group["destination_ids"]))
         group["id"] = "grp-" + digest({"unit_ids": group["unit_ids"], "destination_ids": group["destination_ids"]})[:24]
         group["edges"].sort(key=lambda edge: edge["id"])
@@ -375,10 +402,14 @@ def build_groups(contributions: dict[str, Any], max_units: int = 24, max_edges: 
             group["limitations"].append("partition_has_known_cross_group_edges")
         if any(edge.get("boundary_status") == "excluded_neighbor" for edge in group["boundary_edges"]):
             group["limitations"].append("excluded_neighbor_edges_present")
-        if output_budget_omitted:
+        if output_omissions_by_group.get(group_index):
             group["limitations"].append("edge_output_budget_exhausted")
+            group["omitted_edges_by_type"] = dict(sorted(output_omissions_by_group[group_index].items()))
         group["limitations"] = sorted(set(group["limitations"]))
-        group["context_complete"] = not group["limitations"]
+        group["analysis_observations"] = sorted(set(group["analysis_observations"]))
+        group["context_complete"] = not any(
+            item in _CONTEXT_GAP_LIMITATIONS for item in group["limitations"]
+        )
 
     coverage = {
         "eligible_source_units": len(eligible_ids),
@@ -393,16 +424,19 @@ def build_groups(contributions: dict[str, Any], max_units: int = 24, max_edges: 
         "excluded_neighbor_edge_ids": sorted(edge["id"] for edge in excluded_neighbor_edges),
         "excluded_neighbor_edge_count": len(excluded_neighbor_edges),
         "omitted_candidates_by_type": dict(sorted(omitted.items())),
+        "unexpanded_pairwise_candidates_by_type": dict(sorted(unexpanded_pairwise.items())),
+        "discovery_scope": "one deterministic spanning chain per shared indexed signal; remaining pairwise relationships were not enumerated",
+        "pairwise_relationships_exhaustive": False,
         "omitted_output_edges_by_type": dict(sorted(output_budget_omitted.items())),
         "unresolved_candidate_count": sum(omitted.values()) + sum(output_budget_omitted.values()),
         "output_edges_emitted": output_edge_count,
         "max_units": max_units,
-        "max_edges": max_edges,
+        "max_edges_per_group": max_edges,
         "truncated": bool(omitted) or bool(output_budget_omitted),
     }
     result = {
         "kind": "contribution-groups",
-        "schema_version": 1,
+        "schema_version": _GROUPS_SCHEMA_VERSION,
         "repository_id": contributions["repository_id"],
         "snapshot_digest": contributions["snapshot_digest"],
         "contributions_digest": contributions["contributions_digest"],
