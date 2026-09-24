@@ -295,6 +295,18 @@ approved before any disclosure; changing context is a new payload. Persist
 only validated typed answers, provenance IDs/digests, model, timing, usage, and
 status. These permissions apply equally to a separately authorized LLM control.
 
+An optional non-empty `study.project_goals` value may be included as bounded
+project-purpose context in a presence preview. The request carries the exact
+goal text, its UTF-8 SHA-256, and a purpose-question version; sensitive-content
+scanning and the request byte budget run before preview. The exact payload
+digest binds this context to approval. Without goals, existing questions and
+payloads remain unchanged and project relevance remains `UNKNOWN`. With goals,
+a separate typed question reports only advisory relevance to those stated
+goals. It does not change behavior-presence or usable-delta judgments, establish
+measured utility, or grant integration, preservation, or deletion authority.
+Only the goal digest/version and validated typed relevance are retained with
+answers and outcome reviews.
+
 This revision's acceptance is progress toward section 1: fewer unresolved
 objects, verified destinations for usable work, a complete review ledger, and
 a recoverable cleanup dry-run. Raw confidence scores or a completed request

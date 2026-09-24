@@ -19,6 +19,8 @@ DEFAULT_MAX_GROUPS = 64
 DEFAULT_MAX_REQUESTS = 64
 DEFAULT_MAX_REQUEST_BYTES = 64_000
 DEFAULT_MAX_EVIDENCE_BYTES = 24_000
+PROJECT_PURPOSE_VERSION = "project-purpose-v1"
+MAX_PROJECT_PURPOSE_BYTES = 4_000
 
 
 def _git(root: Path, *args: str, optional: bool = False) -> bytes | None:
@@ -244,6 +246,7 @@ def build_group_requests(
     token_estimator: str | None = None,
     selected_contribution_ids: Iterable[str] | None = None,
     selection_digest: str | None = None,
+    project_goals: str = "",
 ) -> dict[str, Any]:
     """Build one named-question request per bounded group, retaining omissions."""
     if (not isinstance(max_groups, int) or isinstance(max_groups, bool) or max_groups < 1
@@ -273,6 +276,20 @@ def build_group_requests(
         raise JgError("model settings contain unsupported or sensitive fields")
     if any(value is not None and not isinstance(value, (str, int, float, bool)) for value in settings.values()):
         raise JgError("model settings must contain scalar values")
+    if not isinstance(project_goals, str):
+        raise JgError("project goals must be text")
+    project_purpose = None
+    if project_goals.strip():
+        try:
+            encoded_goals = project_goals.encode("utf-8", "strict")
+        except UnicodeEncodeError:
+            raise JgError("project goals must be valid UTF-8 text") from None
+        if len(encoded_goals) > MAX_PROJECT_PURPOSE_BYTES or "\x00" in project_goals:
+            raise JgError("project goals exceed the bounded UTF-8 limit")
+        _reject_sensitive(project_goals)
+        project_purpose = {"text": project_goals,
+                           "sha256": hashlib.sha256(encoded_goals).hexdigest(),
+                           "version": PROJECT_PURPOSE_VERSION}
     if not isinstance(settings.get("model"), str) or not settings["model"]:
         raise JgError("model settings must name a model")
     for field, value in (("estimated_input_tokens", estimated_input_tokens), ("max_provider_tokens", max_provider_tokens)):
@@ -409,16 +426,20 @@ def build_group_requests(
                 not candidate_ids and unit.get("dependency_context_status") == "unknown")
             unit_questions = presence_questions(
                 unit_id, dependencies, dependency_context_status=unit.get("dependency_context_status"),
-                source_only=source_only_case)
+                source_only=source_only_case, project_purpose=project_purpose)
             if cohort_scope is not None:
-                for question in unit_questions.values():
-                    question["scope_limits"] = (
+                for question_id, question in unit_questions.items():
+                    case_scope = (
                         "source-only usable_delta only; no destination, integration, deduplication, "
                         "preservation, or deletion inference; graph incomplete"
                         if source_only_case else
                         "bounded case evidence only; no project-level integration, deduplication, "
                         "preservation, or deletion inference; graph incomplete"
                     )
+                    if question_id == "project_relevance" and isinstance(question.get("scope_limits"), Mapping):
+                        question["scope_limits"] = {**question["scope_limits"], "case_scope": case_scope}
+                    else:
+                        question["scope_limits"] = case_scope
             for question_id, question in unit_questions.items():
                 questions[f"{unit_id}:{question_id}"] = question
             if evidence is not None:
@@ -642,6 +663,8 @@ def build_group_requests(
                  "evidence_ids": sorted({record.get("evidence_id") for item in chunk
                                            for record in (item.get("evidence") or {}).get("records", [])
                                            if isinstance(record.get("evidence_id"), str)})}
+            if project_purpose is not None:
+                chunk_state["project_purpose"] = project_purpose
             requests.append({"state": chunk_state, "model": settings["model"], "questions": chunk_questions})
     size = len(canonical_json(requests))
     request_sizes = [len(canonical_json(request)) for request in requests]

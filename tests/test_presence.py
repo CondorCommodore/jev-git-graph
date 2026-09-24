@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
@@ -22,7 +24,7 @@ from jev_git_graph.presence import (
 )
 from jev_git_graph.presence_calibration import build_presence_calibration
 from jev_git_graph.questions import presence_questions
-from jev_git_graph.safety import digest, read_json, write_json
+from jev_git_graph.safety import canonical_json, digest, read_json, write_json
 from jev_git_graph.outcomes import approve_outcome_review, build_outcomes
 from jev_git_graph.preservation import build_preservation_plan, write_preservation_plan
 
@@ -49,7 +51,7 @@ def _artifact():
 
 
 def _response(request, presence="PRESENT", sufficient=0.95, delta=0.05,
-              dependencies_sufficient=0.95):
+              dependencies_sufficient=0.95, project_relevance=0.95):
     answers = {}
     for qid, question in request["questions"].items():
         if question["type"] == "noul":
@@ -57,6 +59,8 @@ def _response(request, presence="PRESENT", sufficient=0.95, delta=0.05,
                 value = sufficient
             elif qid.endswith(":dependency_context_sufficient"):
                 value = dependencies_sufficient
+            elif qid.endswith(":project_relevance"):
+                value = project_relevance
             else:
                 value = delta
             answers[qid] = {"noul": value}
@@ -111,6 +115,88 @@ def test_synthetic_answers_are_advisory_and_origin_cannot_be_overridden():
                            import_synthetic_answers(preview, [{"request_sha256": digest(preview["requests"][0]),
                                                               "response": _response(preview["requests"][0])}]),
                            origin="jev")
+
+
+def test_project_purpose_is_pinned_scanned_and_separate_from_presence():
+    contributions, groups = _artifact()
+    without_goals = build_group_requests(contributions, groups)
+    empty_goals = build_group_requests(contributions, groups, project_goals="")
+    assert without_goals["requests"] == empty_goals["requests"]
+
+    goals = "Keep interactive examples safe and accessible."
+    plan = build_group_requests(contributions, groups, project_goals=goals)
+    request = plan["requests"][0]
+    purpose = request["state"]["project_purpose"]
+    assert purpose == {
+        "text": goals, "sha256": hashlib.sha256(goals.encode("utf-8")).hexdigest(),
+        "version": "project-purpose-v1",
+    }
+    assert "cu-1:project_relevance" in request["questions"]
+    assert request["questions"]["cu-1:usable_delta"] == without_goals["requests"][0]["questions"]["cu-1:usable_delta"]
+    assert request["questions"]["cu-1:project_relevance"]["scope_limits"]["permitted_judgment"] == \
+        "advisory_project_relevance_to_supplied_purpose"
+
+    with pytest.raises(JgError, match="sensitive material"):
+        build_group_requests(contributions, groups, project_goals="password='fake-secret-value-123'")
+    with pytest.raises(JgError, match="UTF-8 limit"):
+        build_group_requests(contributions, groups, project_goals="é" * 2_001)
+
+    preview = approved_presence_preview(plan)
+    imported = import_synthetic_answers(preview, [{
+        "request_sha256": digest(preview["requests"][0]),
+        "response": _response(preview["requests"][0], project_relevance=0.95),
+    }])
+    result = reconcile_presence(contributions, groups, imported)
+    row = result["contributions"][0]
+    assert row["project_relevance"] is True
+    assert row["project_goal_digest"] == purpose["sha256"]
+    assert row["project_goal_version"] == "project-purpose-v1"
+    assert row["disposition"] == "UNRESOLVED"
+    assert row["usable_delta"] is None
+    assert row["routing_scope"] == "advisory_only"
+    assert result["project_utility_assessment"]["status"] == "UNKNOWN"
+    assert result["project_utility_assessment"]["reason"] == "comparison_or_source_evidence_insufficient"
+
+    from jev_git_graph import cli
+    study = {"kind": "presence-study", "schema_version": 2,
+             "snapshot_digest": contributions["snapshot_digest"],
+             "contributions_digest": contributions["contributions_digest"],
+             "groups_digest": groups["groups_digest"], "project_goals": goals,
+             "selection_policy": "fixture", "cases": [{"contribution_id": "cu-1"}]}
+    study["study_digest"] = digest(study)
+    snapshot = {"snapshot_digest": contributions["snapshot_digest"]}
+    inputs = {"contributions.json": contributions, "groups.json": groups, "study.json": study}
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(cli, "load_snapshot", lambda _path: (snapshot, None))
+        monkeypatch.setattr(cli, "read_json", lambda path: inputs[str(path)])
+        _repo, _ranges, replay, cli_preview = cli._build_group_presence_preview(SimpleNamespace(
+            snapshot="snapshot.json", contributions="contributions.json", groups="groups.json",
+            study="study.json", evidence_ranges=None, model_settings=None, max_groups=64,
+            max_requests=64, max_request_bytes=64_000, auto_estimate_input_tokens=False,
+            estimated_input_tokens=None, max_provider_tokens=None))
+    finally:
+        monkeypatch.undo()
+    cli_purpose = cli_preview["requests"][0]["state"]["project_purpose"]
+    assert cli_purpose["sha256"] == purpose["sha256"]
+    assert replay["project_goal_sha256"] == purpose["sha256"]
+    assert replay["project_goal_version"] == "project-purpose-v1"
+    assert goals not in canonical_json(replay).decode("utf-8")
+
+
+def test_project_relevance_summary_rejects_mixed_goal_contexts():
+    assessment = presence_module._project_utility_assessment([
+        {"project_goal_digest": "a" * 64, "project_goal_version": "project-purpose-v1",
+         "project_relevance": True, "project_goal_context_conflict": False,
+         "evidence_sufficient": True, "comparison_context_complete": True},
+        {"project_goal_digest": "b" * 64, "project_goal_version": "project-purpose-v1",
+         "project_relevance": False, "project_goal_context_conflict": False,
+         "evidence_sufficient": True, "comparison_context_complete": True},
+    ])
+    assert assessment == {
+        "status": "UNKNOWN", "reason": "project_goal_context_conflict",
+        "source": "typed_project_relevance_review",
+    }
 
 
 def test_injected_executor_is_synthetic_and_public_origin_spoof_fails_closed(tmp_path, monkeypatch):
@@ -429,6 +515,29 @@ def test_control_presence_flows_to_outcomes_review_and_stales_on_evidence_change
     assert initial["integration_tasks"] == []
     assert initial["cleanup_authorized"] is False
     assert initial["project_utility_assessment"]["status"] == "UNKNOWN"
+
+    goals = "Support safe and accessible examples."
+    goal_plan = build_group_requests(contributions, groups, project_goals=goals)
+    goal_preview = approved_presence_preview(goal_plan)
+    goal_import = import_synthetic_answers(goal_preview, [{
+        "request_sha256": digest(goal_preview["requests"][0]),
+        "response": _response(goal_preview["requests"][0], project_relevance=0.95),
+    }])
+    goal_presence = reconcile_presence(contributions, groups, goal_import)
+    goal_outcomes = build_outcomes(inventory, snapshot, contributions, presence=goal_presence)
+    goal_branch = next(row for row in goal_outcomes["objects"]
+                       if row["object_id"] == "branch:feature/task")
+    goal_review = goal_branch["contribution_reviews"][0]
+    assert goal_review["project_relevance"] is True
+    assert goal_review["project_goal_digest"] == goal_presence["contributions"][0]["project_goal_digest"]
+    assert goal_review["project_goal_version"] == "project-purpose-v1"
+    assert goal_review["routing_scope"] == "advisory_only"
+    assert goal_outcomes["cleanup_authorized"] is False
+    assert goal_outcomes["project_utility_assessment"]["reason"] == \
+        "comparison_or_source_evidence_insufficient"
+    assert goal_outcomes["project_utility_assessment"]["reason"] != \
+        "project_requirements_not_provided"
+
     queue = build_preservation_plan(inventory, outcomes=initial)
     queue_branch = next(row for row in queue["objects"] if row["object_id"] == branch["object_id"])
     assert queue_branch["outcome_review"]["contribution_reviews"][0]["routing_scope"] == "advisory_only"
@@ -716,6 +825,12 @@ def test_source_only_evidence_keeps_destination_unknown_and_transient(tmp_path):
                  "dependency_context_status": "unknown"})
     unit["source"].update({"path": "src.py", "blob": unit["source_blob"]})
     contributions["branches"][0]["tip"] = source_tip
+    contributions["edges"] = [
+        {"id": "edge-source-dep-1", "source_id": "cu-1", "destination_id": "du-1",
+         "kind": "dependency"},
+        {"id": "edge-source-dep-2", "source_id": "cu-1", "destination_id": "du-1",
+         "kind": "dependency"},
+    ]
     contributions["contributions_digest"] = digest({key: value for key, value in contributions.items()
                                                       if key != "contributions_digest"})
     groups = build_groups(contributions)
@@ -738,7 +853,62 @@ def test_source_only_evidence_keeps_destination_unknown_and_transient(tmp_path):
     assert "missing from destination" not in usable_delta_question["instructions"]
     assert "cu-1:dependency_context_sufficient" in plan["requests"][0]["questions"]
     assert "integration readiness remains unassessed" in plan["requests"][0]["questions"]["cu-1:dependency_context_sufficient"]["criteria"]["false"]
+    assert len(binding["dependency_edges"]) == 2
     assert not any(key.startswith("cu-1:dependency:") for key in plan["requests"][0]["questions"])
+
+    preview = approved_presence_preview(plan)
+    request = preview["requests"][0]
+    imported = import_synthetic_answers(preview, [{
+        "request_sha256": digest(request),
+        "response": _response(request, presence="UNKNOWN", dependencies_sufficient=0.05, delta=0.95),
+    }])
+    result = reconcile_presence(contributions, groups, imported)
+    assert result["contributions"][0]["presence"] == "UNKNOWN"
+    assert result["contributions"][0]["usable_delta"] is None
+    assert result["contributions"][0]["disposition"] == "UNRESOLVED"
+    assert result["contributions"][0]["routing_scope"] == "advisory_only"
+    assert result["contributions"][0]["dependencies"] == [
+        {"edge_id": "edge-source-dep-1", "relevant": None},
+        {"edge_id": "edge-source-dep-2", "relevant": None},
+    ]
+
+    full_contributions, _ = _artifact()
+    full_unit = full_contributions["units"][0]
+    source_blob = _git(repo, "rev-parse", f"{source_tip}:src.py")
+    destination_blob = _git(repo, "rev-parse", f"{destination_tip}:src.py")
+    full_unit.update({"source_tip": source_tip, "main_tip": destination_tip, "path": "src.py",
+                      "source_blob": source_blob, "range": {"start_line": 1, "end_line": 2},
+                      "destination_ids": ["du-1"], "dependency_context_status": "complete"})
+    full_unit["source"].update({"path": "src.py", "blob": source_blob})
+    full_contributions["branches"][0]["tip"] = source_tip
+    full_contributions["destination_units"][0].update({
+        "path": "src.py", "blob": destination_blob, "range": {"start_line": 1, "end_line": 2},
+    })
+    full_contributions["edges"] = [
+        {"id": "edge-source-dep-1", "source_id": "cu-1", "destination_id": "du-1",
+         "kind": "dependency"},
+        {"id": "edge-source-dep-2", "source_id": "cu-1", "destination_id": "du-1",
+         "kind": "dependency"},
+    ]
+    full_contributions["contributions_digest"] = digest({key: value for key, value in full_contributions.items()
+                                                           if key != "contributions_digest"})
+    full_groups = build_groups(full_contributions)
+    full_evidence = build_two_sided_evidence(repo, source_tip, destination_tip, [{
+        "evidence_id": "two-sided-1", "source_path": "src.py",
+        "source_range": {"start_line": 1, "end_line": 2},
+        "destination_path": "src.py", "destination_range": {"start_line": 1, "end_line": 2},
+    }])
+    full_plan = build_group_requests(full_contributions, full_groups, {"cu-1": full_evidence})
+    full_preview = approved_presence_preview(full_plan)
+    full_request = full_preview["requests"][0]
+    incomplete_full = import_synthetic_answers(full_preview, [{
+        "request_sha256": digest(full_request), "response": _response(full_request),
+    }])
+    incomplete_full["answers"][0]["response"]["answers"].pop(
+        "cu-1:dependency:edge-source-dep-1")
+    incomplete_full["answers_digest"] = presence_module._answers_digest(incomplete_full)
+    with pytest.raises(JgError, match="presence answer IDs do not match contribution bindings"):
+        reconcile_presence(full_contributions, full_groups, incomplete_full)
 
     mismatched, _ = _artifact()
     mismatched_unit = mismatched["units"][0]

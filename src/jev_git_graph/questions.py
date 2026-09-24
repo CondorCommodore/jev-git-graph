@@ -86,6 +86,7 @@ def presence_questions(
     dependency_context_status: str | None = None,
     *,
     source_only: bool = False,
+    project_purpose: dict[str, str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Return named, typed questions for one contribution in a shared group.
 
@@ -99,6 +100,13 @@ def presence_questions(
         raise ValueError("dependency_context_status must be complete, unknown, incomplete, or omitted")
     if not isinstance(source_only, bool):
         raise ValueError("source_only must be a boolean")
+    if project_purpose is not None and (
+        not isinstance(project_purpose, dict)
+        or not isinstance(project_purpose.get("text"), str)
+        or not isinstance(project_purpose.get("sha256"), str)
+        or project_purpose.get("version") != "project-purpose-v1"
+    ):
+        raise ValueError("project_purpose must be a versioned, digest-bound goal")
     edge_records = dependency_edges or []
 
     def noul(instructions: str, true: str, false: str) -> dict[str, Any]:
@@ -146,6 +154,25 @@ def presence_questions(
         },
         "usable_delta": usable_delta,
     }
+    if project_purpose is not None:
+        relevance = _noul(
+            prefix + "Considering only the explicit project purpose in state.project_purpose.text, is the behavior visible in the supplied evidence relevant to advancing that stated purpose? Assess relevance only; do not infer that behavior is missing, valuable in practice, preserved, or authorized for action. If the purpose or evidence does not support a clear relevance judgment, return an indeterminate value (0.5).",
+            "The evidence supports a concrete connection between this behavior and the stated project purpose.",
+            "The evidence supports that this behavior does not advance the stated project purpose; do not infer it has no other value.",
+        )
+        relevance["scope_limits"] = {
+            "permitted_judgment": "advisory_project_relevance_to_supplied_purpose",
+            "project_purpose_version": project_purpose["version"],
+            "project_purpose_sha256": project_purpose["sha256"],
+            "prohibited_inferences": [
+                "destination_presence_or_absence",
+                "integration_readiness",
+                "preservation_action",
+                "deletion_action",
+                "measured_or_realized_utility",
+            ],
+        }
+        questions["project_relevance"] = relevance
     if dependency_context_status is not None:
         questions["dependency_context_sufficient"] = noul(
             prefix + (("Dependency status is unknown and no destination or complete relationship context is supplied. Record that integration readiness cannot be assessed; this is not an integration judgment." if source_only else "Given the supplied dependency/reference evidence and analyzer status "
