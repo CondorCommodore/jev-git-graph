@@ -43,6 +43,7 @@ REQUIRED_HOME_LAB_CREATORS = frozenset({
     "scripts/merge_train_parts/candidate_lifecycle.py::construct_candidate_head",
     "scripts/merge_train_parts/verdict_lifecycle.py",
     "scripts/train_builder.py::construct_train",
+    "scripts/train_construction_driver.py::construct_next_train",
     "scripts/l1_drain/self_reported.py",
     "scripts/l1_drain/workspace.py::create_worktree",
     "scripts/pr_repair_loop.py::repair_workspace",
@@ -63,8 +64,10 @@ _REVIEWED_HOOK_FILES = {
     "scripts/merge_train_parts/local_guard_verdict.py": "fc36b0b3544acfd2a43871eb829b4479d3019b765a4e7ad29e5f12686f5319bf",
     "scripts/pr_gate/guard_execution.py": "91dba3571398639d0456a72eae929377b483bab8d376db3daf7c079fcd5b3c7c",
     "scripts/merge_train_parts/candidate_lifecycle.py": "c35db21b44c0d9024b68f802c46f13c9c3e70e0a5ead3eabd45a8c3240d1450e",
-    "scripts/merge_train_parts/verdict_lifecycle.py": "e20f1f5ecba03e84be97fd3ae88f5b687e39738ec5f3ef96d9bdc8e7be5eb782",
+    "scripts/merge_train_parts/verdict_lifecycle.py": "eed5e98a608c7998f10d1c9e9a2c8f240d25d08863901438a1dc3e789a4f98c6",
     "scripts/train_builder.py": "289c985aaf9d8b9b00f3934ba767eee9114773240ec67a44207d74625d8ab367",
+    "scripts/train_construction_driver.py": "1d3a54d2a9742a9309c4d801c7feb71a4cd96a1ae7ffda57e9f16f491dad5824",
+    "launchd/start-train-construction.sh": "426320cbed9a581c08e77adf8da3f13c2911ca9d41f03acb02da8213e1bb1102",
     "scripts/l1_drain/self_reported.py": "662d9cbcd86fc021dad1612347e10a9f23f4456e8d482ca3362419ef63e69fae",
     "scripts/l1_drain/workspace.py": "5aecacb06b3322cc64dc729227d45508eb4ffff7cd0504bcf6f46bce20795b70",
     "scripts/pr_repair_loop.py": "c4275a0a2988fcd5737e394f3083a10e87eb52178df48ec7edbe00b8c51d36f0",
@@ -98,7 +101,7 @@ _REQUIRED_LAUNCHD_PATHS = {
     "com.mikebook.pr-convergence-wake-consumer": ("launchd/start-pr-convergence-wake-consumer.sh", "scripts/merge_safe_pr_wake_consumer.py", "runtime"),
     "com.mikebook.pr-convergence-wake-producer": ("launchd/start-pr-convergence-wake-producer.sh", "scripts/merge_safe_pr_wake_producer.py", "runtime"),
     "com.mikebook.wip-convergence-loop": ("scripts/wip_convergence_entrypoint.py", "scripts/wip_convergence_entrypoint.py", "canonical"),
-    "com.mikebook.train-construction": ("launchd/start-train-construction.sh", "scripts/train_construction_driver.py", "runtime"),
+    "com.mikebook.train-construction": ("launchd/start-train-construction.sh", "launchd/start-train-construction.sh", "canonical"),
     "com.mikebook.pr-repair-loop": ("launchd/start-pr-repair-loop.sh", "scripts/pr_repair_loop.py", "canonical"),
     "com.condor.autonomy-drain-loop.codex": ("launchd/start-autonomy-drain-loop.sh", "scripts/autonomy_drain_loop.py", "canonical"),
     "com.condor.autonomy-drain-loop.claude": ("launchd/start-autonomy-drain-loop.sh", "scripts/autonomy_drain_loop.py", "canonical"),
@@ -125,6 +128,8 @@ class CreatorLeaseCapability:
     hook_digests: tuple[tuple[str, str, str], ...]
     loaded_runtime_jobs: tuple[tuple[str, str, str], ...]
     lock_root: Path
+    train_construction_runtime: Path
+    train_construction_commit: str
     scope: str = "production"
 
 
@@ -149,6 +154,46 @@ class DisposableFixtureLeaseCapability:
                     and self.lock_root == _fixed_lock_root())
         except (JgError, OSError):
             return False
+
+
+def capability_receipt_metadata(
+    capability: CreatorLeaseCapability | DisposableFixtureLeaseCapability,
+) -> dict[str, str | None]:
+    """Return sanitized, stable capability identifiers for cleanup receipts."""
+    if isinstance(capability, CreatorLeaseCapability):
+        roots = {str(root.resolve()): label for root, label in zip(
+            capability.runtime_roots, ("stable", "compat", "canonical"))}
+        roots[str(capability.train_construction_runtime.resolve())] = "train-construction"
+        hooks: list[tuple[str, str, str]] = []
+        for root, relative, sha in capability.hook_digests:
+            label = roots.get(str(Path(root).resolve()))
+            if label is None:
+                raise JgError("creator capability contains an unclassified runtime")
+            hooks.append((label, relative, sha))
+        runtime_commit: str | None = capability.train_construction_commit
+        scope = capability.scope
+        payload = {
+            "contract": COOPERATIVE_LEASE_CONTRACT,
+            "scope": scope,
+            "runtime_commit": runtime_commit,
+            "hooks": sorted(hooks),
+            "jobs": sorted(label for label, _plist, _root in capability.loaded_runtime_jobs),
+        }
+    elif isinstance(capability, DisposableFixtureLeaseCapability):
+        scope = capability.scope
+        runtime_commit = None
+        payload = {
+            "contract": COOPERATIVE_LEASE_CONTRACT,
+            "scope": scope,
+            "common_dir_sha256": hashlib.sha256(str(capability.common_dir).encode()).hexdigest(),
+            "branches": list(capability.branches),
+        }
+    else:
+        raise JgError("cleanup receipt requires a verified creator capability")
+    return {
+        "creator_capability_sha256": digest(payload),
+        "creator_runtime_commit": runtime_commit,
+    }
 
 
 def production_capability_is_current(capability: CreatorLeaseCapability,
@@ -231,6 +276,62 @@ def _verify_runtime_hook_files(runtime_root: Path) -> tuple[tuple[str, str, str]
     return tuple(records)
 
 
+def _verify_train_construction_runtime(
+    home: Path, canonical_common_dir: Path,
+) -> tuple[Path, str, tuple[tuple[str, str, str], ...]]:
+    """Prove the mutable-origin/main train constructor is on a reviewed snapshot.
+
+    The launchd wrapper fetches ``origin/main`` into a dedicated linked worktree
+    before importing its creator. A source checkout or loaded plist alone cannot
+    attest that code. Require the live runtime to be clean, attached to the same
+    Git common directory, exactly at its current local ``origin/main`` commit,
+    and to contain every code-owned creator-hook digest. The optional sourced
+    environment file can redirect the runtime or execute arbitrary shell, so a
+    present file keeps production deletion closed without reading its contents.
+    """
+    home = home.resolve(strict=True)
+    override_file = home / ".config/train-promotion-shadow.env"
+    if override_file.exists() or override_file.is_symlink():
+        raise JgError("train-construction-runtime_override_unverified")
+    runtime = home / ".local/share/home-lab/train-promotion-runtime"
+    if runtime.is_symlink():
+        raise JgError("train-construction-runtime_unverified: runtime is symlinked")
+    try:
+        root = runtime.resolve(strict=True)
+    except OSError as exc:
+        raise JgError("train-construction-runtime_unavailable") from exc
+    if root != runtime:
+        raise JgError("train-construction-runtime_unverified: runtime path changed")
+
+    def git_text(*args: str) -> str:
+        result = subprocess.run(["git", "-C", str(root), *args],
+                                capture_output=True, text=True, check=False, timeout=15)
+        if result.returncode:
+            raise JgError("train-construction-runtime_unverified: Git state unavailable")
+        return result.stdout.strip()
+
+    top = Path(git_text("rev-parse", "--show-toplevel")).resolve(strict=True)
+    if top != root or _common_dir(root) != canonical_common_dir:
+        raise JgError("train-construction-runtime_unverified: runtime is not a linked Home Lab worktree")
+    status = git_text("status", "--porcelain", "--untracked-files=all")
+    if status:
+        raise JgError("train-construction-runtime_unverified: runtime checkout is dirty")
+    head = git_text("rev-parse", "--verify", "HEAD^{commit}").lower()
+    origin_main = git_text("rev-parse", "--verify", "origin/main^{commit}").lower()
+    if (not re.fullmatch(r"[0-9a-f]{40,64}", head)
+            or head != origin_main):
+        raise JgError("train-construction-runtime_snapshot_mismatch")
+    listing = git_text("worktree", "list", "--porcelain")
+    registered = {
+        Path(line.removeprefix("worktree ")).resolve(strict=False)
+        for line in listing.splitlines() if line.startswith("worktree ")
+    }
+    if root not in registered:
+        raise JgError("train-construction-runtime_unverified: worktree registration missing")
+    hook_digests = _verify_runtime_hook_files(root)
+    return root, head, hook_digests
+
+
 def _verify_loaded_runtime_jobs(home: Path, runtime_roots: tuple[Path, ...]) -> tuple[tuple[str, str, str], ...]:
     """Verify configured launchd entrypoints and their currently loaded processes."""
     expected_roots = {selector: root for selector, root in zip(_RUNTIME_SELECTORS, runtime_roots)}
@@ -267,6 +368,22 @@ def _verify_loaded_runtime_jobs(home: Path, runtime_roots: tuple[Path, ...]) -> 
         if (plist.get("Label") != label or not isinstance(args, list) or not configured_launcher
                 or (cwd_scope == "runtime" and isinstance(wd, str) and wd and Path(wd).resolve(strict=False) != root)):
             raise JgError(f"creator runtime launchd entrypoint targets an unverified tree: {label}")
+        if (label == "com.mikebook.train-construction"
+                and isinstance(plist.get("EnvironmentVariables"), dict)
+                and any(key.startswith("TRAIN_") for key in plist["EnvironmentVariables"])):
+            raise JgError("train-construction-runtime_override_unverified")
+        if label == "com.mikebook.train-construction":
+            for variable in (
+                "TRAIN_PROMOTION_RUNTIME_ROOT", "TRAIN_PROMOTION_REPO",
+                "TRAIN_CONSTRUCTION_SCRATCH_ROOT", "TRAIN_PROMOTION_STATE_DIR",
+                "TRAIN_PROMOTION_SHADOW_LOCK_DIR", "TRAIN_CONSTRUCTION_ENV_PATH",
+            ):
+                configured = subprocess.run(
+                    ["launchctl", "getenv", variable], capture_output=True,
+                    text=True, check=False, timeout=5,
+                )
+                if configured.returncode or configured.stdout.strip():
+                    raise JgError("train-construction-runtime_override_unverified")
         check = subprocess.run(["launchctl", "print", f"gui/{uid}/{label}"],
                                capture_output=True, text=True, check=False, timeout=10)
         if check.returncode or f"path = {plist_path}" not in check.stdout:
@@ -297,8 +414,6 @@ def _verify_loaded_runtime_jobs(home: Path, runtime_roots: tuple[Path, ...]) -> 
             if not (cwd_path and cwd_path == expected_cwd and executable_evidence):
                 raise JgError(f"runtime_adoption_unverified: creator process is not running from the reviewed tree: {label}")
         jobs.append((label, str(plist_path.resolve()), str(root)))
-    if any(label == "com.mikebook.train-construction" for label, _plist, _root in jobs):
-        raise JgError("creator_runtime_inventory_incomplete: train-construction checks out mutable origin/main into a separate runtime")
     return tuple(jobs)
 
 
@@ -322,8 +437,12 @@ def resolve_production_creator_capability(repository: str | Path) -> CreatorLeas
         if runtime_roots[-1] in str(exc) or "hook digest mismatch" in str(exc):
             raise JgError("canonical_creator_unverified: canonical Home Lab source does not match reviewed hooks") from exc
         raise
-    jobs = _verify_loaded_runtime_jobs(Path.home(), runtime_roots)
-    return CreatorLeaseCapability(common_dir, runtime_roots, digests, jobs, lock_root)
+    home = Path.home()
+    jobs = _verify_loaded_runtime_jobs(home, runtime_roots)
+    train_runtime, train_commit, train_digests = _verify_train_construction_runtime(home, common_dir)
+    return CreatorLeaseCapability(common_dir, runtime_roots,
+                                  (*digests, *train_digests), jobs, lock_root,
+                                  train_runtime, train_commit)
 
 
 def build_disposable_fixture_inventory(repository: str | Path, branches: list[str],
@@ -745,6 +864,7 @@ def reconcile_interrupted_cleanup(repo: str | Path, plan: Mapping[str, Any],
             raise JgError("disposable fixture capability is stale or unavailable")
     else:
         raise JgError("cleanup reconciliation requires a verified lease capability")
+    receipt_metadata = capability_receipt_metadata(capability)
     plan_digest = str(plan.get("plan_digest") or "")
     bundle = plan.get("bundle")
     if (not plan_digest or _plan_digest(plan) != plan_digest
@@ -780,8 +900,10 @@ def reconcile_interrupted_cleanup(repo: str | Path, plan: Mapping[str, Any],
                 or plan["main"].get("name") != main
                 or plan["main"].get("tip") != main_tip
                 or intent.get("bundle_sha256") != bundle.get("sha256")
+                or intent.get("creator_capability_sha256") != receipt_metadata["creator_capability_sha256"]
+                or intent.get("creator_runtime_commit") != receipt_metadata["creator_runtime_commit"]
                 or action_id != cleanup_action_id(plan_digest, index, branch, tip)):
-            raise JgError("cleanup journal intent does not match the approved plan")
+            raise JgError("cleanup journal intent does not match the approved plan or creator capability")
         if isinstance(capability, CreatorLeaseCapability) and not production_capability_is_current(capability, root):
             raise JgError("production creator hook capability changed during reconciliation")
         if isinstance(capability, DisposableFixtureLeaseCapability) and not capability.is_current(root):
@@ -808,7 +930,7 @@ def reconcile_interrupted_cleanup(repo: str | Path, plan: Mapping[str, Any],
                 "plan_digest": plan_digest, "branch": branch, "tip": tip,
                 "destination": main, "destination_tip": main_tip,
                 "observed_destination_tip": _ref_tip(root, main),
-                "status": status, "restored": restored,
+                "status": status, "restored": restored, **receipt_metadata,
             }
             journal.append(result)
             results.append(result)
@@ -818,7 +940,8 @@ def reconcile_interrupted_cleanup(repo: str | Path, plan: Mapping[str, Any],
 __all__ = [
     "COOPERATIVE_LEASE_CONTRACT", "REQUIRED_HOME_LAB_CREATORS",
     "CreatorLeaseCapability", "DisposableFixtureLeaseCapability",
-    "resolve_production_creator_capability", "build_disposable_fixture_inventory",
+    "resolve_production_creator_capability", "capability_receipt_metadata",
+    "build_disposable_fixture_inventory",
     "resolve_disposable_fixture_capability", "default_cleanup_journal_path",
     "CleanupActionJournal", "CooperativeBranchLeaseAdapter",
     "cleanup_action_id", "reconcile_interrupted_cleanup",

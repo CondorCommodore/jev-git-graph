@@ -7,19 +7,18 @@ ID, or human disposition does not make a branch removable.
 
 ## Current integration status
 
-The production creator gate remains closed. The package now has a concrete
-lease capability resolver and `jg cleanup execute` passes that adapter and a
-durable journal to the executor. The known Home Lab checkout has not yet
-demonstrated all required creator hooks, so production execution fails closed.
-The required integration files are `scripts/bootstrap-worktree.sh` (also the L1 path through
-`scripts/l1_drain/workspace.py`), `scripts/new-worktree.sh`,
-`scripts/overnight-codex-backlog-round.sh`, `scripts/ahc_app/coord_wake.py`,
-`scripts/process-safe-prs.sh`, `scripts/pr_gate/guard_execution.py`,
-`scripts/merge_train_parts/prescreen.py`, and
-`scripts/train_construction_driver.py`. A disposable installed-wheel fixture
-has exercised execute and interrupted-action reconciliation, including
-post-delete capability drift; that fixture does not establish production
-creator participation or authorize Home Lab deletion.
+The CLI passes a production lease adapter and durable journal only after the
+capability resolver verifies the closed Home Lab creator-hook digest set, the
+configured and loaded LaunchAgents, and their running process locations. The
+train-construction job loads code from a separate worktree after fetching
+`origin/main`; its live worktree must be clean, registered with the same Git
+common directory, exactly at the current local `origin/main` commit, and match
+the reviewed hook digests. Runtime overrides or drift keep production execution
+in plan-only mode. Capability is rechecked during execution, so changes to the
+creator runtime stop later branch actions. A disposable installed-wheel fixture
+exercises execute and interrupted-action reconciliation, including
+post-delete capability drift; it does not establish production creator
+participation or authorize Home Lab deletion.
 
 ## Plan
 
@@ -49,13 +48,13 @@ covering the complete approved or unapproved plan.
 ## Execution gates
 
 `execute_cleanup` accepts a `CooperativeBranchLeaseAdapter` and an explicit
-`journal_path`. The adapter uses a cross-process lock keyed by repository and
-branch. Each creator registers its exact adapter id at startup and holds
-`creator_operation(creator_id, branch, expected_tip)` around the whole operation,
-starting before any branch/ref creation, worktree creation, or checkout and
-ending after publication. Cleanup holds `cleanup_operation` across reproof,
-intent journaling, compare-and-delete, result journaling, and release. A callback
-or registration made after the operation does not count as creator participation.
+`journal_path`. Home Lab's shared `cooperative_branch_lease.py` helper and the
+Jev adapter use the same cross-process lock key, derived from the Git common
+directory and branch name. Creator wrappers hold the lock before ref/worktree
+creation or checkout and through publication. Cleanup holds `cleanup_operation`
+across reproof, intent journaling, compare-and-delete, result journaling, and
+release. The adapter's in-memory registration API is diagnostic; production
+authority comes from the verified installed creator capability above.
 
 The `CleanupActionJournal` is owner-only append-only JSONL. It fsyncs an intent
 before each ref mutation and a result afterward. Keep its path outside every
@@ -64,7 +63,10 @@ inspected worktree, alongside the recovery bundle. After interruption, call
 new execution. Reconciliation checks the exact branch under the cooperative
 lock, restores an absent branch from the verified bundle only with
 compare-and-create, and records moved or recreated refs without replacing them.
-It never retries deletion.
+It never retries deletion. Each intent/result also records a sanitized creator
+capability digest and, for production, the verified train-construction runtime
+commit. Reconciliation requires the pending intent's capability metadata to
+match the current verified capability before restoring or recording it.
 
 `execute_cleanup(repo, plan, approved_digest=..., lease_contract=...,
 journal_path=...)` checks the exact plan digest and bundle hash and approval

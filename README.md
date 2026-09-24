@@ -2,7 +2,7 @@
 
 Find the relationships among Git branches, commits, worktrees, stashes, and pull requests so a maintainer can return a repository to a clean, understood state without losing work.
 
-The default workflow is a **read-only local CLI**. Git provides the facts and an in-memory graph. Jev answers small, typed questions about relationships that Git ancestry alone cannot establish. A maintainer reviews the resulting preservation and cleanup plan. A separate, digest-approved executor has strict recovery and lease gates; without an integrated lease it leaves refs intact.
+The default workflow is a **read-only local CLI**. Git provides the facts and an in-memory graph. Jev answers small, typed questions about relationships that Git ancestry alone cannot establish. A maintainer reviews the resulting preservation and cleanup plan. A separate, digest-approved executor has strict recovery and verified creator-lease gates; missing or stale runtime proof leaves refs intact.
 
 ## Use with a private repository
 
@@ -26,7 +26,7 @@ jg plan --repo /path/to/repository --inventory /path/to/private-artifacts/invent
 
 `coverage.json` records exact source/main blob, mode, and deletion comparisons for each local branch. Branches active within 24 hours or lacking activity evidence remain `UNKNOWN`. `jg residual --repo PATH --coverage COVERAGE --branch NAME --out PRIVATE_DIR` can simulate a merge and propose Python definition moves in an independent disposable repository; those suggestions never establish exact preservation.
 
-`jg cleanup plan --repo PATH --coverage COVERAGE --out PRIVATE_DIR` prepares at most 25 strict `EXACT` local refs and verifies a recovery bundle in an independent repository. Review the resulting `cleanup-plan.json` and its `plan_digest`. `jg cleanup approve --repo PATH --plan PLAN --approved-digest SHA256 --out NEW_PRIVATE_DIR` records approval of that exact manifest and emits a new approved digest. `jg cleanup execute --repo PATH --plan APPROVED_PLAN --approved-digest NEW_SHA256` checks the lease gate; the CLI has no worktree-creator lease integration and therefore leaves refs intact. See [guarded cleanup](docs/cleanup.md).
+`jg cleanup plan --repo PATH --coverage COVERAGE --out PRIVATE_DIR` prepares at most 25 strict `EXACT` local refs and verifies a recovery bundle in an independent repository. Review the resulting `cleanup-plan.json` and its `plan_digest`. `jg cleanup approve --repo PATH --plan PLAN --approved-digest SHA256 --out NEW_PRIVATE_DIR` records approval of that exact manifest and emits a new approved digest. `jg cleanup execute --repo PATH --plan APPROVED_PLAN --approved-digest NEW_SHA256` revalidates the production creator lease, journal, recovery bundle, and live branch state; if any proof is missing or stale it leaves refs intact. See [guarded cleanup](docs/cleanup.md).
 
 `relate` writes only a local preview by default. A live Jev request requires an approved preview digest, `--use-jev`, and `TYPESAFE_API_KEY` in the process environment. It is hard-capped by default at **one request and 8,192 payload bytes**; raising either cap requires an explicit command-line override after reviewing the preview. The default `--evidence-profile minimal` keeps labels, commit subjects, and path names out of the request. The explicit `review` profile adds preview-visible labels, normalized subjects, and bounded paths when the operator decides that context may leave the machine. There are no OpenAI, Codex, Claude, or agent-loop calls in this project. Read the preview before approving it.
 

@@ -13,7 +13,11 @@ from jev_git_graph.cleanup import (_atomic_delete,
 from jev_git_graph.cli import main as jg_main
 from jev_git_graph.coordinator import (CleanupActionJournal,
                                        CooperativeBranchLeaseAdapter,
+                                       _common_dir,
+                                       _verify_train_construction_runtime,
+                                       _verify_runtime_hook_files,
                                        build_disposable_fixture_inventory,
+                                       capability_receipt_metadata,
                                        cleanup_action_id,
                                        reconcile_interrupted_cleanup)
 from jev_git_graph.errors import JgError
@@ -58,6 +62,60 @@ def build_old_plan(*args, **kwargs):
 
 
 class CleanupTests(unittest.TestCase):
+    def test_unreviewed_creator_hook_digest_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory)
+            helper = runtime / "scripts/cooperative_branch_lease.py"
+            helper.parent.mkdir()
+            helper.write_text('CONTRACT = "jev-git-graph/cooperative-branch-lease-v1"\n')
+            with patch("jev_git_graph.coordinator._REVIEWED_HOOK_FILES", {
+                    "scripts/cooperative_branch_lease.py": "0" * 64}):
+                with self.assertRaisesRegex(JgError, "creator runtime hook digest mismatch"):
+                    _verify_runtime_hook_files(runtime)
+
+    def test_train_construction_requires_live_clean_origin_main_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "repo"
+            repository.mkdir()
+            run(repository, "init", "-q", "-b", "main")
+            run(repository, "config", "user.name", "Fixture")
+            run(repository, "config", "user.email", "fixture@example.invalid")
+            contents = {
+                "scripts/cooperative_branch_lease.py": (
+                    'CONTRACT = "jev-git-graph/cooperative-branch-lease-v1"\n'),
+                "scripts/train_builder.py": "# pinned train builder\n",
+                "scripts/train_construction_driver.py": "# pinned driver\n",
+                "launchd/start-train-construction.sh": "#!/bin/sh\nexit 0\n",
+            }
+            expected = {}
+            for relative, content in contents.items():
+                path = repository / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content)
+                expected[relative] = hashlib.sha256(content.encode()).hexdigest()
+            run(repository, "add", ".")
+            run(repository, "commit", "-qm", "reviewed creator snapshot")
+            run(repository, "update-ref", "refs/remotes/origin/main", "HEAD")
+
+            home = root / "home"
+            runtime = home / ".local/share/home-lab/train-promotion-runtime"
+            runtime.parent.mkdir(parents=True)
+            run(repository, "worktree", "add", "--detach", str(runtime), "HEAD")
+            with patch("jev_git_graph.coordinator._REVIEWED_HOOK_FILES", expected):
+                verified_root, verified_commit, records = _verify_train_construction_runtime(
+                    home, _common_dir(repository))
+                self.assertEqual(runtime.resolve(), verified_root)
+                self.assertEqual(run(repository, "rev-parse", "HEAD"), verified_commit)
+                self.assertEqual(len(expected), len(records))
+
+                (repository / "scripts/train_construction_driver.py").write_text("# changed driver\n")
+                run(repository, "add", ".")
+                run(repository, "commit", "-qm", "new origin main")
+                run(repository, "update-ref", "refs/remotes/origin/main", "HEAD")
+                with self.assertRaisesRegex(JgError, "train-construction-runtime_snapshot_mismatch"):
+                    _verify_train_construction_runtime(home, _common_dir(repository))
+
     def integrated_lease(self, repository: Path) -> CooperativeBranchLeaseAdapter:
         fixture_root = repository.parent
         inventory = build_disposable_fixture_inventory(
@@ -229,6 +287,12 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual("deleted", events[-1]["status"])
         self.assertEqual(topic_tip, events[0]["tip"])
         self.assertEqual(main_tip, events[-1]["observed_destination_tip"])
+        self.assertEqual(events[0]["creator_capability_sha256"],
+                         events[-1]["creator_capability_sha256"])
+        self.assertEqual(64, len(events[-1]["creator_capability_sha256"]))
+        self.assertIsNone(events[-1]["creator_runtime_commit"])
+        self.assertEqual(events[-1]["creator_capability_sha256"],
+                         result["creator_capability_sha256"])
         self.assertFalse(_ref_exists(repo, "topic"))
 
     def test_capability_drift_after_branch_lock_blocks_ref_transaction(self):
@@ -315,6 +379,12 @@ class CleanupTests(unittest.TestCase):
             plan = build_old_plan(repo, coverage, bundle_dir=root / "bundle")
             approved = approve_cleanup_plan(plan, approved_digest=plan["plan_digest"])
             action_id = cleanup_action_id(approved["plan_digest"], 0, "topic", topic_tip)
+            fixture_root = repo.parent
+            inventory = build_disposable_fixture_inventory(
+                repo, ["topic"], operator="interrupted fixture", fixture_root=fixture_root)
+            lease = CooperativeBranchLeaseAdapter.for_disposable_fixture(
+                repo, inventory, ["topic"], fixture_root=fixture_root)
+            receipt = capability_receipt_metadata(lease.capability)
             journal = CleanupActionJournal(root / "actions.jsonl")
             journal.append({
                 "event": "intent", "action_id": action_id,
@@ -322,13 +392,9 @@ class CleanupTests(unittest.TestCase):
                 "branch": "topic",
                 "tip": topic_tip, "destination": "main", "destination_tip": main_tip,
                 "bundle_sha256": approved["bundle"]["sha256"],
+                **receipt,
             })
-            fixture_root = repo.parent
-            inventory = build_disposable_fixture_inventory(
-                repo, ["topic"], operator="interrupted fixture", fixture_root=fixture_root)
             run(repo, "update-ref", "-d", "refs/heads/topic", topic_tip)
-            lease = CooperativeBranchLeaseAdapter.for_disposable_fixture(
-                repo, inventory, ["topic"], fixture_root=fixture_root)
             results = reconcile_interrupted_cleanup(repo, approved, journal, lease)
             restored_tip = run(repo, "rev-parse", "refs/heads/topic")
             events = journal.read_events()
@@ -336,7 +402,34 @@ class CleanupTests(unittest.TestCase):
         self.assertTrue(results[0]["restored"])
         self.assertEqual(topic_tip, restored_tip)
         self.assertEqual("reconciled", events[-1]["event"])
+        self.assertEqual(receipt["creator_capability_sha256"],
+                         events[-1]["creator_capability_sha256"])
         self.assertEqual([], journal.pending_intents(plan_digest=approved["plan_digest"]))
+
+    def test_interrupted_reconciliation_rejects_changed_creator_receipt(self):
+        repo, topic_tip, main_tip = self.make_repo()
+        coverage = coverage_for(repo, [{"name": "topic", "tip": topic_tip, "main_tip": main_tip,
+                                       "verdict": "EXACT", "reason": None, "last_activity_epoch": 1,
+                                       "paths": [{"path": "topic", "verdict": "EXACT_PRESENT"}]}])
+        with tempfile.TemporaryDirectory() as out:
+            root = Path(out)
+            plan = build_old_plan(repo, coverage, bundle_dir=root / "bundle")
+            approved = approve_cleanup_plan(plan, approved_digest=plan["plan_digest"])
+            lease = self.integrated_lease(repo)
+            receipt = capability_receipt_metadata(lease.capability)
+            action_id = cleanup_action_id(approved["plan_digest"], 0, "topic", topic_tip)
+            journal = CleanupActionJournal(root / "actions.jsonl")
+            journal.append({
+                "event": "intent", "action_id": action_id,
+                "plan_digest": approved["plan_digest"], "candidate_index": 0,
+                "branch": "topic", "tip": topic_tip,
+                "destination": "main", "destination_tip": main_tip,
+                "bundle_sha256": approved["bundle"]["sha256"],
+                **{**receipt, "creator_capability_sha256": "0" * 64},
+            })
+            with self.assertRaisesRegex(JgError, "creator capability"):
+                reconcile_interrupted_cleanup(repo, approved, journal, lease)
+            self.assertEqual(topic_tip, run(repo, "rev-parse", "refs/heads/topic"))
 
     def test_interrupted_reconciliation_preserves_recreated_ref(self):
         repo, topic_tip, main_tip = self.make_repo()
@@ -348,6 +441,8 @@ class CleanupTests(unittest.TestCase):
             plan = build_old_plan(repo, coverage, bundle_dir=root / "bundle")
             approved = approve_cleanup_plan(plan, approved_digest=plan["plan_digest"])
             action_id = cleanup_action_id(approved["plan_digest"], 0, "topic", topic_tip)
+            fixture_root = repo.parent
+            receipt = capability_receipt_metadata(self.integrated_lease(repo).capability)
             journal = CleanupActionJournal(root / "actions.jsonl")
             journal.append({
                 "event": "intent", "action_id": action_id,
@@ -355,6 +450,7 @@ class CleanupTests(unittest.TestCase):
                 "branch": "topic",
                 "tip": topic_tip, "destination": "main", "destination_tip": main_tip,
                 "bundle_sha256": approved["bundle"]["sha256"],
+                **receipt,
             })
             run(repo, "branch", "--force", "topic", main_tip)
             lease = self.integrated_lease(repo)
