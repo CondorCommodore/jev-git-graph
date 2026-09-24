@@ -17,6 +17,9 @@ from jev_git_graph.cli import main as jg_main
 from jev_git_graph.coordinator import (CleanupActionJournal,
                                        CooperativeBranchLeaseAdapter,
                                        CreatorLeaseCapability,
+                                       _REVIEWED_DEPLOY_SYNC_RUNTIME_COMPAT_SHA,
+                                       _REVIEWED_HOOK_FILES,
+                                       _is_reviewed_runtime_hook_digest,
                                        _common_dir,
                                        _attest_process_generation,
                                        _verify_process_startup_attestation,
@@ -256,6 +259,53 @@ class CleanupTests(unittest.TestCase):
                     "scripts/cooperative_branch_lease.py": "0" * 64}):
                 with self.assertRaisesRegex(JgError, "creator runtime hook digest mismatch"):
                     _verify_runtime_hook_files(runtime)
+
+    def test_deploy_sync_runtime_digest_accepts_only_reviewed_variants(self):
+        reviewed = _REVIEWED_HOOK_FILES["scripts/deploy_sync.py"]
+        compatible = _REVIEWED_DEPLOY_SYNC_RUNTIME_COMPAT_SHA
+        self.assertTrue(_is_reviewed_runtime_hook_digest(
+            "scripts/deploy_sync.py", reviewed, reviewed))
+        self.assertTrue(_is_reviewed_runtime_hook_digest(
+            "scripts/deploy_sync.py", reviewed, compatible))
+        self.assertFalse(_is_reviewed_runtime_hook_digest(
+            "scripts/deploy_sync.py", reviewed, "0" * 64))
+        self.assertFalse(_is_reviewed_runtime_hook_digest(
+            "scripts/cooperative_branch_lease.py", "1" * 64, compatible))
+
+    def test_deploy_sync_hash_change_remains_a_capability_change(self):
+        root = Path("/fixture/home-lab")
+        roots = (root / "stable", root / "compat", root / "canonical")
+        relative = "scripts/deploy_sync.py"
+        original_sha = _REVIEWED_HOOK_FILES[relative]
+        compatible_sha = _REVIEWED_DEPLOY_SYNC_RUNTIME_COMPAT_SHA
+        expected = CreatorLeaseCapability(
+            common_dir=root / ".git", runtime_roots=roots, hook_digests=tuple(
+                (str(runtime_root), relative, original_sha) for runtime_root in roots
+            ), loaded_runtime_jobs=(), lock_root=root / "locks",
+            train_construction_runtime=root / "train-runtime",
+            train_construction_commit=None,
+        )
+        current_hooks = tuple(
+            (str(runtime_root), relative,
+             compatible_sha if runtime_root == roots[0] else original_sha)
+            for runtime_root in roots
+        )
+        current = replace(expected, hook_digests=current_hooks)
+        with patch("jev_git_graph.coordinator.resolve_production_creator_capability",
+                   return_value=current):
+            diagnostic = production_capability_diagnostic(expected, root)
+        self.assertFalse(diagnostic["ok"])
+        self.assertEqual(["hook_digests"], diagnostic["changed_fields"])
+        self.assertEqual({"added_count": 1, "removed_count": 1},
+                         diagnostic["hook_changes"])
+
+        self.assertIn((str(roots[0]), relative, compatible_sha), current.hook_digests)
+        self.assertIn((str(roots[1]), relative, original_sha), current.hook_digests)
+        self.assertIn((str(roots[2]), relative, original_sha), current.hook_digests)
+        self.assertNotEqual(
+            capability_receipt_metadata(expected)["creator_capability_sha256"],
+            capability_receipt_metadata(current)["creator_capability_sha256"],
+        )
 
     def test_train_construction_requires_live_clean_origin_main_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
