@@ -67,7 +67,7 @@ _REVIEWED_HOOK_FILES = {
     "scripts/merge_train_parts/local_guard_verdict.py": "fc36b0b3544acfd2a43871eb829b4479d3019b765a4e7ad29e5f12686f5319bf",
     "scripts/pr_gate/guard_execution.py": "91dba3571398639d0456a72eae929377b483bab8d376db3daf7c079fcd5b3c7c",
     "scripts/merge_train_parts/candidate_lifecycle.py": "c35db21b44c0d9024b68f802c46f13c9c3e70e0a5ead3eabd45a8c3240d1450e",
-    "scripts/merge_train_parts/verdict_lifecycle.py": "eed5e98a608c7998f10d1c9e9a2c8f240d25d08863901438a1dc3e789a4f98c6",
+    "scripts/merge_train_parts/verdict_lifecycle.py": "df6d1e16a71a3ccbbf8c556d7172375324997321ef723558b23bec8806b3e164",
     "scripts/train_builder.py": "289c985aaf9d8b9b00f3934ba767eee9114773240ec67a44207d74625d8ab367",
     "scripts/train_construction_driver.py": "4b9c1631c0b940d6df18ae1987fcef9801776a03ff3a6f1abd98e60059403b70",
     "launchd/start-train-construction.sh": "0f42fc8d72145a5f1845770317e88b677d25fca3d0939633ff79316419903e8f",
