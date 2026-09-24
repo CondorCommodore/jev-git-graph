@@ -5,6 +5,7 @@ from collections import Counter, defaultdict, deque
 from pathlib import Path
 
 from .errors import JgError
+from .code_evidence import _path as checked_code_path
 from .groups import _family, _validate
 from .safety import digest, read_json, write_json, write_private_text
 
@@ -342,6 +343,14 @@ def build_study_range_manifest(study: dict, main_tip: str) -> dict:
         if not isinstance(source_range, dict):
             omissions.append({"contribution_id": case["contribution_id"], "reason": "source_definition_range_unavailable"})
             continue
+        try:
+            checked_code_path(source["path"])
+            for candidate in case["destination_candidates"]:
+                checked_code_path(candidate["path"])
+        except JgError:
+            omissions.append({"contribution_id": case["contribution_id"],
+                              "reason": "code_evidence_path_denied"})
+            continue
         source_chunks = chunks(source_range)
         specs = []
         candidates = case["destination_candidates"]
@@ -375,6 +384,7 @@ def build_study_range_manifest(study: dict, main_tip: str) -> dict:
                               "reason": "complete_definition_exceeds_evidence_bounds"})
             continue
         ranges.append({"contribution_id": case["contribution_id"],
+                       **({"arm": "source_only_unknown"} if not candidates else {}),
                        "source_tip": source["source_tip"], "destination_tip": main_tip,
                        "ranges": specs})
     return {"kind": "branch-presence-range-manifest", "schema_version": 1,
