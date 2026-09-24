@@ -18,6 +18,7 @@ from .coordinator import (DISPOSABLE_FIXTURE_ROOT, CleanupActionJournal, Coopera
                           _common_dir, default_cleanup_journal_path,
                           reconcile_interrupted_cleanup)
 from .code_evidence import approve_code_batch, build_code_evidence, build_transient_preview
+from .credential_cache import KeychainLease, credential_status, resolve_provider_token, serve_cache_form
 from .decisions import write_decisions
 from .equivalence import write_equivalence
 from .errors import JgError
@@ -286,6 +287,12 @@ def parser() -> argparse.ArgumentParser:
     root.add_argument("--version", action="version", version=__version__)
     commands = root.add_subparsers(dest="command", required=True)
 
+    credential = commands.add_parser("credential", help="manage a 48-hour Jev Keychain credential lease")
+    credential_actions = credential.add_subparsers(dest="credential_action", required=True)
+    credential_actions.add_parser("cache", help="open a one-time local form for Jev_Key")
+    credential_actions.add_parser("status", help="show cache expiry without reading the key aloud")
+    credential_actions.add_parser("clear", help="remove the cached Jev key")
+
     inventory = commands.add_parser("inventory", help="collect a read-only local Git snapshot")
     inventory.add_argument("--repo", required=True)
     inventory.add_argument("--out", required=True)
@@ -519,6 +526,13 @@ def _protected_output(repo: str, output: str) -> Path:
 
 
 def run(args: argparse.Namespace) -> str:
+    if args.command == "credential":
+        if args.credential_action == "cache":
+            return serve_cache_form()
+        if args.credential_action == "status":
+            return credential_status()
+        if args.credential_action == "clear":
+            return "Jev Keychain cache cleared" if KeychainLease().clear() else "Jev Keychain cache was absent"
     if args.command == "group-relate":
         if args.execute and args.answers:
             raise JgError("choose either approved Jev execution or answer import")
@@ -561,7 +575,7 @@ def run(args: argparse.Namespace) -> str:
                 approved_approval_sha256=args.approved_approval_sha256,
                 max_workers=args.max_workers, checkpoint=checkpoint,
                 code_evidence_repo=object_repo,
-                token=os.environ.get("TYPESAFE_API_KEY"),
+                token=resolve_provider_token(),
                 execution_receipt_path=target / "presence-execution-receipt.json")
             response_path = target / "presence-execution.json"
             write_json(response_path, result)
