@@ -10,6 +10,11 @@ ID, or human disposition does not make a branch removable.
 The CLI passes a production lease adapter and durable journal only after the
 capability resolver verifies the closed Home Lab creator-hook digest set, the
 configured and loaded LaunchAgents, and their running process locations. The
+active PID and process start time must be readable, and the process must have
+started after every reviewed hook file in its runtime was last changed; the
+resulting process generation is included in the ephemeral capability digest.
+An idle job, unknown start time, or older process keeps production execution in
+plan-only mode until the creator is relaunched from the reviewed tree. The
 train-construction job loads code from a separate worktree after fetching
 `origin/main`; its live worktree must be clean, registered with the same Git
 common directory, exactly at the current local `origin/main` commit, and match

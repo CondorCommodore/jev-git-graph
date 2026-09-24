@@ -126,7 +126,7 @@ class CreatorLeaseCapability:
     common_dir: Path
     runtime_roots: tuple[Path, ...]
     hook_digests: tuple[tuple[str, str, str], ...]
-    loaded_runtime_jobs: tuple[tuple[str, str, str], ...]
+    loaded_runtime_jobs: tuple[tuple[str, str, str, str], ...]
     lock_root: Path
     train_construction_runtime: Path
     train_construction_commit: str
@@ -177,7 +177,8 @@ def capability_receipt_metadata(
             "scope": scope,
             "runtime_commit": runtime_commit,
             "hooks": sorted(hooks),
-            "jobs": sorted(label for label, _plist, _root in capability.loaded_runtime_jobs),
+            "jobs": sorted((label, generation) for label, _plist, _root, generation
+                           in capability.loaded_runtime_jobs),
         }
     elif isinstance(capability, DisposableFixtureLeaseCapability):
         scope = capability.scope
@@ -332,10 +333,30 @@ def _verify_train_construction_runtime(
     return root, head, hook_digests
 
 
-def _verify_loaded_runtime_jobs(home: Path, runtime_roots: tuple[Path, ...]) -> tuple[tuple[str, str, str], ...]:
+def _attest_process_generation(runtime_root: Path, pid: int, started_at: float) -> str:
+    """Bind a live process generation to the exact reviewed hook bytes on disk.
+
+    A path and cwd check alone accepts a long-lived process that imported older
+    Python code before the reviewed lease hook was installed. Fail closed unless
+    the process started after every hook file in this runtime was last changed.
+    """
+    hooks = _verify_runtime_hook_files(runtime_root)
+    latest_hook_mtime = max((runtime_root / relative).stat().st_mtime
+                            for _root, relative, _sha in hooks)
+    if started_at < latest_hook_mtime:
+        raise JgError("runtime_adoption_unverified: creator process predates reviewed hook bytes")
+    return digest({
+        "pid": pid,
+        "started_at": datetime.fromtimestamp(started_at, timezone.utc).isoformat(),
+        "runtime_root_sha256": hashlib.sha256(str(runtime_root.resolve()).encode()).hexdigest(),
+        "hooks": sorted((relative, sha) for _root, relative, sha in hooks),
+    })
+
+
+def _verify_loaded_runtime_jobs(home: Path, runtime_roots: tuple[Path, ...]) -> tuple[tuple[str, str, str, str], ...]:
     """Verify configured launchd entrypoints and their currently loaded processes."""
     expected_roots = {selector: root for selector, root in zip(_RUNTIME_SELECTORS, runtime_roots)}
-    jobs: list[tuple[str, str, str]] = []
+    jobs: list[tuple[str, str, str, str]] = []
     uid = os.getuid()
     for label, selector in sorted(_REQUIRED_LAUNCHD_SELECTORS.items()):
         plist_path = home / "Library/LaunchAgents" / f"{label}.plist"
@@ -394,26 +415,35 @@ def _verify_loaded_runtime_jobs(home: Path, runtime_roots: tuple[Path, ...]) -> 
             if match:
                 pid = int(match.group(1))
                 break
-        if pid is not None:
-            process = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
-                                     capture_output=True, text=True, check=False, timeout=5)
-            cwd_result = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
-                                        capture_output=True, text=True, check=False, timeout=5)
-            cwd = next((line[1:] for line in cwd_result.stdout.splitlines()
-                        if line.startswith("n/") and cwd_result.returncode == 0), None)
-            cwd_path = Path(cwd).resolve(strict=False) if cwd else None
-            argv = shlex.split(process.stdout) if process.returncode == 0 else []
-            expected_process = (root / process_rel).resolve(strict=False)
-            executable_evidence = False
-            for token in argv:
-                token_path = Path(token)
-                candidate = token_path if token_path.is_absolute() else ((cwd_path / token_path) if cwd_path else Path("/nonexistent"))
-                if candidate.is_file() and candidate.resolve(strict=False) == expected_process:
-                    executable_evidence = True
-            expected_cwd = root if cwd_scope == "runtime" else runtime_roots[-1]
-            if not (cwd_path and cwd_path == expected_cwd and executable_evidence):
-                raise JgError(f"runtime_adoption_unverified: creator process is not running from the reviewed tree: {label}")
-        jobs.append((label, str(plist_path.resolve()), str(root)))
+        if pid is None:
+            raise JgError(f"runtime_adoption_unverified: creator job has no active PID: {label}")
+        process = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                                 capture_output=True, text=True, check=False, timeout=5)
+        start_result = subprocess.run(["ps", "-p", str(pid), "-o", "lstart="],
+                                      capture_output=True, text=True, check=False, timeout=5)
+        cwd_result = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                                    capture_output=True, text=True, check=False, timeout=5)
+        cwd = next((line[1:] for line in cwd_result.stdout.splitlines()
+                    if line.startswith("n/") and cwd_result.returncode == 0), None)
+        cwd_path = Path(cwd).resolve(strict=False) if cwd else None
+        argv = shlex.split(process.stdout) if process.returncode == 0 else []
+        expected_process = (root / process_rel).resolve(strict=False)
+        executable_evidence = False
+        for token in argv:
+            token_path = Path(token)
+            candidate = token_path if token_path.is_absolute() else ((cwd_path / token_path) if cwd_path else Path("/nonexistent"))
+            if candidate.is_file() and candidate.resolve(strict=False) == expected_process:
+                executable_evidence = True
+        expected_cwd = root if cwd_scope == "runtime" else runtime_roots[-1]
+        if (not cwd_path or cwd_path != expected_cwd or not executable_evidence
+                or process.returncode != 0 or start_result.returncode != 0):
+            raise JgError(f"runtime_adoption_unverified: creator process is not running from the reviewed tree: {label}")
+        try:
+            started_at = datetime.strptime(start_result.stdout.strip(), "%a %b %d %H:%M:%S %Y").timestamp()
+        except (ValueError, OverflowError):
+            raise JgError(f"runtime_adoption_unverified: creator process start time is unavailable: {label}") from None
+        generation = _attest_process_generation(root, pid, started_at)
+        jobs.append((label, str(plist_path.resolve()), str(root), generation))
     return tuple(jobs)
 
 

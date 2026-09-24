@@ -14,6 +14,7 @@ from jev_git_graph.cli import main as jg_main
 from jev_git_graph.coordinator import (CleanupActionJournal,
                                        CooperativeBranchLeaseAdapter,
                                        _common_dir,
+                                       _attest_process_generation,
                                        _verify_train_construction_runtime,
                                        _verify_runtime_hook_files,
                                        build_disposable_fixture_inventory,
@@ -62,6 +63,22 @@ def build_old_plan(*args, **kwargs):
 
 
 class CleanupTests(unittest.TestCase):
+    def test_creator_generation_must_start_after_reviewed_hook_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory)
+            helper = runtime / "scripts/cooperative_branch_lease.py"
+            helper.parent.mkdir()
+            contents = 'CONTRACT = "jev-git-graph/cooperative-branch-lease-v1"\n'
+            helper.write_text(contents)
+            os.utime(helper, (1_000, 1_000))
+            with patch("jev_git_graph.coordinator._REVIEWED_HOOK_FILES", {
+                    "scripts/cooperative_branch_lease.py": hashlib.sha256(contents.encode()).hexdigest()}):
+                with self.assertRaisesRegex(JgError, "process predates reviewed hook bytes"):
+                    _attest_process_generation(runtime, 123, 999)
+                first_generation = _attest_process_generation(runtime, 123, 1_001)
+                restarted_generation = _attest_process_generation(runtime, 456, 1_001)
+                self.assertNotEqual(first_generation, restarted_generation)
+
     def test_unreviewed_creator_hook_digest_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             runtime = Path(directory)
