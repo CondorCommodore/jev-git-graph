@@ -5,6 +5,7 @@ import plistlib
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -15,6 +16,7 @@ from jev_git_graph.cleanup import (_atomic_delete,
 from jev_git_graph.cli import main as jg_main
 from jev_git_graph.coordinator import (CleanupActionJournal,
                                        CooperativeBranchLeaseAdapter,
+                                       CreatorLeaseCapability,
                                        _common_dir,
                                        _attest_process_generation,
                                        _verify_process_startup_attestation,
@@ -24,6 +26,7 @@ from jev_git_graph.coordinator import (CleanupActionJournal,
                                        build_disposable_fixture_inventory,
                                        capability_receipt_metadata,
                                        cleanup_action_id,
+                                       production_capability_diagnostic,
                                        reconcile_interrupted_cleanup)
 from jev_git_graph.errors import JgError
 from jev_git_graph.inventory import build_inventory
@@ -536,6 +539,189 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(4, calls)
         self.assertEqual(topic_tip, run(repo, "rev-parse", "topic"))
         self.assertEqual(["intent", "result"], [event["event"] for event in events])
+
+    def test_post_intent_capability_drift_is_recorded_from_exact_check(self):
+        repo, topic_tip, main_tip = self.make_repo(old_commits=True)
+        coverage = coverage_for(repo, [{"name": "topic", "tip": topic_tip,
+                                        "main_tip": main_tip, "verdict": "EXACT",
+                                        "reason": None, "last_activity_epoch": 1,
+                                        "paths": [{"path": "topic",
+                                                   "verdict": "EXACT_PRESENT"}]}])
+        with tempfile.TemporaryDirectory() as out:
+            root = Path(out)
+            plan = build_old_plan(repo, coverage, bundle_dir=root / "bundle")
+            approved = approve_cleanup_plan(plan, approved_digest=plan["plan_digest"])
+            common_dir = _common_dir(repo)
+            lease_root = root / "leases"
+            resolved_lease_root = lease_root.resolve(strict=False)
+            label = "com.mikebook.merge-safe-prs-loop"
+            expected = CreatorLeaseCapability(
+                common_dir=common_dir,
+                runtime_roots=(root / "stable", root / "compat", root / "canonical"),
+                hook_digests=((str(root / "stable"), "scripts/cooperative_branch_lease.py",
+                               "1" * 64),),
+                loaded_runtime_jobs=((label, str(root / "launchd.plist"),
+                                      str(root / "stable"), "a" * 64),),
+                lock_root=resolved_lease_root,
+                train_construction_runtime=root / "train-runtime",
+                train_construction_commit="b" * 40,
+            )
+            changed = replace(expected, loaded_runtime_jobs=(
+                (label, str(root / "launchd.plist"), str(root / "stable"), "c" * 64),
+            ))
+            adapter = CooperativeBranchLeaseAdapter(
+                str(common_dir), resolved_lease_root, capability=expected,
+            )
+            adapter.common_dir = common_dir
+            journal_path = root / "actions.jsonl"
+
+            # The fourth fresh resolution (post-intent) sees a new PID-bound
+            # generation. A fifth resolution would return the original
+            # capability, proving the recorded result must come from check 4.
+            with patch("jev_git_graph.cleanup._fixed_lock_root",
+                       return_value=resolved_lease_root), \
+                    patch("jev_git_graph.coordinator.resolve_production_creator_capability",
+                          side_effect=[expected, expected, expected, changed, expected]) as resolve:
+                result = execute_cleanup(
+                    repo, approved, approved_digest=approved["plan_digest"],
+                    lease_contract=adapter, journal_path=journal_path,
+                )
+
+            self.assertEqual(4, resolve.call_count, repr(result))
+            self.assertEqual("creator_capability_changed", result["stopped"])
+            self.assertFalse(result["destructive_action_authorized"])
+            self.assertEqual(topic_tip, run(repo, "rev-parse", "refs/heads/topic"))
+            diagnostic = result["capability_diagnostic"]
+            self.assertEqual(["loaded_job_generation"], diagnostic["changed_fields"])
+            self.assertEqual([{
+                "label": label,
+                "change": "generation_changed",
+                "expected_generation_sha256": "a" * 64,
+                "current_generation_sha256": "c" * 64,
+            }], diagnostic["changed_jobs"])
+            events = CleanupActionJournal(journal_path).read_events()
+            self.assertEqual(["intent", "result"], [event["event"] for event in events])
+            self.assertEqual(diagnostic, events[-1]["capability_diagnostic"])
+
+    def test_capability_diagnostic_pass_and_failure_are_sanitized(self):
+        root = Path("/safe/test-root")
+        capability = CreatorLeaseCapability(
+            common_dir=root / ".git",
+            runtime_roots=(root / "stable", root / "compat", root / "canonical"),
+            hook_digests=((str(root / "stable"), "scripts/cooperative_branch_lease.py",
+                           "1" * 64),),
+            loaded_runtime_jobs=(("com.mikebook.merge-safe-prs-loop", "plist", "root",
+                                  "a" * 64),),
+            lock_root=root / "locks",
+            train_construction_runtime=root / "train",
+            train_construction_commit="b" * 40,
+        )
+        with patch("jev_git_graph.coordinator.resolve_production_creator_capability",
+                   return_value=capability) as resolve:
+            passed = production_capability_diagnostic(capability, root)
+        self.assertTrue(passed["ok"])
+        self.assertEqual(1, resolve.call_count)
+
+        hook_and_root_change = replace(
+            capability,
+            runtime_roots=(root / "stable-v2", root / "compat", root / "canonical"),
+            hook_digests=((str(root / "stable"), "scripts/cooperative_branch_lease.py",
+                           "2" * 64),),
+        )
+        with patch("jev_git_graph.coordinator.resolve_production_creator_capability",
+                   return_value=hook_and_root_change):
+            changed = production_capability_diagnostic(capability, root)
+        self.assertFalse(changed["ok"])
+        self.assertEqual(["hook_digests", "runtime_roots"], changed["changed_fields"])
+        self.assertEqual({"added_count": 1, "removed_count": 1}, changed["hook_changes"])
+
+        with patch("jev_git_graph.coordinator.resolve_production_creator_capability",
+                   side_effect=JgError(
+                       "runtime_adoption_unverified: SECRET_VALUE "
+                       "com.mikebook.merge-safe-prs-loop")) as resolve:
+            failed = production_capability_diagnostic(capability, root)
+        self.assertFalse(failed["ok"])
+        self.assertEqual("runtime_adoption_unverified", failed["validation_failure"])
+        self.assertEqual("com.mikebook.merge-safe-prs-loop", failed["failed_label"])
+        self.assertEqual(1, resolve.call_count)
+        self.assertNotIn("SECRET_VALUE", json.dumps(failed))
+
+    def test_post_intent_runtime_error_is_sanitized_in_result_and_journal(self):
+        repo, topic_tip, main_tip = self.make_repo(old_commits=True)
+        coverage = coverage_for(repo, [{"name": "topic", "tip": topic_tip,
+                                        "main_tip": main_tip, "verdict": "EXACT",
+                                        "reason": None, "last_activity_epoch": 1,
+                                        "paths": [{"path": "topic",
+                                                   "verdict": "EXACT_PRESENT"}]}])
+        with tempfile.TemporaryDirectory() as out:
+            root = Path(out)
+            plan = build_old_plan(repo, coverage, bundle_dir=root / "bundle")
+            approved = approve_cleanup_plan(plan, approved_digest=plan["plan_digest"])
+            common_dir = _common_dir(repo)
+            lease_root = (root / "leases").resolve(strict=False)
+            label = "com.mikebook.merge-safe-prs-loop"
+            capability = CreatorLeaseCapability(
+                common_dir=common_dir,
+                runtime_roots=(root / "stable", root / "compat", root / "canonical"),
+                hook_digests=((str(root / "stable"), "scripts/cooperative_branch_lease.py",
+                               "1" * 64),),
+                loaded_runtime_jobs=((label, str(root / "launchd.plist"),
+                                      str(root / "stable"), "a" * 64),),
+                lock_root=lease_root,
+                train_construction_runtime=root / "train-runtime",
+                train_construction_commit="b" * 40,
+            )
+            adapter = CooperativeBranchLeaseAdapter(
+                str(common_dir), lease_root, capability=capability,
+            )
+            adapter.common_dir = common_dir
+            journal_path = root / "actions.jsonl"
+            marker = "PRIVATE_PATH_SECRET_MARKER"
+            with patch("jev_git_graph.cleanup._fixed_lock_root",
+                       return_value=lease_root), \
+                    patch("jev_git_graph.coordinator.resolve_production_creator_capability",
+                          side_effect=[capability, capability, capability,
+                                       RuntimeError(marker + " /private/path")]) as resolve:
+                result = execute_cleanup(
+                    repo, approved, approved_digest=approved["plan_digest"],
+                    lease_contract=adapter, journal_path=journal_path,
+                )
+            self.assertEqual(4, resolve.call_count)
+            self.assertEqual("creator_capability_changed", result["stopped"])
+            self.assertEqual("runtime_validation_error",
+                             result["capability_diagnostic"]["validation_failure"])
+            self.assertNotIn(marker, json.dumps(result))
+            self.assertEqual(topic_tip, run(repo, "rev-parse", "refs/heads/topic"))
+            events = CleanupActionJournal(journal_path).read_events()
+            self.assertEqual("runtime_validation_error",
+                             events[-1]["capability_diagnostic"]["validation_failure"])
+            self.assertNotIn(marker, json.dumps(events))
+
+    def test_lease_path_runtime_error_has_fixed_diagnostic(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            common_dir = root / "repo.git"
+            lease_root = (root / "leases").resolve(strict=False)
+            capability = CreatorLeaseCapability(
+                common_dir=common_dir,
+                runtime_roots=(root / "stable", root / "compat", root / "canonical"),
+                hook_digests=(), loaded_runtime_jobs=(), lock_root=lease_root,
+                train_construction_runtime=root / "train-runtime",
+                train_construction_commit=None,
+            )
+            adapter = CooperativeBranchLeaseAdapter(
+                str(common_dir), lease_root, capability=capability,
+            )
+            adapter.common_dir = common_dir
+            marker = "PRIVATE_PATH_SECRET_MARKER"
+            with patch("jev_git_graph.cleanup._fixed_lock_root",
+                       return_value=lease_root), \
+                    patch("jev_git_graph.cleanup._common_dir",
+                          side_effect=RuntimeError(marker + " /private/path")):
+                self.assertFalse(_lease_established(adapter, root))
+            self.assertEqual("runtime_validation_error",
+                             adapter.last_capability_diagnostic["validation_failure"])
+            self.assertNotIn(marker, json.dumps(adapter.last_capability_diagnostic))
 
     def test_post_delete_capability_drift_restores_exact_tip_without_overwriting_recreation(self):
         # Exercise both outcomes after a real CAS deletion: restore the pinned

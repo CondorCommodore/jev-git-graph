@@ -31,7 +31,7 @@ from .coordinator import (COOPERATIVE_LEASE_CONTRACT, CleanupActionJournal,
                           CooperativeBranchLeaseAdapter, CreatorLeaseCapability,
                           DisposableFixtureLeaseCapability, _fixed_lock_root,
                           _common_dir, capability_receipt_metadata,
-                          production_capability_is_current,
+                          production_capability_diagnostic,
                           cleanup_action_id)
 from .errors import JgError
 from .equivalence import _activity
@@ -384,27 +384,83 @@ def write_cleanup_plan(repo: str | Path, coverage_path: str | Path, out: str | P
 
 
 def _lease_established(contract: Any, repository: Path | None = None) -> bool:
+    if isinstance(contract, CooperativeBranchLeaseAdapter):
+        contract.last_capability_diagnostic = None
     if not isinstance(contract, CooperativeBranchLeaseAdapter):
         return False
     if repository is None or contract.common_dir is None or contract.capability is None:
+        contract.last_capability_diagnostic = {
+            "ok": False, "status": "validation_failed",
+            "changed_fields": ["lease_contract"],
+            "validation_failure": "lease_contract_incomplete",
+        }
         return False
     try:
         canonical_common = _common_dir(repository)
         if canonical_common != contract.common_dir:
+            contract.last_capability_diagnostic = {
+                "ok": False, "status": "changed",
+                "changed_fields": ["common_dir"],
+            }
             return False
         if contract.lease_dir != _fixed_lock_root():
+            contract.last_capability_diagnostic = {
+                "ok": False, "status": "changed",
+                "changed_fields": ["lock_root"],
+            }
             return False
         if isinstance(contract.capability, CreatorLeaseCapability):
-            if not production_capability_is_current(contract.capability, repository):
+            diagnostic = production_capability_diagnostic(contract.capability, repository)
+            contract.last_capability_diagnostic = diagnostic
+            if not diagnostic["ok"]:
                 return False
         elif isinstance(contract.capability, DisposableFixtureLeaseCapability):
-            if not contract.capability.is_current(repository):
+            current = contract.capability.is_current(repository)
+            contract.last_capability_diagnostic = {
+                "ok": current,
+                "status": "current" if current else "changed",
+                "changed_fields": [] if current else ["fixture_capability"],
+            }
+            if not current:
                 return False
         else:
+            contract.last_capability_diagnostic = {
+                "ok": False, "status": "validation_failed",
+                "changed_fields": ["lease_capability"],
+                "validation_failure": "unsupported_capability",
+            }
             return False
+    except RuntimeError:
+        contract.last_capability_diagnostic = {
+            "ok": False, "status": "validation_failed",
+            "changed_fields": ["lease_validation"],
+            "validation_failure": "runtime_validation_error",
+        }
+        return False
     except (JgError, OSError, subprocess.SubprocessError):
+        contract.last_capability_diagnostic = {
+            "ok": False, "status": "validation_failed",
+            "changed_fields": ["lease_validation"],
+            "validation_failure": "lease_validation_failed",
+        }
         return False
     return True
+
+
+def _lease_check(contract: Any, repository: Path) -> tuple[bool, dict[str, Any] | None]:
+    """Run one lease check and return diagnostics from that exact check."""
+    if isinstance(contract, CooperativeBranchLeaseAdapter):
+        contract.last_capability_diagnostic = None
+    current = _lease_established(contract, repository)
+    diagnostic = (getattr(contract, "last_capability_diagnostic", None)
+                  if isinstance(contract, CooperativeBranchLeaseAdapter) else None)
+    if not current and diagnostic is None:
+        diagnostic = {
+            "ok": False, "status": "validation_failed",
+            "changed_fields": ["lease_validation"],
+            "validation_failure": "lease_validation_failed",
+        }
+    return current, diagnostic
 
 
 def _lease_call(contract: Any, method: str, name: str, tip: str) -> bool:
@@ -542,11 +598,13 @@ def execute_cleanup(repo: str | Path, plan: Mapping[str, Any] | str | Path,
     if (loaded.get("manifest_approved") is not True
             or bundle.get("manifest_approved") is not True):
         raise JgError("cleanup plan manifest is not approved")
-    if not _lease_established(lease_contract, root):
+    lease_current, lease_diagnostic = _lease_check(lease_contract, root)
+    if not lease_current:
         return {"kind": "cleanup-execution", "plan_digest": expected,
                 "scope": scope,
                 "deletion_ready": False, "mode": "deletion-ready-plan-only",
                 "deleted": [], "stopped": "cooperative_lease_unestablished",
+                "capability_diagnostic": lease_diagnostic,
                 "network_performed": False, "destructive_action_authorized": False}
     if journal_path is None:
         return {"kind": "cleanup-execution", "plan_digest": expected,
@@ -575,10 +633,12 @@ def execute_cleanup(repo: str | Path, plan: Mapping[str, Any] | str | Path,
     creator_receipt = capability_receipt_metadata(lease_contract.capability)
     for index, candidate in enumerate(loaded.get("candidates", [])):
         name, tip = str(candidate["name"]), str(candidate["tip"])
-        if not _lease_established(lease_contract, root):
+        lease_current, lease_diagnostic = _lease_check(lease_contract, root)
+        if not lease_current:
             return {"kind": "cleanup-execution", "plan_digest": expected,
                     "scope": scope, "deletion_ready": False, "deleted": deleted,
                     "stopped": "creator_capability_changed", "branch": name,
+                    "capability_diagnostic": lease_diagnostic,
                     "network_performed": False, "destructive_action_authorized": False}
         if not _lease_call(lease_contract, "acquire", name, tip):
             return {"kind": "cleanup-execution", "plan_digest": expected,
@@ -593,7 +653,8 @@ def execute_cleanup(repo: str | Path, plan: Mapping[str, Any] | str | Path,
         intent_written = False
         operation_exception = False
         try:
-            reason = (None if _lease_established(lease_contract, root) else "creator_capability_changed")
+            lease_current, lease_diagnostic = _lease_check(lease_contract, root)
+            reason = None if lease_current else "creator_capability_changed"
             if reason is None:
                 reason = _live_reproof(root, candidate, loaded["main"], runner,
                                        float(loaded.get("recent_hours", 0)))
@@ -601,6 +662,8 @@ def execute_cleanup(repo: str | Path, plan: Mapping[str, Any] | str | Path,
                 outcome = {"kind": "cleanup-execution", "plan_digest": expected,
                            "deletion_ready": False, "deleted": deleted,
                            "stopped": reason, "branch": name,
+                           **({"capability_diagnostic": lease_diagnostic}
+                              if not lease_current else {}),
                            "network_performed": False, "destructive_action_authorized": False}
             else:
                 destination = str(loaded["main"]["name"])
@@ -615,10 +678,12 @@ def execute_cleanup(repo: str | Path, plan: Mapping[str, Any] | str | Path,
                     **creator_receipt,
                 })
                 intent_written = True
-                if not _lease_established(lease_contract, root):
+                lease_current, lease_diagnostic = _lease_check(lease_contract, root)
+                if not lease_current:
                     outcome = {"kind": "cleanup-execution", "plan_digest": expected,
                                "deletion_ready": False, "deleted": deleted,
                                "stopped": "creator_capability_changed", "branch": name,
+                               "capability_diagnostic": lease_diagnostic,
                                "network_performed": False, "destructive_action_authorized": False}
                 elif not _atomic_delete(root, name, tip, destination, destination_tip):
                     outcome = {"kind": "cleanup-execution", "plan_digest": expected,
@@ -655,16 +720,19 @@ def execute_cleanup(repo: str | Path, plan: Mapping[str, Any] | str | Path,
                                        "stopped": "delete_verification_uncertain",
                                        "restoration_attempted": False, "branch": name,
                                        "network_performed": False, "destructive_action_authorized": False}
-                        elif not _lease_established(lease_contract, root):
-                            restored = _atomic_restore(root, name, tip)
-                            outcome = {"kind": "cleanup-execution", "plan_digest": expected,
-                                       "deletion_ready": False, "deleted": deleted,
-                                       "stopped": "creator_capability_changed_after_delete",
-                                       "restoration_attempted": True, "restored": restored,
-                                       "branch": name, "network_performed": False,
-                                       "destructive_action_authorized": False}
                         else:
-                            deleted.append({"name": name, "tip": tip})
+                            lease_current, lease_diagnostic = _lease_check(lease_contract, root)
+                            if not lease_current:
+                                restored = _atomic_restore(root, name, tip)
+                                outcome = {"kind": "cleanup-execution", "plan_digest": expected,
+                                           "deletion_ready": False, "deleted": deleted,
+                                           "stopped": "creator_capability_changed_after_delete",
+                                           "restoration_attempted": True, "restored": restored,
+                                           "capability_diagnostic": lease_diagnostic,
+                                           "branch": name, "network_performed": False,
+                                           "destructive_action_authorized": False}
+                            else:
+                                deleted.append({"name": name, "tip": tip})
         except BaseException:
             operation_exception = True
             raise
@@ -685,6 +753,8 @@ def execute_cleanup(repo: str | Path, plan: Mapping[str, Any] | str | Path,
                         "observed_source_tip": _read_ref_tip(root, name),
                         "observed_destination_tip": _read_ref_tip(root, str(loaded["main"]["name"])),
                         "status": event_status,
+                        **({"capability_diagnostic": outcome["capability_diagnostic"]}
+                           if outcome is not None and "capability_diagnostic" in outcome else {}),
                         **creator_receipt,
                     })
             finally:
