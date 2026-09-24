@@ -28,7 +28,8 @@ from .residual import analyze_residual
 from .snapshot import load_snapshot, write_snapshot
 from .contributions import write_contributions
 from .groups import write_groups
-from .outcomes import write_outcomes
+from .outcomes import approve_outcome_review, write_outcomes
+from .preservation import write_preservation_plan
 from .study import (build_selected_study, validate_selected_range_manifest,
                     write_selected_study_artifacts, write_study)
 from .snapshot import load_snapshot
@@ -145,6 +146,7 @@ def _build_group_presence_preview(args):
         # fails closed for that contribution.
     plan_kwargs = {
         "max_groups": args.max_groups,
+        "max_requests": args.max_requests,
         "max_request_bytes": args.max_request_bytes,
         "model_settings": model_settings,
         "selected_contribution_ids": selected_ids,
@@ -319,7 +321,10 @@ def parser() -> argparse.ArgumentParser:
     group_relate.add_argument("--out", required=True)
     group_relate.add_argument("--show-preview", action="store_true",
                               help="serve exact request content transiently from a loopback no-store page")
-    group_relate.add_argument("--max-groups", type=int, default=32)
+    group_relate.add_argument("--max-groups", type=int, default=64,
+                              help="maximum distinct source groups in the request batch")
+    group_relate.add_argument("--max-requests", type=int, default=64,
+                              help="maximum chunk requests in the bounded batch")
     group_relate.add_argument("--max-request-bytes", type=int, default=64000)
     group_relate.add_argument("--estimated-input-tokens", type=int)
     group_relate.add_argument("--auto-estimate-input-tokens", action="store_true",
@@ -369,7 +374,26 @@ def parser() -> argparse.ArgumentParser:
     outcomes.add_argument("--presence")
     outcomes.add_argument("--coverage")
     outcomes.add_argument("--review")
+    outcomes.add_argument("--review-approval", help="signed local receipt for the exact v2 review document")
     outcomes.add_argument("--out", required=True)
+
+    outcome_review_approve = commands.add_parser(
+        "outcome-review-approve", help="approve one exact v2 human review document by digest"
+    )
+    outcome_review_approve.add_argument("--review", required=True)
+    outcome_review_approve.add_argument("--approved-review-sha256")
+    outcome_review_approve.add_argument("--out")
+
+    preservation_queue = commands.add_parser(
+        "preservation-queue", help="build the canonical non-destructive queue from pinned outcomes"
+    )
+    preservation_queue.add_argument("--repo", required=True)
+    preservation_queue.add_argument("--inventory", required=True)
+    preservation_queue.add_argument("--outcomes", required=True)
+    preservation_queue.add_argument("--candidates")
+    preservation_queue.add_argument("--relations")
+    preservation_queue.add_argument("--review")
+    preservation_queue.add_argument("--out", required=True)
 
     candidates = commands.add_parser("candidates", help="build bounded deterministic relationship candidates")
     candidates.add_argument("--repo", required=True)
@@ -529,6 +553,8 @@ def run(args: argparse.Namespace) -> str:
         if args.show_preview and not args.execute and not args.answers:
             serve_presence_preview(preview)
         if args.execute:
+            if not args.checkpoint:
+                raise JgError("--execute requires --checkpoint for durable fail-closed progress")
             checkpoint = validate_output_path(args.checkpoint, [object_repo]) if args.checkpoint else None
             result = execute_presence_preview(
                 preview, args.approved_payload_sha256,
@@ -586,7 +612,29 @@ def run(args: argparse.Namespace) -> str:
             raise JgError("inventory belongs to a different local repository")
         target = validate_output_path(args.out, [*protected_worktree_paths(args.repo), common])
         return str(write_outcomes(args.inventory, args.snapshot, args.contributions, target,
-                                  args.presence, args.coverage, args.review))
+                                  args.presence, args.coverage, args.review, args.review_approval))
+    if args.command == "outcome-review-approve":
+        review = read_json(args.review)
+        review_sha256 = digest(review)
+        if args.approved_review_sha256 is None:
+            if args.out is not None:
+                raise JgError("approval output requires the exact --approved-review-sha256")
+            return canonical_json({"review_sha256": review_sha256,
+                                   "approval_required": True}).decode("ascii")
+        if args.out is None:
+            raise JgError("exact-digest approval requires a private --out receipt path")
+        receipt = approve_outcome_review(review, args.approved_review_sha256)
+        write_json(Path(args.out).expanduser().resolve(), receipt)
+        return args.out
+    if args.command == "preservation-queue":
+        inventory = read_json(args.inventory)
+        root, common, _runner = git.open_repository(args.repo)
+        if inventory.get("repository", {}).get("id") != opaque_path_id(root):
+            raise JgError("inventory belongs to a different local repository")
+        target = validate_output_path(args.out, [*protected_worktree_paths(args.repo), common])
+        return str(write_preservation_plan(
+            args.inventory, target, args.candidates, args.relations, args.review, args.outcomes,
+        ))
     if args.command == "groups":
         contributions = read_json(args.contributions)
         root, common, _runner = git.open_repository(args.repo)

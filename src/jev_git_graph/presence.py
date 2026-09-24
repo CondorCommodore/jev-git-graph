@@ -6,16 +6,18 @@ import concurrent.futures
 import base64
 import hashlib
 import hmac
+import json
 import os
 import re
 import stat
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic
 from typing import Any, Callable, Mapping
 
 from .errors import JgError
-from .group_requests import revalidate_two_sided_evidence
+from .group_requests import revalidate_source_only_evidence, revalidate_two_sided_evidence
 from .jev import _default_transport, validate_response
 from .questions import PRESENCE_CHOICES, PRESENCE_QUESTION_VERSION
 from .safety import canonical_json, digest, read_json, write_json
@@ -69,6 +71,7 @@ def validate_presence_responses(preview: Mapping[str, Any], records: list[Mappin
         response = record.get("response")
         try:
             validate_response(request, dict(response) if isinstance(response, Mapping) else response)
+            _validate_response_scope(request, response)
         except Exception:
             raise JgError("presence response does not match its typed request") from None
         canonical = digest(response)
@@ -110,6 +113,12 @@ def _request_bindings(request: Mapping[str, Any]) -> list[dict[str, Any]]:
                    "context_limitations": list(state.get("limitations", [])),
                    "evidence_ids": sorted({record.get("evidence_id") for record in (item.get("evidence") or {}).get("records", [])
                                            if isinstance(record.get("evidence_id"), str)})}
+        evidence = item.get("evidence") or {}
+        if evidence.get("kind") == "branch-presence-source-only-evidence":
+            binding["presence_scope"] = "bounded_source_unit_usable_delta_only"
+            binding["destination_presence"] = "unknown"
+            binding["integration_readiness"] = "unresolved"
+            binding["project_decisions"] = "not_assessed"
         if "comparison_context_complete" in item:
             binding["comparison_context_complete"] = item.get("comparison_context_complete") is True
             binding["comparison_context_limitations"] = list(item.get("comparison_context_limitations", []))
@@ -121,6 +130,56 @@ def _request_bindings(request: Mapping[str, Any]) -> list[dict[str, Any]]:
             binding["dependency_context_limitations"] = list(item.get("dependency_context_limitations", []))
         bindings.append(binding)
     return bindings
+
+
+def _validate_response_scope(request: Mapping[str, Any], response: Mapping[str, Any]) -> None:
+    """Fail closed if source-only evidence is converted into a destination claim."""
+    questions = request.get("questions", {})
+    for item in request.get("state", {}).get("contributions", []):
+        evidence = item.get("evidence") or {}
+        if evidence.get("kind") != "branch-presence-source-only-evidence":
+            continue
+        if item.get("destination_ids") or any("destination" in record for record in evidence.get("records", [])):
+            raise JgError("source-only response has destination evidence")
+        answers = response.get("answers", {})
+        cid = item.get("contribution_id")
+        presence = answers.get(f"{cid}:presence", {})
+        if presence.get("choice") != "UNKNOWN":
+            raise JgError("source-only response must keep destination presence UNKNOWN")
+        dependency = answers.get(f"{cid}:dependency_context_sufficient", {})
+        if f"{cid}:dependency_context_sufficient" in questions and _probability(dependency.get("noul")) is None:
+            raise JgError("source-only response has an invalid dependency status")
+        if f"{cid}:dependency_context_sufficient" in questions and dependency["noul"] > _FALSE:
+            raise JgError("source-only response must leave integration readiness unresolved")
+        if any(key.startswith(f"{cid}:dependency:") for key in questions):
+            raise JgError("source-only response cannot assess dependency integration edges")
+
+
+def _write_checkpoint(path: Path, ledger: Mapping[str, Any]) -> None:
+    """Durably replace a sanitized checkpoint without exposing partial JSON."""
+    path = path.expanduser().absolute()
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if path.parent.stat().st_mode & 0o077:
+        raise JgError("presence checkpoint directory must be owner-only")
+    if path.is_symlink():
+        raise JgError("presence checkpoint must not be a symlink")
+    data = json.dumps(ledger, indent=2, sort_keys=True) + "\n"
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def _answers_digest(artifact: Mapping[str, Any]) -> str:
@@ -335,6 +394,10 @@ def execute_presence_preview(
     """
     if max_workers < 1 or max_workers > 8:
         raise JgError("max_workers must be between 1 and 8")
+    if checkpoint is None:
+        raise JgError("presence execution requires a durable checkpoint path")
+    if Path(checkpoint).is_symlink():
+        raise JgError("presence checkpoint must not be a symlink")
     requests = preview.get("requests")
     if (preview.get("kind") != "branch-presence-preview" or preview.get("no_store") is not True
             or preview.get("network_performed") is not False or not isinstance(requests, list)):
@@ -352,7 +415,8 @@ def execute_presence_preview(
         raise JgError("presence model settings digest is invalid")
     approval_sha = digest({"payload_sha256": payload_sha,
                            "plan_digest": preview.get("plan_digest"),
-                           "request_count": len(requests)})
+                           "request_count": len(requests),
+                           "request_budgets": preview.get("request_budgets")})
     if preview.get("approval_sha256") != approval_sha or approved_approval_sha256 != approval_sha:
         raise JgError("approved presence manifest digest does not match preview")
     budgets = preview.get("request_budgets")
@@ -364,9 +428,23 @@ def execute_presence_preview(
         raise JgError("presence provider token estimate exceeds its approved budget")
     if preview.get("payload_bytes") != len(canonical_json(requests)):
         raise JgError("presence preview byte count does not match payload")
-    if (not isinstance(budgets.get("max_groups"), int) or len(requests) > budgets["max_groups"]
-            or not isinstance(budgets.get("max_request_bytes"), int)
-            or preview["payload_bytes"] > budgets["max_request_bytes"]):
+    if preview.get("request_bytes_by_chunk") != [len(canonical_json(request)) for request in requests]:
+        raise JgError("presence per-request byte diagnostics differ from exact request records")
+    request_limit = budgets.get("max_request_bytes")
+    aggregate_limit = budgets.get("max_aggregate_request_bytes")
+    max_groups = budgets.get("max_groups")
+    max_requests = budgets.get("max_requests")
+    request_sizes = [len(canonical_json(request)) for request in requests]
+    group_ids = {request.get("state", {}).get("group_id") for request in requests}
+    if (not isinstance(request_limit, int) or request_limit < 1
+            or not isinstance(aggregate_limit, int) or aggregate_limit < 1
+            or not isinstance(max_groups, int) or max_groups < 1
+            or not isinstance(max_requests, int) or max_requests < 1
+            or len(request_sizes) != preview.get("request_count")
+            or any(size > request_limit for size in request_sizes)
+            or len(requests) > max_requests
+            or len(group_ids) > max_groups
+            or preview["payload_bytes"] > aggregate_limit):
         raise JgError("presence request exceeds its approved count or byte budget")
     trusted_sdk_executor = transport is None
     actual_transport = transport
@@ -434,6 +512,7 @@ def execute_presence_preview(
             _validate_sanitized_answers(answer.get("contribution_bindings", []), answer.get("response", {}))
             if answer.get("contribution_bindings") != _request_bindings(request_index[answer["request_sha256"]]):
                 raise JgError("presence checkpoint bindings differ from the approved request")
+            _validate_response_scope(request_index[answer["request_sha256"]], answer.get("response", {}))
             answer_ids.add(answer["request_sha256"])
         if any(attempt.get("status") == "succeeded" for attempt in ledger["attempts"] if attempt["request_sha256"] not in answer_ids):
             raise JgError("presence checkpoint is missing a successful answer")
@@ -449,9 +528,8 @@ def execute_presence_preview(
     for request_sha, request in request_by_sha.items():
         ledger["attempts"].append({"request_sha256": request_sha, "group_id": request["state"].get("group_id"),
                                    "status": "uncertain", "started_at": datetime.now(UTC).isoformat()})
-    if checkpoint is not None:
-        _seal_checkpoint(ledger, create_key=True)
-        write_json(Path(checkpoint), ledger)
+    _seal_checkpoint(ledger, create_key=True)
+    _write_checkpoint(Path(checkpoint), ledger)
 
     def invoke(item: tuple[str, dict[str, Any]]) -> tuple[str, Any, str | None, bool]:
         request_sha, request = item
@@ -462,18 +540,56 @@ def execute_presence_preview(
                 if evidence is not None:
                     if code_evidence_repo is None:
                         raise JgError("presence code evidence requires immediate pin revalidation")
-                    revalidate_two_sided_evidence(code_evidence_repo, evidence)
+                    if evidence.get("kind") == "branch-presence-source-only-evidence":
+                        revalidate_source_only_evidence(code_evidence_repo, evidence)
+                    elif evidence.get("kind") == "branch-presence-code-evidence":
+                        revalidate_two_sided_evidence(code_evidence_repo, evidence)
+                    else:
+                        raise JgError("presence evidence has an unsupported validation kind")
             dispatched = True
             response = actual_transport(request, token)
             validate_response(request, response)
+            _validate_response_scope(request, response)
             return request_sha, response, None, dispatched
         except Exception:
             return request_sha, None, "transport_or_validation_error", dispatched
 
     ledger["network_performed"] = bool(ledger.get("network_performed"))
     elapsed_started = monotonic()
+    attempts = {item["request_sha256"]: item for item in ledger["attempts"]}
+
+    def persist_progress() -> None:
+        prior_actual = ledger.get("actual_budgets", {})
+        prior_wall = prior_actual.get("wall_time_seconds", 0) if isinstance(prior_actual, Mapping) else 0
+        ledger["actual_budgets"] = {
+            "attempted_requests": len(ledger["attempts"]),
+            "successful_requests": len(ledger["answers"]),
+            "input_tokens": sum(item["response"]["usage"]["input_tokens"] for item in ledger["answers"]),
+            "output_tokens": sum(item["response"]["usage"]["output_tokens"] for item in ledger["answers"]),
+            "wall_time_seconds": prior_wall + monotonic() - elapsed_started,
+        }
+        _seal_checkpoint(ledger)
+        _write_checkpoint(Path(checkpoint), ledger)
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-        outcomes = list(pool.map(invoke, request_by_sha.items()))
+        futures = {pool.submit(invoke, item): item[0] for item in request_by_sha.items()}
+        outcomes = []
+        for future in concurrent.futures.as_completed(futures):
+            request_sha, response, error_class, dispatched = future.result()
+            ledger["network_performed"] = bool(ledger.get("network_performed") or dispatched)
+            attempt = attempts[request_sha]
+            if error_class:
+                attempt["error_class"] = error_class
+                persist_progress()
+                continue
+            attempt.update({"status": "succeeded", "completed_at": datetime.now(UTC).isoformat(),
+                            "model": response["model"], "usage": dict(response["usage"])})
+            ledger["answers"].append({"request_sha256": request_sha,
+                                      "group_id": request_by_sha[request_sha]["state"].get("group_id"),
+                                      "contribution_bindings": _request_bindings(request_by_sha[request_sha]),
+                                      "response": _sanitize_response(request_by_sha[request_sha], response)})
+            ledger["answers"].sort(key=lambda item: item["request_sha256"])
+            persist_progress()
     attempts = {item["request_sha256"]: item for item in ledger["attempts"]}
     for request_sha, response, error_class, dispatched in outcomes:
         ledger["network_performed"] = bool(ledger["network_performed"] or dispatched)
@@ -496,9 +612,8 @@ def execute_presence_preview(
         "output_tokens": sum(item["response"]["usage"]["output_tokens"] for item in ledger["answers"]),
         "wall_time_seconds": prior_wall + monotonic() - elapsed_started,
     }
-    if checkpoint is not None:
-        _seal_checkpoint(ledger)
-        write_json(Path(checkpoint), ledger)
+    _seal_checkpoint(ledger)
+    _write_checkpoint(Path(checkpoint), ledger)
     ledger.pop("checkpoint_signature", None)
     ledger["answers_digest"] = _answers_digest(ledger)
     if trusted_sdk_executor:
@@ -730,7 +845,13 @@ def reconcile_presence(
               "origin": effective_origin, "snapshot_digest": contributions.get("snapshot_digest"),
               "groups_digest": groups.get("groups_digest"),
               "contributions_digest": contributions.get("contributions_digest"),
-              "contributions": result_rows, "network_performed": bool(answer_artifact.get("network_performed"))}
+              "contributions": result_rows,
+              "project_utility_assessment": {
+                  "status": "UNKNOWN",
+                  "reason": "project_requirements_not_provided",
+                  "source": "code_only_presence_review",
+              },
+              "network_performed": bool(answer_artifact.get("network_performed"))}
     if verified_receipt is not None:
         result_body_sha = digest(result)
         result["trusted_provenance"] = _signed_record(
@@ -742,8 +863,16 @@ def reconcile_presence(
     return result
 
 
-def validate_outcome_presence(presence: Mapping[str, Any], contributions: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
-    """Validate parent ledger input and expose only production-eligible rows."""
+def validate_presence_observations(
+    presence: Mapping[str, Any], contributions: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Validate every normalized observation without granting it action scope.
+
+    Advisory synthetic/control answers and unresolved Jev results must remain
+    visible to reviewers. This API validates them but does not promote their
+    routing scope. Consumers that create production recommendations must use
+    :func:`validate_outcome_presence` instead.
+    """
     if presence.get("kind") != "branch-presence-result" or presence.get("schema") != RESULT_SCHEMA:
         raise JgError("outcome presence has an unsupported schema")
     if presence.get("presence_digest") != digest({k: v for k, v in presence.items() if k != "presence_digest"}):
@@ -795,4 +924,13 @@ def validate_outcome_presence(presence: Mapping[str, Any], contributions: Mappin
             ):
                 raise JgError("usable-work row has inconsistent typed answers")
         result[cid] = dict(row)
-    return {cid: row for cid, row in result.items() if row.get("routing_scope") == "production_review_candidate"}
+    return result
+
+
+def validate_outcome_presence(
+    presence: Mapping[str, Any], contributions: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Validate and expose only rows eligible for human preservation review."""
+    observations = validate_presence_observations(presence, contributions)
+    return {cid: row for cid, row in observations.items()
+            if row.get("routing_scope") == "production_review_candidate"}
