@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import concurrent.futures
 import base64
+import concurrent.futures
 import hashlib
 import hmac
 import json
@@ -388,6 +388,37 @@ def _validate_sanitized_answers(bindings: list[Mapping[str, Any]], response: Map
                 raise JgError("presence choice probabilities are invalid")
 
 
+def _safe_failure_metadata(exc: Exception, stage: str) -> dict[str, Any]:
+    """Return fixed, non-sensitive diagnostics; never serialize exception text."""
+    mro_names = {base.__name__ for base in type(exc).__mro__}
+    if stage == "sdk_transport":
+        if "TypeSafeAPITimeoutError" in mro_names:
+            error_class = "sdk_timeout"
+        elif "TypeSafeAPIConnectionError" in mro_names:
+            error_class = "sdk_connection_error"
+        elif "TypeSafeAPIResponseValidationError" in mro_names:
+            error_class = "sdk_response_error"
+        elif "TypeSafeAPIError" in mro_names:
+            error_class = "sdk_http_error"
+        elif "TypeSafeError" in mro_names:
+            error_class = "sdk_client_error"
+        else:
+            error_class = "transport_error"
+    elif stage == "evidence_revalidation":
+        error_class = "evidence_validation_error"
+    elif stage == "response_validation":
+        error_class = "response_validation_error"
+    else:
+        error_class = "response_scope_error"
+    result: dict[str, Any] = {"failure_stage": stage, "error_class": error_class}
+    if stage == "sdk_transport" and error_class == "sdk_http_error":
+        attributes = getattr(exc, "__dict__", None)
+        status = attributes.get("status") if isinstance(attributes, dict) else None
+        if isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599:
+            result["http_status"] = status
+    return result
+
+
 def import_synthetic_answers(preview: Mapping[str, Any], answers: list[Mapping[str, Any]]) -> dict[str, Any]:
     """Strict offline importer for known-answer fixtures and package checks."""
     normalized = validate_presence_responses(preview, answers)
@@ -446,7 +477,8 @@ def execute_presence_preview(
     """Execute an explicitly approved preview with bounded workers/resume.
 
     Uncertain request identities remain uncertain on resume and are never
-    retried implicitly. Checkpoints contain only IDs/statuses/sanitized answers.
+    retried implicitly. A failed request stops new scheduling; only already
+    in-flight calls settle. Checkpoints list remaining request hashes explicitly.
     """
     if max_workers < 1 or max_workers > 8:
         raise JgError("max_workers must be between 1 and 8")
@@ -531,7 +563,8 @@ def execute_presence_preview(
               "groups_digest": preview.get("groups_digest"),
               "request_budgets": dict(budgets),
               "model_settings_digest": preview.get("model_settings_digest"),
-              "network_performed": False, "attempts": [], "answers": []}
+              "network_performed": False, "attempts": [], "answers": [],
+              "unattempted_request_sha256s": sorted(digest(request) for request in requests)}
     if checkpoint is not None and Path(checkpoint).exists():
         ledger = read_json(checkpoint)
         if not _verify_checkpoint(ledger):
@@ -545,7 +578,7 @@ def execute_presence_preview(
                 or ledger.get("executor") != ("pooled-jev-sdk-v1" if trusted_sdk_executor else "injected-advisory-transport")):
             raise JgError("presence checkpoint belongs to another preview")
         allowed_attempt_fields = {"request_sha256", "group_id", "status", "started_at", "completed_at",
-                                  "error_class", "model", "usage"}
+                                  "failure_stage", "error_class", "http_status", "model", "usage"}
         allowed_answer_fields = {"request_sha256", "group_id", "contribution_bindings", "response"}
         if not isinstance(ledger.get("attempts"), list) or not isinstance(ledger.get("answers"), list):
             raise JgError("presence checkpoint has malformed attempt or answer lists")
@@ -555,8 +588,18 @@ def execute_presence_preview(
             if (not isinstance(attempt, Mapping) or set(attempt) - allowed_attempt_fields
                     or attempt.get("request_sha256") not in valid_shas
                     or attempt.get("request_sha256") in attempt_ids
-                    or attempt.get("status") not in {"uncertain", "succeeded"}):
+                    or attempt.get("status") not in {"uncertain", "succeeded", "not_dispatched"}):
                 raise JgError("presence checkpoint contains invalid or non-sanitized attempt data")
+            if ("failure_stage" in attempt and attempt["failure_stage"] not in {
+                    "evidence_revalidation", "sdk_transport", "response_validation", "response_scope_validation"}
+                    or "error_class" in attempt and attempt["error_class"] not in {
+                        "sdk_timeout", "sdk_connection_error", "sdk_response_error", "sdk_http_error",
+                        "sdk_client_error", "transport_error", "evidence_validation_error",
+                        "response_validation_error", "usage_unavailable", "response_scope_error",
+                        "transport_or_validation_error"}
+                    or "http_status" in attempt and (not isinstance(attempt["http_status"], int)
+                        or isinstance(attempt["http_status"], bool) or not 100 <= attempt["http_status"] <= 599)):
+                raise JgError("presence checkpoint contains invalid failure diagnostics")
             attempt_ids.add(attempt["request_sha256"])
         answer_ids = set()
         request_index = {digest(request): request for request in requests}
@@ -572,22 +615,42 @@ def execute_presence_preview(
             answer_ids.add(answer["request_sha256"])
         if any(attempt.get("status") == "succeeded" for attempt in ledger["attempts"] if attempt["request_sha256"] not in answer_ids):
             raise JgError("presence checkpoint is missing a successful answer")
+        derived_unattempted = sorted(valid_shas - attempt_ids)
+        stored_unattempted = ledger.get("unattempted_request_sha256s")
+        if stored_unattempted is not None and (
+                not isinstance(stored_unattempted, list)
+                or any(not isinstance(item, str) for item in stored_unattempted)
+                or len(stored_unattempted) != len(set(stored_unattempted))
+                or sorted(stored_unattempted) != derived_unattempted):
+            raise JgError("presence checkpoint has invalid unattempted request identities")
+        ledger["unattempted_request_sha256s"] = derived_unattempted
     attempted = {item.get("request_sha256"): item for item in ledger.get("attempts", [])}
-    allowed = [request for request in requests if digest(request) not in attempted]
-    known_uncertain = {key for key, item in attempted.items() if item.get("status") == "uncertain"}
-    if known_uncertain:
-        # This is an operator-visible stop; the remote service may have accepted
-        # these requests and replay would duplicate a disclosure/call.
+    request_by_sha = {digest(request): request for request in requests if digest(request) not in attempted}
+    request_index = {digest(request): request for request in requests}
+
+    def update_unattempted() -> None:
+        done_ids = {item["request_sha256"] for item in ledger["attempts"]}
+        ledger["unattempted_request_sha256s"] = sorted(set(request_index) - done_ids)
+
+    if any(item.get("status") == "uncertain" for item in ledger["attempts"]):
+        # A previously dispatched request may have consumed provider budget.
+        # Preserve remaining identities, but require explicit reconciliation
+        # before any further dispatch can occur.
+        prior_actual = ledger.get("actual_budgets", {})
+        prior_wall = prior_actual.get("wall_time_seconds", 0) if isinstance(prior_actual, Mapping) else 0
+        ledger["actual_budgets"] = {
+            "attempted_requests": sum(item.get("status") != "not_dispatched" for item in ledger["attempts"]),
+            "successful_requests": len(ledger["answers"]),
+            "input_tokens": None,
+            "output_tokens": None,
+            "wall_time_seconds": prior_wall,
+        }
+        update_unattempted()
+        _seal_checkpoint(ledger)
+        _write_checkpoint(Path(checkpoint), ledger)
         raise JgError("presence checkpoint has uncertain requests; reconcile them before resuming")
 
-    request_by_sha = {digest(request): request for request in allowed}
-    for request_sha, request in request_by_sha.items():
-        ledger["attempts"].append({"request_sha256": request_sha, "group_id": request["state"].get("group_id"),
-                                   "status": "uncertain", "started_at": datetime.now(UTC).isoformat()})
-    _seal_checkpoint(ledger, create_key=True)
-    _write_checkpoint(Path(checkpoint), ledger)
-
-    def invoke(item: tuple[str, dict[str, Any]]) -> tuple[str, Any, str | None, bool]:
+    def invoke(item: tuple[str, dict[str, Any]]) -> tuple[str, Any, dict[str, Any] | None, bool]:
         request_sha, request = item
         dispatched = False
         try:
@@ -602,72 +665,108 @@ def execute_presence_preview(
                         revalidate_two_sided_evidence(code_evidence_repo, evidence)
                     else:
                         raise JgError("presence evidence has an unsupported validation kind")
-            dispatched = True
+        except Exception as exc:
+            return request_sha, None, _safe_failure_metadata(exc, "evidence_revalidation"), dispatched
+        dispatched = True
+        try:
             response = actual_transport(request, token)
+        except Exception as exc:
+            return request_sha, None, _safe_failure_metadata(exc, "sdk_transport"), dispatched
+        usage = response.get("usage") if isinstance(response, Mapping) else None
+        if isinstance(usage, Mapping) and any(usage.get(field) is None for field in ("input_tokens", "output_tokens")):
+            return request_sha, None, {"failure_stage": "response_validation", "error_class": "usage_unavailable"}, dispatched
+        try:
             validate_response(request, response)
+        except Exception as exc:
+            return request_sha, None, _safe_failure_metadata(exc, "response_validation"), dispatched
+        try:
             _validate_response_scope(request, response)
-            return request_sha, response, None, dispatched
-        except Exception:
-            return request_sha, None, "transport_or_validation_error", dispatched
+        except Exception as exc:
+            return request_sha, None, _safe_failure_metadata(exc, "response_scope_validation"), dispatched
+        return request_sha, response, None, dispatched
 
     ledger["network_performed"] = bool(ledger.get("network_performed"))
+    prior_actual = ledger.get("actual_budgets", {})
+    initial_wall = prior_actual.get("wall_time_seconds", 0) if isinstance(prior_actual, Mapping) else 0
     elapsed_started = monotonic()
     attempts = {item["request_sha256"]: item for item in ledger["attempts"]}
 
+    def total_wall_time() -> float:
+        return initial_wall + monotonic() - elapsed_started
+
     def persist_progress() -> None:
-        prior_actual = ledger.get("actual_budgets", {})
-        prior_wall = prior_actual.get("wall_time_seconds", 0) if isinstance(prior_actual, Mapping) else 0
+        usage_known = all(item.get("status") != "uncertain" for item in ledger["attempts"])
         ledger["actual_budgets"] = {
-            "attempted_requests": len(ledger["attempts"]),
+            "attempted_requests": sum(item.get("status") != "not_dispatched" for item in ledger["attempts"]),
             "successful_requests": len(ledger["answers"]),
-            "input_tokens": sum(item["response"]["usage"]["input_tokens"] for item in ledger["answers"]),
-            "output_tokens": sum(item["response"]["usage"]["output_tokens"] for item in ledger["answers"]),
-            "wall_time_seconds": prior_wall + monotonic() - elapsed_started,
+            "input_tokens": (sum(item["response"]["usage"]["input_tokens"] for item in ledger["answers"])
+                             if usage_known else None),
+            "output_tokens": (sum(item["response"]["usage"]["output_tokens"] for item in ledger["answers"])
+                              if usage_known else None),
+            "wall_time_seconds": total_wall_time(),
         }
+        update_unattempted()
         _seal_checkpoint(ledger)
         _write_checkpoint(Path(checkpoint), ledger)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(invoke, item): item[0] for item in request_by_sha.items()}
-        outcomes = []
-        for future in concurrent.futures.as_completed(futures):
-            request_sha, response, error_class, dispatched = future.result()
-            ledger["network_performed"] = bool(ledger.get("network_performed") or dispatched)
-            attempt = attempts[request_sha]
-            if error_class:
-                attempt["error_class"] = error_class
+        pending = iter(request_by_sha.items())
+        futures: dict[concurrent.futures.Future, str] = {}
+        stop_scheduling = False
+
+        def submit_one() -> bool:
+            try:
+                item = next(pending)
+            except StopIteration:
+                return False
+            request_sha, request = item
+            attempt = {"request_sha256": request_sha, "group_id": request["state"].get("group_id"),
+                       "status": "uncertain", "started_at": datetime.now(UTC).isoformat()}
+            ledger["attempts"].append(attempt)
+            attempts[request_sha] = attempt
+            update_unattempted()
+            _seal_checkpoint(ledger, create_key=True)
+            _write_checkpoint(Path(checkpoint), ledger)
+            futures[pool.submit(invoke, item)] = request_sha
+            return True
+
+        while len(futures) < max_workers and submit_one():
+            pass
+        while futures:
+            done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
+            for future in done:
+                request_sha = futures.pop(future)
+                _, response, failure, dispatched = future.result()
+                ledger["network_performed"] = bool(ledger.get("network_performed") or dispatched)
+                attempt = attempts[request_sha]
+                if failure:
+                    attempt.update(failure)
+                    if not dispatched:
+                        attempt["status"] = "not_dispatched"
+                    stop_scheduling = True
+                else:
+                    attempt.update({"status": "succeeded", "completed_at": datetime.now(UTC).isoformat(),
+                                    "model": response["model"], "usage": dict(response["usage"])})
+                    ledger["answers"].append({"request_sha256": request_sha,
+                                              "group_id": request_by_sha[request_sha]["state"].get("group_id"),
+                                              "contribution_bindings": _request_bindings(request_by_sha[request_sha]),
+                                              "response": _sanitize_response(request_by_sha[request_sha], response)})
+                    ledger["answers"].sort(key=lambda item: item["request_sha256"])
                 persist_progress()
-                continue
-            attempt.update({"status": "succeeded", "completed_at": datetime.now(UTC).isoformat(),
-                            "model": response["model"], "usage": dict(response["usage"])})
-            ledger["answers"].append({"request_sha256": request_sha,
-                                      "group_id": request_by_sha[request_sha]["state"].get("group_id"),
-                                      "contribution_bindings": _request_bindings(request_by_sha[request_sha]),
-                                      "response": _sanitize_response(request_by_sha[request_sha], response)})
-            ledger["answers"].sort(key=lambda item: item["request_sha256"])
-            persist_progress()
-    attempts = {item["request_sha256"]: item for item in ledger["attempts"]}
-    for request_sha, response, error_class, dispatched in outcomes:
-        ledger["network_performed"] = bool(ledger["network_performed"] or dispatched)
-        attempt = attempts[request_sha]
-        if error_class:
-            attempt["error_class"] = error_class
-            continue
-        attempt.update({"status": "succeeded", "completed_at": datetime.now(UTC).isoformat(),
-                        "model": response["model"], "usage": dict(response["usage"])})
-        ledger["answers"].append({"request_sha256": request_sha,
-                                  "group_id": request_by_sha[request_sha]["state"].get("group_id"),
-                                  "contribution_bindings": _request_bindings(request_by_sha[request_sha]),
-                                  "response": _sanitize_response(request_by_sha[request_sha], response)})
-    prior_actual = ledger.get("actual_budgets", {})
-    prior_wall = prior_actual.get("wall_time_seconds", 0) if isinstance(prior_actual, Mapping) else 0
+            if not stop_scheduling:
+                while len(futures) < max_workers and submit_one():
+                    pass
+    usage_known = all(item.get("status") != "uncertain" for item in ledger["attempts"])
     ledger["actual_budgets"] = {
-        "attempted_requests": len(ledger["attempts"]),
+        "attempted_requests": sum(item.get("status") != "not_dispatched" for item in ledger["attempts"]),
         "successful_requests": len(ledger["answers"]),
-        "input_tokens": sum(item["response"]["usage"]["input_tokens"] for item in ledger["answers"]),
-        "output_tokens": sum(item["response"]["usage"]["output_tokens"] for item in ledger["answers"]),
-        "wall_time_seconds": prior_wall + monotonic() - elapsed_started,
+        "input_tokens": (sum(item["response"]["usage"]["input_tokens"] for item in ledger["answers"])
+                         if usage_known else None),
+        "output_tokens": (sum(item["response"]["usage"]["output_tokens"] for item in ledger["answers"])
+                          if usage_known else None),
+        "wall_time_seconds": total_wall_time(),
     }
+    update_unattempted()
     _seal_checkpoint(ledger)
     _write_checkpoint(Path(checkpoint), ledger)
     ledger.pop("checkpoint_signature", None)
