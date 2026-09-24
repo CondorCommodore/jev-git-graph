@@ -306,6 +306,11 @@ def _safe_validation_failure(exc: BaseException) -> tuple[str, str | None]:
     elif isinstance(exc, OSError):
         code = "local_runtime_read_failed"
         message = ""
+    elif isinstance(exc, RuntimeError):
+        # pathlib strict-resolution loops raise RuntimeError on supported
+        # Python versions; never copy that exception's path-bearing text.
+        code = "runtime_validation_error"
+        message = ""
     else:
         code = "runtime_probe_failed"
         message = ""
@@ -324,7 +329,7 @@ def production_capability_diagnostic(
     """
     try:
         current = resolve_production_creator_capability(repository)
-    except (JgError, OSError, subprocess.SubprocessError) as exc:
+    except (JgError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
         failure, label = _safe_validation_failure(exc)
         return {
             "ok": False,

@@ -646,6 +646,83 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(1, resolve.call_count)
         self.assertNotIn("SECRET_VALUE", json.dumps(failed))
 
+    def test_post_intent_runtime_error_is_sanitized_in_result_and_journal(self):
+        repo, topic_tip, main_tip = self.make_repo(old_commits=True)
+        coverage = coverage_for(repo, [{"name": "topic", "tip": topic_tip,
+                                        "main_tip": main_tip, "verdict": "EXACT",
+                                        "reason": None, "last_activity_epoch": 1,
+                                        "paths": [{"path": "topic",
+                                                   "verdict": "EXACT_PRESENT"}]}])
+        with tempfile.TemporaryDirectory() as out:
+            root = Path(out)
+            plan = build_old_plan(repo, coverage, bundle_dir=root / "bundle")
+            approved = approve_cleanup_plan(plan, approved_digest=plan["plan_digest"])
+            common_dir = _common_dir(repo)
+            lease_root = (root / "leases").resolve(strict=False)
+            label = "com.mikebook.merge-safe-prs-loop"
+            capability = CreatorLeaseCapability(
+                common_dir=common_dir,
+                runtime_roots=(root / "stable", root / "compat", root / "canonical"),
+                hook_digests=((str(root / "stable"), "scripts/cooperative_branch_lease.py",
+                               "1" * 64),),
+                loaded_runtime_jobs=((label, str(root / "launchd.plist"),
+                                      str(root / "stable"), "a" * 64),),
+                lock_root=lease_root,
+                train_construction_runtime=root / "train-runtime",
+                train_construction_commit="b" * 40,
+            )
+            adapter = CooperativeBranchLeaseAdapter(
+                str(common_dir), lease_root, capability=capability,
+            )
+            adapter.common_dir = common_dir
+            journal_path = root / "actions.jsonl"
+            marker = "PRIVATE_PATH_SECRET_MARKER"
+            with patch("jev_git_graph.cleanup._fixed_lock_root",
+                       return_value=lease_root), \
+                    patch("jev_git_graph.coordinator.resolve_production_creator_capability",
+                          side_effect=[capability, capability, capability,
+                                       RuntimeError(marker + " /private/path")]) as resolve:
+                result = execute_cleanup(
+                    repo, approved, approved_digest=approved["plan_digest"],
+                    lease_contract=adapter, journal_path=journal_path,
+                )
+            self.assertEqual(4, resolve.call_count)
+            self.assertEqual("creator_capability_changed", result["stopped"])
+            self.assertEqual("runtime_validation_error",
+                             result["capability_diagnostic"]["validation_failure"])
+            self.assertNotIn(marker, json.dumps(result))
+            self.assertEqual(topic_tip, run(repo, "rev-parse", "refs/heads/topic"))
+            events = CleanupActionJournal(journal_path).read_events()
+            self.assertEqual("runtime_validation_error",
+                             events[-1]["capability_diagnostic"]["validation_failure"])
+            self.assertNotIn(marker, json.dumps(events))
+
+    def test_lease_path_runtime_error_has_fixed_diagnostic(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            common_dir = root / "repo.git"
+            lease_root = (root / "leases").resolve(strict=False)
+            capability = CreatorLeaseCapability(
+                common_dir=common_dir,
+                runtime_roots=(root / "stable", root / "compat", root / "canonical"),
+                hook_digests=(), loaded_runtime_jobs=(), lock_root=lease_root,
+                train_construction_runtime=root / "train-runtime",
+                train_construction_commit=None,
+            )
+            adapter = CooperativeBranchLeaseAdapter(
+                str(common_dir), lease_root, capability=capability,
+            )
+            adapter.common_dir = common_dir
+            marker = "PRIVATE_PATH_SECRET_MARKER"
+            with patch("jev_git_graph.cleanup._fixed_lock_root",
+                       return_value=lease_root), \
+                    patch("jev_git_graph.cleanup._common_dir",
+                          side_effect=RuntimeError(marker + " /private/path")):
+                self.assertFalse(_lease_established(adapter, root))
+            self.assertEqual("runtime_validation_error",
+                             adapter.last_capability_diagnostic["validation_failure"])
+            self.assertNotIn(marker, json.dumps(adapter.last_capability_diagnostic))
+
     def test_post_delete_capability_drift_restores_exact_tip_without_overwriting_recreation(self):
         # Exercise both outcomes after a real CAS deletion: restore the pinned
         # source only while the ref is still absent, and preserve a concurrent

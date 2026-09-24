@@ -430,6 +430,13 @@ def _lease_established(contract: Any, repository: Path | None = None) -> bool:
                 "validation_failure": "unsupported_capability",
             }
             return False
+    except RuntimeError:
+        contract.last_capability_diagnostic = {
+            "ok": False, "status": "validation_failed",
+            "changed_fields": ["lease_validation"],
+            "validation_failure": "runtime_validation_error",
+        }
+        return False
     except (JgError, OSError, subprocess.SubprocessError):
         contract.last_capability_diagnostic = {
             "ok": False, "status": "validation_failed",
