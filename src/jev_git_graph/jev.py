@@ -453,9 +453,8 @@ def execute_preview(
         })
         if approved_code_batch_sha256 != expected_batch:
             raise JgError("approved code batch digest does not match preview")
-    token = os.environ.get("TYPESAFE_API_KEY")
-    if not token:
-        raise JgError("--use-jev requires TYPESAFE_API_KEY in the process environment")
+    from .credential_cache import resolve_provider_token
+    token = resolve_provider_token()
     ledger = {
         "kind": "relations", "source_preview_sha256": approved_payload_sha256,
         "question_version": preview.get("question_version"), "network_performed": False,
