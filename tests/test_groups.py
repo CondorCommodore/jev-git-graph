@@ -105,29 +105,16 @@ class TestGroups(unittest.TestCase):
 
     def test_large_component_has_bidirectional_boundary_edges(self):
         branches = [branch("squad/task/part")]
-        units = [unit(f"cu-{index:03}", "squad/task/part") for index in range(7)]
+        units = [unit(f"cu-{index:03}", "squad/task/part", path=f"src/{index}.py") for index in range(7)]
         result = build_groups(contribution_artifact(branches, units), max_units=3)
         groups = result["groups"]
         self.assertEqual([len(group["unit_ids"]) for group in groups], [3, 3, 1])
         boundary_id_sets = [{edge["id"] for edge in group["boundary_edges"]} for group in groups]
         self.assertTrue(boundary_id_sets[0] & boundary_id_sets[1])
         self.assertTrue(boundary_id_sets[1] & boundary_id_sets[2])
-        self.assertTrue(all(not group["context_complete"] for group in groups))
-
-    def test_unparsed_python_marks_only_its_group_context_incomplete(self):
-        branches = [branch("feature/parsed"), branch("feature/unparsed")]
-        units = [
-            unit("cu-parsed", "feature/parsed", path="src/parsed.py"),
-            unit("cu-unparsed", "feature/unparsed", path="src/unparsed.py",
-                 limitations=["python_parse_unsupported"]),
-        ]
-
-        result = build_groups(contribution_artifact(branches, units))
-
-        groups_by_unit = {group["unit_ids"][0]: group for group in result["groups"]}
-        self.assertTrue(groups_by_unit["cu-parsed"]["context_complete"])
-        self.assertFalse(groups_by_unit["cu-unparsed"]["context_complete"])
-        self.assertIn("python_parse_unsupported", groups_by_unit["cu-unparsed"]["limitations"])
+        self.assertTrue(all(group["context_complete"] for group in groups))
+        self.assertTrue(all(group["candidate_boundary_edge_count"] > 0 for group in groups))
+        self.assertEqual(result["coverage"]["groups_with_candidate_boundaries"], 3)
 
     def test_common_path_candidate_discovery_uses_linear_edges_and_accounts_for_every_unit(self):
         branches = [branch(f"independent/{index:03}") for index in range(300)]
@@ -179,6 +166,131 @@ class TestGroups(unittest.TestCase):
         self.assertEqual(result["schema_version"], 3)
         self.assertEqual([edge["kind"] for edge in result["groups"][0]["edges"]], ["structural_match"])
         self.assertEqual(result["groups"][0]["omitted_edges_by_type"], {"same_branch": 1})
+
+    def test_group_partition_keeps_strong_dependency_ahead_of_weak_path_signal(self):
+        branches = [branch("feature/a"), branch("feature/b"), branch("feature/c")]
+        units = [
+            unit("cu-a", "feature/a", path="shared.py"),
+            unit("cu-b", "feature/b", path="shared.py"),
+            unit("cu-c", "feature/c", path="shared.py"),
+        ]
+        dependency = {
+            "source_id": "cu-b", "destination_id": "cu-c",
+            "type": "dependency", "provenance": "static_ast_symbol_reference",
+        }
+
+        result = build_groups(contribution_artifact(branches, units, edges=[dependency]), max_units=2)
+
+        groups_by_units = {tuple(group["unit_ids"]): group for group in result["groups"]}
+        self.assertEqual(set(groups_by_units), {("cu-a",), ("cu-b", "cu-c")})
+        strong_group = groups_by_units[("cu-b", "cu-c")]
+        self.assertTrue(any(edge["kind"] == "dependency" for edge in strong_group["edges"]))
+        self.assertFalse(any(edge["kind"] == "dependency" for group in result["groups"]
+                             for edge in group["boundary_edges"]))
+        self.assertEqual(result["coverage"]["accepted_group_merges_by_type"], {"dependency": 1})
+        self.assertGreater(result["coverage"]["rejected_group_merges_by_type"]["path"], 0)
+        self.assertTrue(all(len(group["unit_ids"]) <= 2 for group in result["groups"]))
+
+    def test_group_partition_reports_relationships_cut_by_the_size_bound(self):
+        branches = [branch("feature/a")]
+        units = [unit(f"cu-{index:03}", "feature/a", path=f"src/{index}.py") for index in range(7)]
+
+        result = build_groups(contribution_artifact(branches, units), max_units=3)
+
+        self.assertEqual(sum(len(group["unit_ids"]) for group in result["groups"]), 7)
+        self.assertTrue(all(len(group["unit_ids"]) <= 3 for group in result["groups"]))
+        self.assertGreater(result["coverage"]["rejected_group_merges_by_type"]["same_branch"], 0)
+        self.assertTrue(all(group["context_complete"] for group in result["groups"]))
+        self.assertTrue(all(group["candidate_boundary_edge_count"] > 0 for group in result["groups"]))
+
+    def test_unparsed_python_marks_only_its_group_context_incomplete(self):
+        branches = [branch("feature/parsed"), branch("feature/unparsed")]
+        units = [
+            unit("cu-parsed", "feature/parsed", path="src/parsed.py"),
+            unit("cu-unparsed", "feature/unparsed", path="src/unparsed.py",
+                 limitations=["python_parse_unsupported"]),
+        ]
+
+        result = build_groups(contribution_artifact(branches, units))
+
+        groups_by_unit = {group["unit_ids"][0]: group for group in result["groups"]}
+        self.assertTrue(groups_by_unit["cu-parsed"]["context_complete"])
+        self.assertFalse(groups_by_unit["cu-unparsed"]["context_complete"])
+        self.assertIn("python_parse_unsupported", groups_by_unit["cu-unparsed"]["limitations"])
+
+    def test_dependency_crossing_a_bounded_partition_keeps_context_incomplete(self):
+        branches = [branch("feature/a"), branch("feature/b"), branch("feature/c"), branch("feature/d")]
+        units = [unit(f"cu-{letter}", f"feature/{letter}", path=f"src/{letter}.py") for letter in "abcd"]
+        edges = [
+            {"source_id": "cu-a", "destination_id": "cu-b", "type": "dependency", "provenance": "static_ast"},
+            {"source_id": "cu-b", "destination_id": "cu-c", "type": "dependency", "provenance": "static_ast"},
+            {"source_id": "cu-c", "destination_id": "cu-d", "type": "dependency", "provenance": "static_ast"},
+        ]
+
+        result = build_groups(contribution_artifact(branches, units, edges=edges), max_units=2)
+
+        self.assertEqual([group["unit_ids"] for group in result["groups"]], [["cu-a", "cu-b"], ["cu-c", "cu-d"]])
+        self.assertEqual(result["coverage"]["groups_with_required_boundaries"], 2)
+        self.assertTrue(all(not group["context_complete"] for group in result["groups"]))
+        self.assertTrue(all(group["required_boundary_edge_count"] == 1 for group in result["groups"]))
+
+    def test_omitted_dependency_boundary_remains_counted(self):
+        branches = [branch(f"feature/{letter}") for letter in "abc"]
+        units = [unit(f"cu-{letter}", f"feature/{letter}", path=f"src/{letter}.py") for letter in "abc"]
+        edges = [
+            {"source_id": "cu-a", "destination_id": "cu-b", "type": "dependency", "provenance": "static_ast"},
+            {"source_id": "cu-b", "destination_id": "cu-c", "type": "dependency", "provenance": "static_ast"},
+        ]
+
+        result = build_groups(contribution_artifact(branches, units, edges=edges), max_units=2, max_edges=1)
+
+        self.assertEqual(result["coverage"]["groups_with_required_boundaries"], 2)
+        self.assertEqual(result["coverage"]["omitted_output_edges_by_type"]["dependency"], 1)
+        for group in result["groups"]:
+            self.assertEqual(group["required_boundary_edge_count"], 1)
+            self.assertEqual(group["omitted_required_boundary_edge_count"], 1)
+            self.assertEqual(group["omitted_edges_by_type"]["dependency"], 1)
+            self.assertIn("partition_has_required_cross_group_edges", group["limitations"])
+            self.assertFalse(group["context_complete"])
+
+    def test_omitted_candidate_boundary_remains_visible_without_dependency_gap(self):
+        branches = [branch(f"feature/{letter}") for letter in "abc"]
+        units = [unit(f"cu-{letter}", f"feature/{letter}", path=f"src/{letter}.py") for letter in "abc"]
+        edges = [
+            {"source_id": "cu-a", "destination_id": "cu-b", "type": "dependency", "provenance": "static_ast"},
+            {"source_id": "cu-b", "destination_id": "cu-c", "type": "path", "provenance": "path_similarity"},
+        ]
+
+        result = build_groups(contribution_artifact(branches, units, edges=edges), max_units=2, max_edges=1)
+
+        self.assertEqual(result["coverage"]["groups_with_candidate_boundaries"], 2)
+        self.assertEqual(result["coverage"]["omitted_output_edges_by_type"]["path"], 1)
+        for group in result["groups"]:
+            self.assertEqual(group["candidate_boundary_edge_count"], 1)
+            self.assertEqual(group["omitted_candidate_boundary_edge_count"], 1)
+            self.assertNotIn("partition_has_required_cross_group_edges", group["limitations"])
+            self.assertNotIn("edge_output_budget_exhausted", group["limitations"])
+            self.assertTrue(group["context_complete"])
+
+    def test_structural_match_edge_budget_omission_preserves_destination_context(self):
+        branches = [branch("feature/a")]
+        destinations = [{"id": "du-a"}, {"id": "du-b"}]
+        units = [
+            unit("cu-a", "feature/a", path="src/a.py", destination_ids=["du-a"]),
+            unit("cu-b", "feature/a", path="src/b.py", destination_ids=["du-b"]),
+        ]
+        edges = [
+            {"source_id": "cu-a", "destination_id": "du-a", "type": "structural_match", "provenance": "ast_fingerprint"},
+            {"source_id": "cu-b", "destination_id": "du-b", "type": "structural_match", "provenance": "ast_fingerprint"},
+        ]
+
+        result = build_groups(contribution_artifact(branches, units, destinations, edges), max_edges=1)
+
+        group = result["groups"][0]
+        self.assertTrue(group["context_complete"])
+        self.assertEqual(group["destination_ids"], ["du-a", "du-b"])
+        self.assertEqual(group["omitted_edges_by_type"], {"structural_match": 1, "same_branch": 1})
+        self.assertNotIn("edge_output_budget_exhausted", group["limitations"])
 
     def test_edge_to_excluded_source_is_retained_as_one_sided_boundary(self):
         branches = [branch("feature/eligible"), branch("feature/excluded", False, ["active_within_cutoff"])]
