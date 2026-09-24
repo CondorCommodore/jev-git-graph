@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import plistlib
 import subprocess
 import tempfile
 import unittest
@@ -13,10 +14,16 @@ from jev_git_graph.cleanup import (_atomic_delete,
 from jev_git_graph.cli import main as jg_main
 from jev_git_graph.coordinator import (CleanupActionJournal,
                                        CooperativeBranchLeaseAdapter,
+                                       _common_dir,
+                                       _attest_process_generation,
+                                       _verify_process_startup_attestation,
+                                       _verify_loaded_runtime_jobs,
+                                       _verify_train_construction_runtime,
+                                       _verify_runtime_hook_files,
                                        build_disposable_fixture_inventory,
+                                       capability_receipt_metadata,
                                        cleanup_action_id,
-                                       reconcile_interrupted_cleanup,
-                                       resolve_production_creator_capability)
+                                       reconcile_interrupted_cleanup)
 from jev_git_graph.errors import JgError
 from jev_git_graph.inventory import build_inventory
 from jev_git_graph.safety import digest, opaque_path_id
@@ -59,9 +66,211 @@ def build_old_plan(*args, **kwargs):
 
 
 class CleanupTests(unittest.TestCase):
-    def test_production_creator_capability_stays_plan_only_without_loaded_code_proof(self):
-        with self.assertRaisesRegex(JgError, "per-process creator startup attestations"):
-            resolve_production_creator_capability("/uninspected/repository")
+    def test_idle_runtime_job_requires_matching_loaded_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            runtime = home / "code/home-lab"
+            (runtime / "launchd").mkdir(parents=True)
+            (runtime / "scripts").mkdir()
+            launcher = runtime / "launchd/start.sh"
+            process = runtime / "scripts/entry.py"
+            launcher.write_text("#!/bin/sh\n")
+            process.write_text("pass\n")
+            plist_path = home / "Library/LaunchAgents/com.example.creator.plist"
+            plist_path.parent.mkdir(parents=True)
+            plist_path.write_bytes(plistlib.dumps({
+                "Label": "com.example.creator",
+                "ProgramArguments": ["/bin/sh", str(launcher)],
+            }))
+            launchctl_result = subprocess.CompletedProcess(
+                ["launchctl"], 0, stdout=(f"path = {plist_path}\nstate = not running\n"
+                    f"arguments = {{\n    /bin/sh\n    {launcher}\n}}\n"), stderr="",
+            )
+            with patch("jev_git_graph.coordinator._RUNTIME_SELECTORS", (
+                    "code/.runtime/releases/home-lab/stable", "code/.runtime/home-lab", "code/home-lab")), \
+                    patch("jev_git_graph.coordinator._REQUIRED_LAUNCHD_SELECTORS", {
+                        "com.example.creator": "code/home-lab"}), \
+                    patch("jev_git_graph.coordinator._REQUIRED_LAUNCHD_PATHS", {
+                        "com.example.creator": ("launchd/start.sh", "scripts/entry.py", "runtime")}), \
+                    patch("jev_git_graph.coordinator.subprocess.run", return_value=launchctl_result):
+                jobs = _verify_loaded_runtime_jobs(home, (runtime, runtime, runtime))
+                self.assertEqual(len(jobs), 1)
+                self.assertEqual(len(jobs[0][3]), 64)
+                launchctl_result.stdout = (f"path = {plist_path}\nstate = not running\n"
+                    "arguments = {\n    /bin/sh\n    /tmp/unreviewed.sh\n}\n")
+                with self.assertRaisesRegex(JgError, "loaded creator command differs"):
+                    _verify_loaded_runtime_jobs(home, (runtime, runtime, runtime))
+                unavailable = subprocess.CompletedProcess(["launchctl"], 113, stdout="", stderr="not found")
+                disabled = subprocess.CompletedProcess(
+                    ["launchctl"], 0,
+                    stdout='"com.example.creator" => disabled\n', stderr="")
+                with patch("jev_git_graph.coordinator.subprocess.run",
+                           side_effect=lambda command, **_kwargs: (
+                               disabled if command[1] == "print-disabled" else unavailable)):
+                    self.assertEqual(len(_verify_loaded_runtime_jobs(
+                        home, (runtime, runtime, runtime))), 1)
+                    disabled.stdout = '"com.example.creator" => enabled\n'
+                    with self.assertRaisesRegex(JgError, "unavailable and not disabled"):
+                        _verify_loaded_runtime_jobs(home, (runtime, runtime, runtime))
+
+    def test_creator_generation_is_bound_to_pid_and_reviewed_hook_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory)
+            helper = runtime / "scripts/cooperative_branch_lease.py"
+            helper.parent.mkdir()
+            contents = 'CONTRACT = "jev-git-graph/cooperative-branch-lease-v1"\n'
+            helper.write_text(contents)
+            os.utime(helper, (1_000, 1_000))
+            with patch("jev_git_graph.coordinator._REVIEWED_HOOK_FILES", {
+                    "scripts/cooperative_branch_lease.py": hashlib.sha256(contents.encode()).hexdigest()}):
+                first_generation = _attest_process_generation(runtime, 123, 999)
+                same_generation = _attest_process_generation(runtime, 123, 999)
+                restarted_generation = _attest_process_generation(runtime, 456, 999)
+                self.assertEqual(first_generation, same_generation)
+                self.assertNotEqual(first_generation, restarted_generation)
+
+    def test_startup_attestation_requires_exact_process_and_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            run(runtime, "init", "-q", "-b", "main")
+            run(runtime, "config", "user.name", "Fixture")
+            run(runtime, "config", "user.email", "fixture@example.invalid")
+            source = runtime / "scripts/entry.py"
+            helper = runtime / "scripts/cooperative_branch_lease.py"
+            shell = runtime / "launchd/start.sh"
+            source.parent.mkdir()
+            shell.parent.mkdir()
+            source.write_text("pass\n")
+            helper.write_text('CONTRACT = "jev-git-graph/cooperative-branch-lease-v1"\n')
+            shell.write_text("#!/bin/bash\nexit 0\n")
+            run(runtime, "add", ".")
+            run(runtime, "commit", "-qm", "reviewed runtime")
+            source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+            helper_sha = hashlib.sha256(helper.read_bytes()).hexdigest()
+            shell_sha = hashlib.sha256(shell.read_bytes()).hexdigest()
+            label = "com.example.creator"
+            process_start = "Wed Sep 24 08:00:00 2026"
+            home = root / "home"
+            directory_path = home / ".local/state/jev-git-graph/creator-runtime-attestations"
+            directory_path.mkdir(parents=True)
+            os.chmod(directory_path, 0o700)
+            pid = os.getpid()
+            receipt = {
+                "contract": "jev-git-graph/creator-runtime-attestation-v1",
+                "pid": pid,
+                "process_start": process_start,
+                "runtime_root_sha256": hashlib.sha256(str(runtime.resolve()).encode()).hexdigest(),
+                "runtime_commit": run(runtime, "rev-parse", "HEAD"),
+                "creator": label,
+                "attestations": [{
+                    "creator": label,
+                    "kind": "python_code",
+                    "source_path": "scripts/entry.py",
+                    "source_sha256": source_sha,
+                    "loaded_code_sha256": "a" * 64,
+                    "helper_path": "scripts/cooperative_branch_lease.py",
+                    "helper_sha256": helper_sha,
+                }],
+            }
+            path = directory_path / f"{pid}.json"
+            path.write_text(json.dumps(receipt))
+            os.chmod(path, 0o600)
+            with patch("jev_git_graph.coordinator._REVIEWED_HOOK_FILES", {
+                    "scripts/cooperative_branch_lease.py": helper_sha,
+                    "scripts/entry.py": source_sha,
+                    "launchd/start.sh": shell_sha}):
+                self.assertEqual(_verify_process_startup_attestation(
+                    home, runtime, pid, process_start, label, "scripts/entry.py"),
+                    digest(receipt))
+                with self.assertRaisesRegex(JgError, "shell source receipts are not authoritative"):
+                    _verify_process_startup_attestation(
+                        home, runtime, pid, process_start, label, "launchd/start.sh")
+                with self.assertRaisesRegex(JgError, "generation mismatch"):
+                    _verify_process_startup_attestation(
+                        home, runtime, pid, process_start + " stale", label, "scripts/entry.py")
+                path.unlink()
+                with self.assertRaisesRegex(JgError, "attestation missing"):
+                    _verify_process_startup_attestation(
+                        home, runtime, pid, process_start, label, "scripts/entry.py")
+                tampered = dict(receipt)
+                tampered["attestations"] = [dict(receipt["attestations"][0], source_sha256="0" * 64)]
+                path.write_text(json.dumps(tampered))
+                os.chmod(path, 0o600)
+                with self.assertRaisesRegex(JgError, "source digest mismatch"):
+                    _verify_process_startup_attestation(
+                        home, runtime, pid, process_start, label, "scripts/entry.py")
+                path.write_text(json.dumps(receipt))
+                with patch("jev_git_graph.coordinator._SUPERVISED_SHELL_SOURCES", {
+                        label: ("launchd/start.sh",)}):
+                    with self.assertRaisesRegex(JgError, "reviewed shell descriptor missing"):
+                        _verify_process_startup_attestation(
+                            home, runtime, pid, process_start, label, "scripts/entry.py")
+                    receipt["attestations"].append({
+                        "creator": label, "kind": "shell_fd",
+                        "source_path": "launchd/start.sh", "source_sha256": shell_sha,
+                        "loaded_code_sha256": shell_sha,
+                        "helper_path": "scripts/cooperative_branch_lease.py",
+                        "helper_sha256": helper_sha,
+                    })
+                    path.write_text(json.dumps(receipt))
+                    self.assertEqual(_verify_process_startup_attestation(
+                        home, runtime, pid, process_start, label, "scripts/entry.py"), digest(receipt))
+
+    def test_unreviewed_creator_hook_digest_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory)
+            helper = runtime / "scripts/cooperative_branch_lease.py"
+            helper.parent.mkdir()
+            helper.write_text('CONTRACT = "jev-git-graph/cooperative-branch-lease-v1"\n')
+            with patch("jev_git_graph.coordinator._REVIEWED_HOOK_FILES", {
+                    "scripts/cooperative_branch_lease.py": "0" * 64}):
+                with self.assertRaisesRegex(JgError, "creator runtime hook digest mismatch"):
+                    _verify_runtime_hook_files(runtime)
+
+    def test_train_construction_requires_live_clean_origin_main_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "repo"
+            repository.mkdir()
+            run(repository, "init", "-q", "-b", "main")
+            run(repository, "config", "user.name", "Fixture")
+            run(repository, "config", "user.email", "fixture@example.invalid")
+            contents = {
+                "scripts/cooperative_branch_lease.py": (
+                    'CONTRACT = "jev-git-graph/cooperative-branch-lease-v1"\n'),
+                "scripts/train_builder.py": "# pinned train builder\n",
+                "scripts/train_construction_driver.py": "# pinned driver\n",
+                "launchd/start-train-construction.sh": "#!/bin/sh\nexit 0\n",
+            }
+            expected = {}
+            for relative, content in contents.items():
+                path = repository / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content)
+                expected[relative] = hashlib.sha256(content.encode()).hexdigest()
+            run(repository, "add", ".")
+            run(repository, "commit", "-qm", "reviewed creator snapshot")
+            run(repository, "update-ref", "refs/remotes/origin/main", "HEAD")
+
+            home = root / "home"
+            runtime = home / ".local/share/home-lab/train-promotion-runtime"
+            runtime.parent.mkdir(parents=True)
+            run(repository, "worktree", "add", "--detach", str(runtime), "HEAD")
+            with patch("jev_git_graph.coordinator._REVIEWED_HOOK_FILES", expected):
+                verified_root, verified_commit, records = _verify_train_construction_runtime(
+                    home, _common_dir(repository))
+                self.assertEqual(runtime.resolve(), verified_root)
+                self.assertEqual(run(repository, "rev-parse", "HEAD"), verified_commit)
+                self.assertEqual(len(expected), len(records))
+
+                (repository / "scripts/train_construction_driver.py").write_text("# changed driver\n")
+                run(repository, "add", ".")
+                run(repository, "commit", "-qm", "new origin main")
+                run(repository, "update-ref", "refs/remotes/origin/main", "HEAD")
+                with self.assertRaisesRegex(JgError, "train-construction-runtime_snapshot_mismatch"):
+                    _verify_train_construction_runtime(home, _common_dir(repository))
 
     def integrated_lease(self, repository: Path) -> CooperativeBranchLeaseAdapter:
         fixture_root = repository.parent
@@ -234,6 +443,12 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual("deleted", events[-1]["status"])
         self.assertEqual(topic_tip, events[0]["tip"])
         self.assertEqual(main_tip, events[-1]["observed_destination_tip"])
+        self.assertEqual(events[0]["creator_capability_sha256"],
+                         events[-1]["creator_capability_sha256"])
+        self.assertEqual(64, len(events[-1]["creator_capability_sha256"]))
+        self.assertIsNone(events[-1]["creator_runtime_commit"])
+        self.assertEqual(events[-1]["creator_capability_sha256"],
+                         result["creator_capability_sha256"])
         self.assertFalse(_ref_exists(repo, "topic"))
 
     def test_capability_drift_after_branch_lock_blocks_ref_transaction(self):
@@ -320,6 +535,12 @@ class CleanupTests(unittest.TestCase):
             plan = build_old_plan(repo, coverage, bundle_dir=root / "bundle")
             approved = approve_cleanup_plan(plan, approved_digest=plan["plan_digest"])
             action_id = cleanup_action_id(approved["plan_digest"], 0, "topic", topic_tip)
+            fixture_root = repo.parent
+            inventory = build_disposable_fixture_inventory(
+                repo, ["topic"], operator="interrupted fixture", fixture_root=fixture_root)
+            lease = CooperativeBranchLeaseAdapter.for_disposable_fixture(
+                repo, inventory, ["topic"], fixture_root=fixture_root)
+            receipt = capability_receipt_metadata(lease.capability)
             journal = CleanupActionJournal(root / "actions.jsonl")
             journal.append({
                 "event": "intent", "action_id": action_id,
@@ -327,13 +548,9 @@ class CleanupTests(unittest.TestCase):
                 "branch": "topic",
                 "tip": topic_tip, "destination": "main", "destination_tip": main_tip,
                 "bundle_sha256": approved["bundle"]["sha256"],
+                **receipt,
             })
-            fixture_root = repo.parent
-            inventory = build_disposable_fixture_inventory(
-                repo, ["topic"], operator="interrupted fixture", fixture_root=fixture_root)
             run(repo, "update-ref", "-d", "refs/heads/topic", topic_tip)
-            lease = CooperativeBranchLeaseAdapter.for_disposable_fixture(
-                repo, inventory, ["topic"], fixture_root=fixture_root)
             results = reconcile_interrupted_cleanup(repo, approved, journal, lease)
             restored_tip = run(repo, "rev-parse", "refs/heads/topic")
             events = journal.read_events()
@@ -341,7 +558,34 @@ class CleanupTests(unittest.TestCase):
         self.assertTrue(results[0]["restored"])
         self.assertEqual(topic_tip, restored_tip)
         self.assertEqual("reconciled", events[-1]["event"])
+        self.assertEqual(receipt["creator_capability_sha256"],
+                         events[-1]["creator_capability_sha256"])
         self.assertEqual([], journal.pending_intents(plan_digest=approved["plan_digest"]))
+
+    def test_interrupted_reconciliation_rejects_changed_creator_receipt(self):
+        repo, topic_tip, main_tip = self.make_repo()
+        coverage = coverage_for(repo, [{"name": "topic", "tip": topic_tip, "main_tip": main_tip,
+                                       "verdict": "EXACT", "reason": None, "last_activity_epoch": 1,
+                                       "paths": [{"path": "topic", "verdict": "EXACT_PRESENT"}]}])
+        with tempfile.TemporaryDirectory() as out:
+            root = Path(out)
+            plan = build_old_plan(repo, coverage, bundle_dir=root / "bundle")
+            approved = approve_cleanup_plan(plan, approved_digest=plan["plan_digest"])
+            lease = self.integrated_lease(repo)
+            receipt = capability_receipt_metadata(lease.capability)
+            action_id = cleanup_action_id(approved["plan_digest"], 0, "topic", topic_tip)
+            journal = CleanupActionJournal(root / "actions.jsonl")
+            journal.append({
+                "event": "intent", "action_id": action_id,
+                "plan_digest": approved["plan_digest"], "candidate_index": 0,
+                "branch": "topic", "tip": topic_tip,
+                "destination": "main", "destination_tip": main_tip,
+                "bundle_sha256": approved["bundle"]["sha256"],
+                **{**receipt, "creator_capability_sha256": "0" * 64},
+            })
+            with self.assertRaisesRegex(JgError, "creator capability"):
+                reconcile_interrupted_cleanup(repo, approved, journal, lease)
+            self.assertEqual(topic_tip, run(repo, "rev-parse", "refs/heads/topic"))
 
     def test_interrupted_reconciliation_preserves_recreated_ref(self):
         repo, topic_tip, main_tip = self.make_repo()
@@ -353,6 +597,8 @@ class CleanupTests(unittest.TestCase):
             plan = build_old_plan(repo, coverage, bundle_dir=root / "bundle")
             approved = approve_cleanup_plan(plan, approved_digest=plan["plan_digest"])
             action_id = cleanup_action_id(approved["plan_digest"], 0, "topic", topic_tip)
+            fixture_root = repo.parent
+            receipt = capability_receipt_metadata(self.integrated_lease(repo).capability)
             journal = CleanupActionJournal(root / "actions.jsonl")
             journal.append({
                 "event": "intent", "action_id": action_id,
@@ -360,6 +606,7 @@ class CleanupTests(unittest.TestCase):
                 "branch": "topic",
                 "tip": topic_tip, "destination": "main", "destination_tip": main_tip,
                 "bundle_sha256": approved["bundle"]["sha256"],
+                **receipt,
             })
             run(repo, "branch", "--force", "topic", main_tip)
             lease = self.integrated_lease(repo)

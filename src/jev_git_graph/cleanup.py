@@ -30,7 +30,8 @@ from .coverage import _tree
 from .coordinator import (COOPERATIVE_LEASE_CONTRACT, CleanupActionJournal,
                           CooperativeBranchLeaseAdapter, CreatorLeaseCapability,
                           DisposableFixtureLeaseCapability, _fixed_lock_root,
-                          _common_dir, production_capability_is_current,
+                          _common_dir, capability_receipt_metadata,
+                          production_capability_is_current,
                           cleanup_action_id)
 from .errors import JgError
 from .equivalence import _activity
@@ -564,6 +565,7 @@ def execute_cleanup(repo: str | Path, plan: Mapping[str, Any] | str | Path,
                     "scope": scope, "deletion_ready": False, "deleted": [],
                     "stopped": "fixture_branch_inventory_mismatch",
                     "network_performed": False, "destructive_action_authorized": False}
+    creator_receipt = capability_receipt_metadata(lease_contract.capability)
     for index, candidate in enumerate(loaded.get("candidates", [])):
         name, tip = str(candidate["name"]), str(candidate["tip"])
         if not _lease_established(lease_contract, root):
@@ -603,6 +605,7 @@ def execute_cleanup(repo: str | Path, plan: Mapping[str, Any] | str | Path,
                     "candidate_index": index, "branch": name, "tip": tip,
                     "destination": destination, "destination_tip": destination_tip,
                     "bundle_sha256": bundle.get("sha256"),
+                    **creator_receipt,
                 })
                 intent_written = True
                 if not _lease_established(lease_contract, root):
@@ -675,6 +678,7 @@ def execute_cleanup(repo: str | Path, plan: Mapping[str, Any] | str | Path,
                         "observed_source_tip": _read_ref_tip(root, name),
                         "observed_destination_tip": _read_ref_tip(root, str(loaded["main"]["name"])),
                         "status": event_status,
+                        **creator_receipt,
                     })
             finally:
                 released = not acquired or _safe_release(lease_contract, name, tip)
@@ -708,12 +712,14 @@ def execute_cleanup(repo: str | Path, plan: Mapping[str, Any] | str | Path,
                     "status": "lease_release_failed",
                     "restoration_attempted": restoration_attempted,
                     "restored": restored,
+                    **creator_receipt,
                 })
         if outcome is not None:
             return outcome
     return {"kind": "cleanup-execution", "plan_digest": expected,
             "scope": scope,
             "deletion_ready": True, "deleted": deleted, "stopped": None,
+            **creator_receipt,
             "network_performed": False, "destructive_action_authorized": True}
 
 
