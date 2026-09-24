@@ -86,7 +86,7 @@ _REVIEWED_HOOK_FILES = {
     "watcher/coord-wake.sh": "a1d3fc92ba0709f849b8044030b0fe9260ad066856e3524463bc6b7f4d381c56",
     "launchd/com.mikebook.wip-convergence-loop.plist": "af41fa095438701d1aab7127778550e373c8a1e966738f77644f9df7ed5cc7bd",
     "launchd/start-all-health-controller.sh": "26e5e394a4593ed9c05fa30c278c090ecb328c2efb6bd58fcc7ba4a3bcaad517",
-    "launchd/start-all-health-coord-wake-consumer.sh": "37fc614e8659c5e0098a5ea85500c157478d35273bc5e7d1be7aa3e400a84ee9",
+    "launchd/start-all-health-coord-wake-consumer.sh": "f76a72ffdd502ab8abe7d878a5cad6ed97a18b63bb383be791ae4ae0153b4f72",
     "launchd/start-pr-convergence-wake-consumer.sh": "0feea9285380c6992e783cf0af425f4c22d488c9672f7c59d622edebaa09bf57",
     "launchd/start-pr-convergence-wake-producer.sh": "4277f8268de31b878dec72c488fe29b51b62434e257d66a47a35597c8cfd9537",
     "launchd/start-pr-repair-loop.sh": "0ec1816b6c2ed02b59fd4cc2d2508ae22e773dd9cc8f30a947cd9742a6281de1",
@@ -155,7 +155,7 @@ class CreatorLeaseCapability:
     loaded_runtime_jobs: tuple[tuple[str, str, str, str], ...]
     lock_root: Path
     train_construction_runtime: Path
-    train_construction_commit: str
+    train_construction_commit: str | None
     scope: str = "production"
 
 
@@ -305,7 +305,7 @@ def _verify_runtime_hook_files(runtime_root: Path) -> tuple[tuple[str, str, str]
 
 def _verify_train_construction_runtime(
     home: Path, canonical_common_dir: Path,
-) -> tuple[Path, str, tuple[tuple[str, str, str], ...]]:
+) -> tuple[Path, str | None, tuple[tuple[str, str, str], ...]]:
     """Prove the mutable-origin/main train constructor is on a reviewed snapshot.
 
     The launchd wrapper fetches ``origin/main`` into a dedicated linked worktree
@@ -315,6 +315,9 @@ def _verify_train_construction_runtime(
     and to contain every code-owned creator-hook digest. The optional sourced
     environment file can redirect the runtime or execute arbitrary shell, so a
     present file keeps production deletion closed without reading its contents.
+    An absent dedicated worktree is an inactive state: the reviewed launcher
+    refuses to start its creator until that worktree exists. Its appearance
+    changes the capability and requires a fresh exact snapshot proof.
     """
     home = home.resolve(strict=True)
     override_file = home / ".config/train-promotion-shadow.env"
@@ -323,6 +326,8 @@ def _verify_train_construction_runtime(
     runtime = home / ".local/share/home-lab/train-promotion-runtime"
     if runtime.is_symlink():
         raise JgError("train-construction-runtime_unverified: runtime is symlinked")
+    if not runtime.exists():
+        return runtime, None, ()
     try:
         root = runtime.resolve(strict=True)
     except OSError as exc:

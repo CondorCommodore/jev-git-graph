@@ -27,8 +27,11 @@ relevant creator starts with the attestation-enabled launcher; no running proces
 retroactively trusted. The train-construction job loads code from a
 separate worktree after fetching `origin/main`; its live worktree must be clean,
 registered with the same Git common directory, exactly at the current local
-`origin/main` commit, and match the reviewed hook digests. Runtime overrides or
-drift keep production execution in plan-only mode. Capability is rechecked
+`origin/main` commit, and match the reviewed hook digests. An absent dedicated
+worktree is recorded as inactive because the reviewed launcher exits before
+creator execution when it is missing; its appearance requires a fresh snapshot
+proof. Runtime overrides or drift keep production execution in plan-only mode.
+Capability is rechecked
 during execution, so changes to the creator runtime stop later branch actions.
 A disposable installed-wheel fixture exercises execute and interrupted-action
 reconciliation, including post-delete capability drift; it does not establish
