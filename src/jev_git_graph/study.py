@@ -40,6 +40,11 @@ def build_study(contributions: dict, groups: dict, count: int = 32,
             stratum = "file_level_or_unsupported"
         elif path_exact.get((unit["branch"], unit["path"])):
             stratum = "exact_path_present"
+        elif any(unit.get("destination_candidate_provenance", {}).get(candidate_id) == "same_path_name"
+                 and candidate_id in destinations
+                 and destinations[candidate_id].get("ast_fingerprint") != unit.get("ast_fingerprint")
+                 for candidate_id in matches):
+            stratum = "changed_implementation_candidate"
         elif len(matches) > 1:
             stratum = "ambiguous_structural_match"
         elif matches:

@@ -84,7 +84,8 @@ def test_inventory_accounts_for_changed_files_and_matches_all_destinations(tmp_p
     assert {item["path"] for item in result["paths"]} == expected_paths
     assert all(any(unit["path"] == path for unit in result["units"]) for path in expected_paths)
     changed = next(unit for unit in result["units"] if unit["path"] == "src.py" and unit["kind"] == "python_definition")
-    assert changed["destination_ids"] and len(changed["destination_ids"]) == 2
+    assert changed["destination_ids"] and len(changed["destination_ids"]) == 3
+    assert set(changed["destination_candidate_provenance"].values()) == {"same_path_name", "ast_fingerprint"}
     assert "binding_resolution_unverified" in changed["limitations"]
     assert "ambiguous_destination_match" in changed["limitations"]
     assert all(edge["source_id"] == changed["id"] for edge in result["edges"])
@@ -113,7 +114,7 @@ def test_ast_ambiguity_keeps_every_candidate(tmp_path: Path) -> None:
     snapshot = {"kind": "git-snapshot", "schema_version": 1, "snapshot_digest": "s", "repository_id": "r", "main": {"name": "main", "tip": main_tip, "tree": git(repo, "rev-parse", f"{main_tip}^{{tree}}")}, "branches": [{"name": "source", "tip": source_tip, "merge_base": base, "eligible": True, "exclusion_reasons": []}]}
     result = build_contributions(snapshot, repo)
     unit = next(unit for unit in result["units"] if unit["kind"] == "python_definition")
-    assert len(unit["destination_ids"]) == 2
+    assert len(unit["destination_ids"]) == 3
     assert unit["source_dependency_context_status"] == "complete"
     assert unit["dependency_context_status"] == "complete"
     assert result["branches"][0]["eligible"] is True
@@ -145,8 +146,8 @@ def test_static_same_module_references_are_explicit_and_incomplete_references_ab
     assert dependency["destination_id"] == helper["id"]
     assert dependency["provenance"] == "static_ast_symbol_reference"
     assert caller["source_dependency_context_status"] == "complete"
-    assert caller["dependency_context_status"] == "unknown"
-    assert "destination_dependency_context_unavailable" in caller["dependency_context_limitations"]
+    assert caller["dependency_context_status"] == "complete"
+    assert caller["destination_candidate_provenance"][caller["destination_ids"][0]] == "same_path_name"
     assert result["dependency_extraction"]["status"] == "partial_unknown"
 
 

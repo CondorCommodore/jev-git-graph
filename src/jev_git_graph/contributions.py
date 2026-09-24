@@ -19,9 +19,10 @@ from .analysis_cache import BlobAnalysisCache, checkpoint_key, load_checkpoint, 
 
 
 CONTRIBUTIONS_SCHEMA_VERSION = 2
-EXTRACTOR_VERSION = "python-ast-references-v2"
+EXTRACTOR_VERSION = "python-ast-references-v3"
+MAX_DESTINATION_CANDIDATES = 8
 _OID = re.compile(r"\A[0-9a-f]{40,64}\Z")
-_PROCESS_CONTEXT: tuple[Path, str, dict[str, list[str]], BlobAnalysisCache] | None = None
+_PROCESS_CONTEXT: tuple[Path, str, dict[str, dict[Any, list[str]]], BlobAnalysisCache] | None = None
 
 
 def _git(repo: Path, *args: str) -> bytes:
@@ -363,7 +364,7 @@ def _identity(prefix: str, value: dict[str, Any]) -> str:
 
 
 def _destination_index(repo: Path, main_tip: str, limitations: list[str], cache: BlobAnalysisCache,
-                       max_blobs: int | None = None) -> tuple[list[dict[str, Any]], dict[str, list[str]]]:
+                       max_blobs: int | None = None) -> tuple[list[dict[str, Any]], dict[str, dict[Any, list[str]]]]:
     listing = _git(repo, "ls-tree", "-r", "-z", "--full-tree", main_tip)
     rows: list[tuple[str, str, str]] = []
     for item in listing.split(b"\0"):
@@ -379,6 +380,7 @@ def _destination_index(repo: Path, main_tip: str, limitations: list[str], cache:
         rows = rows[:max_blobs]
     units: list[dict[str, Any]] = []
     by_fingerprint: dict[str, list[str]] = {}
+    by_path_name: dict[tuple[str, str], list[str]] = {}
     for path, blob_id, mode in rows:
         defs, _module_fp = _cached_python(cache, repo, blob_id)
         if defs is None:
@@ -389,7 +391,8 @@ def _destination_index(repo: Path, main_tip: str, limitations: list[str], cache:
             record = {"id": uid, "path": path, "blob": blob_id, "mode": mode, "kind": "python_definition", **definition}
             units.append(record)
             by_fingerprint.setdefault(definition["ast_fingerprint"], []).append(uid)
-    return units, by_fingerprint
+            by_path_name.setdefault((path, definition["name"]), []).append(uid)
+    return units, {"fingerprint": by_fingerprint, "path_name": by_path_name}
 
 
 def _cached_python(cache: BlobAnalysisCache, repo: Path, blob_id: str) -> tuple[list[dict[str, Any]] | None, str | None]:
@@ -408,7 +411,7 @@ def _cached_python(cache: BlobAnalysisCache, repo: Path, blob_id: str) -> tuple[
 
 
 def _analyze_branch(repo: Path, branch: dict[str, Any], main_tip: str,
-                    destination_by_fingerprint: dict[str, list[str]], cache: BlobAnalysisCache) -> dict[str, Any]:
+                    destination_index: dict[str, dict[Any, list[str]]], cache: BlobAnalysisCache) -> dict[str, Any]:
     name = branch.get("name")
     if not isinstance(name, str) or not name:
         raise JgError("snapshot branch name is invalid")
@@ -483,10 +486,15 @@ def _analyze_branch(repo: Path, branch: dict[str, Any], main_tip: str,
                     else:
                         changed_defs.append(definition)
                 for definition in changed_defs:
-                    candidates = destination_by_fingerprint.get(definition["ast_fingerprint"], [])
+                    same_path = destination_index.get("path_name", {}).get((path, definition["name"]), [])
+                    same_ast = destination_index.get("fingerprint", {}).get(definition["ast_fingerprint"], [])
+                    ranked = list(dict.fromkeys([*same_path, *same_ast]))
+                    candidates = ranked[:MAX_DESTINATION_CANDIDATES]
                     identity = {"branch": name, "tip": tip, "path": path, "blob": source_entry["blob"],
                                 "range": definition["range"], "name": definition["name"], "extractor": EXTRACTOR_VERSION}
                     unit_limitations = ["binding_resolution_unverified"]
+                    if len(ranked) > MAX_DESTINATION_CANDIDATES:
+                        unit_limitations.append("destination_candidate_limit")
                     if len(candidates) > 1:
                         unit_limitations.append("ambiguous_destination_match")
                     created.append({"id": _identity("cu-", identity), "branch": name, "source_tip": tip,
@@ -504,12 +512,17 @@ def _analyze_branch(repo: Path, branch: dict[str, Any], main_tip: str,
                                     "dependency_context_status": "unknown",
                                     "dependency_context_limitations": ["module_imports_and_dynamic_resolution_not_exhaustive"],
                                     "destination_ids": list(candidates), "limitations": unit_limitations,
+                                    "destination_candidate_provenance": {
+                                        candidate: ("same_path_name" if candidate in same_path else "ast_fingerprint")
+                                        for candidate in candidates},
                                     "source": {"branch": name, "path": path, "kind": "python_definition",
                                                "name": definition["name"], "blob": source_entry["blob"],
                                                "ast_fingerprint": definition["ast_fingerprint"]}})
                     limitations.append("binding_resolution_unverified")
                     if len(candidates) > 1:
                         limitations.append("ambiguous_destination_match")
+                    if len(ranked) > MAX_DESTINATION_CANDIDATES:
+                        limitations.append(f"destination_candidate_limit:{name}:{path}:{definition['name']}")
                 source_names = {item["name"] for item in src_defs}
                 module_changed = base_module_fingerprint is None or src_module_fingerprint != base_module_fingerprint
                 if any(item["name"] not in source_names for item in base_defs):
@@ -541,22 +554,23 @@ def _analyze_branch(repo: Path, branch: dict[str, Any], main_tip: str,
             output_branch["unit_ids"].append(unit["id"])
             for destination_id in unit["destination_ids"]:
                 edges.append({"source_id": unit["id"], "destination_id": destination_id,
-                              "type": "structural_match", "provenance": "ast_fingerprint"})
+                              "type": "structural_match", "provenance":
+                              unit.get("destination_candidate_provenance", {}).get(destination_id, "ast_fingerprint")})
     return {"branch": output_branch, "paths": paths, "units": units, "edges": edges,
             "limitations": limitations}
 
 
-def _init_process_worker(object_repo: str, main_tip: str, destination_by_fingerprint: dict[str, list[str]]) -> None:
+def _init_process_worker(object_repo: str, main_tip: str, destination_index: dict[str, dict[Any, list[str]]]) -> None:
     """Install read-only snapshot context once in each CPU worker process."""
     global _PROCESS_CONTEXT
-    _PROCESS_CONTEXT = (Path(object_repo), main_tip, destination_by_fingerprint, BlobAnalysisCache())
+    _PROCESS_CONTEXT = (Path(object_repo), main_tip, destination_index, BlobAnalysisCache())
 
 
 def _analyze_branch_in_process(branch: dict[str, Any]) -> dict[str, Any]:
     if _PROCESS_CONTEXT is None:
         raise JgError("contribution worker was not initialized")
-    repo, main_tip, destination_by_fingerprint, cache = _PROCESS_CONTEXT
-    return _analyze_branch(repo, branch, main_tip, destination_by_fingerprint, cache)
+    repo, main_tip, destination_index, cache = _PROCESS_CONTEXT
+    return _analyze_branch(repo, branch, main_tip, destination_index, cache)
 
 
 def build_contributions(snapshot: dict, object_repo: Path, *, workers: int | None = None,
@@ -599,10 +613,10 @@ def build_contributions(snapshot: dict, object_repo: Path, *, workers: int | Non
             branch_results[branch["name"]] = completed[branch["name"]]
     pending = [branch for branch in branches if branch["name"] not in branch_results]
     if any(branch.get("eligible") for branch in branches):
-        destinations, destination_by_fingerprint = _destination_index(
+        destinations, destination_index = _destination_index(
             repo, main_tip, limitations, cache, max_blobs=max_destination_blobs)
     else:
-        destinations, destination_by_fingerprint = [], {}
+        destinations, destination_index = [], {}
     total = len(branches)
     done = len(branch_results)
     if progress is not None:
@@ -610,7 +624,7 @@ def build_contributions(snapshot: dict, object_repo: Path, *, workers: int | Non
             progress(index, total, name)
     if workers == 1:
         for branch in pending:
-            result = _analyze_branch(repo, branch, main_tip, destination_by_fingerprint, cache)
+            result = _analyze_branch(repo, branch, main_tip, destination_index, cache)
             branch_results[branch["name"]] = result
             done += 1
             if checkpoint_path is not None:
@@ -621,7 +635,7 @@ def build_contributions(snapshot: dict, object_repo: Path, *, workers: int | Non
         with ProcessPoolExecutor(
             max_workers=min(workers, len(pending)),
             initializer=_init_process_worker,
-            initargs=(str(repo), main_tip, destination_by_fingerprint),
+            initargs=(str(repo), main_tip, destination_index),
         ) as pool:
             futures = {pool.submit(_analyze_branch_in_process, branch): branch for branch in pending}
             for future in as_completed(futures):

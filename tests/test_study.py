@@ -64,6 +64,22 @@ def test_dependency_complete_selection_versions_policy_and_keeps_uncertainty_arm
     assert study["selection_uses_model_answers"] is False
 
 
+def test_study_includes_changed_same_path_implementations():
+    contributions, _ = _artifact(complete_count=24, total=32)
+    for index in range(8):
+        unit = contributions["units"][index]
+        unit["destination_candidate_provenance"] = {unit["destination_ids"][0]: "same_path_name"}
+        contributions["destination_units"][index]["ast_fingerprint"] = "f" * 64
+    contributions["contributions_digest"] = digest({k: v for k, v in contributions.items()
+                                                     if k != "contributions_digest"})
+    groups = build_groups(contributions)
+    study = build_study(contributions, groups, count=32,
+                        selection_policy="dependency-complete-majority-v1")
+    changed = [case for case in study["cases"] if case["selection_stratum"] == "changed_implementation_candidate"]
+    assert changed
+    assert all(case["context_stratum"] == "dependency_context_supported" for case in changed)
+
+
 def _explicit_selection_fixture():
     contributions, _ = _artifact(complete_count=23, total=24)
     destination_by_id = {item["id"]: item for item in contributions["destination_units"]}
