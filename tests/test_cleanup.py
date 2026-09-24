@@ -10,7 +10,8 @@ from unittest.mock import patch
 
 from jev_git_graph.cleanup import (_atomic_delete,
                                    approve_cleanup_plan, build_cleanup_plan,
-                                   execute_cleanup, _lease_established)
+                                   execute_cleanup, _lease_established,
+                                   write_cleanup_plan)
 from jev_git_graph.cli import main as jg_main
 from jev_git_graph.coordinator import (CleanupActionJournal,
                                        CooperativeBranchLeaseAdapter,
@@ -66,6 +67,30 @@ def build_old_plan(*args, **kwargs):
 
 
 class CleanupTests(unittest.TestCase):
+    def test_cli_plan_keeps_private_recovery_bundle_beside_manifest(self):
+        repo, topic_tip, main_tip = self.make_repo()
+        coverage = coverage_for(repo, [{
+            "name": "topic", "tip": topic_tip, "main_tip": main_tip,
+            "verdict": "EXACT", "reason": None, "last_activity_epoch": 1,
+            "paths": [{"path": "topic", "verdict": "EXACT_PRESENT"}],
+        }])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            coverage_path = root / "coverage.json"
+            coverage_path.write_text(json.dumps(coverage))
+            with patch("jev_git_graph.cleanup._activity", return_value=1):
+                plan_path = write_cleanup_plan(repo, coverage_path, root / "plan")
+            plan = json.loads(plan_path.read_text())
+            bundle = Path(plan["bundle"]["path"])
+            self.assertEqual(bundle, (root / "plan/recovery/cleanup.bundle").resolve())
+            self.assertEqual(plan["bundle"]["restoration_verified"], True)
+            self.assertEqual(bundle.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(hashlib.sha256(bundle.read_bytes()).hexdigest(),
+                             plan["bundle"]["sha256"])
+            with patch("jev_git_graph.cleanup._activity", return_value=1):
+                with self.assertRaisesRegex(JgError, "bundle already exists"):
+                    write_cleanup_plan(repo, coverage_path, root / "plan")
+
     def test_idle_runtime_job_requires_matching_loaded_command(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / "home"

@@ -55,6 +55,10 @@ The planner creates `cleanup.bundle` in an owner-only directory outside every
 inspected worktree. It includes the pinned default tip and every selected tip.
 The bundle is verified and fetched into a fresh disposable repository. Every
 tip must resolve to its exact SHA before the bundle is considered restorable.
+The CLI keeps that bundle at `recovery/cleanup.bundle` beside its private plan
+file. Keep the output directory through approval, execution, and any later
+reconciliation. Use a new output directory for a new plan; an existing recovery
+bundle is never replaced.
 The returned plan intentionally has `manifest_approved: false`. Call
 `approve_cleanup_plan(plan, approved_digest=...)` only after reviewing that
 proof; the helper validates the original digest supplied by the operator,

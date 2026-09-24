@@ -195,6 +195,8 @@ def _candidate_reason(record: Mapping[str, Any], cutoff: int, holds: Mapping[str
 
 
 def _bundle_path(bundle_dir: Path) -> Path:
+    if bundle_dir.is_symlink():
+        raise JgError(f"bundle directory must not be a symlink: {bundle_dir}")
     bundle_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     if bundle_dir.stat().st_mode & 0o077:
         raise JgError(f"bundle directory must be owner-only: {bundle_dir}")
@@ -207,9 +209,10 @@ def _create_and_verify_bundle(repo: Path, tips: Mapping[str, str], bundle_dir: P
     # still pins and independently restores only the approved tips below;
     # keeping the source refs in the bundle makes the artifact self-contained
     # on Git versions that reject bare object IDs as bundle revisions.
-    if path.exists():
-        path.unlink()
+    if path.exists() or path.is_symlink():
+        raise JgError("cleanup bundle already exists; use a new plan directory")
     _git(repo, "bundle", "create", str(path), "--all")
+    path.chmod(0o600)
     verify = _git(repo, "bundle", "verify", str(path), check=False)
     if verify.returncode:
         raise JgError("cleanup bundle verification failed")
@@ -369,8 +372,11 @@ def write_cleanup_plan(repo: str | Path, coverage_path: str | Path, out: str | P
     """Write a private cleanup plan artifact outside the inspected worktrees."""
     root, _common, _runner = git.open_repository(repo)
     destination = validate_output_path(out, protected_worktree_paths(root))
-    plan = build_cleanup_plan(root, coverage_path, bundle_dir=bundle_dir, max_branches=max_branches)
     destination.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if destination.stat().st_mode & 0o077:
+        raise JgError(f"cleanup plan directory must be owner-only: {destination}")
+    recovery_dir = bundle_dir if bundle_dir is not None else destination / "recovery"
+    plan = build_cleanup_plan(root, coverage_path, bundle_dir=recovery_dir, max_branches=max_branches)
     path = destination / "cleanup-plan.json"
     write_json(path, plan)
     return path
