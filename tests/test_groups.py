@@ -203,6 +203,21 @@ class TestGroups(unittest.TestCase):
         self.assertTrue(all(group["context_complete"] for group in result["groups"]))
         self.assertTrue(all(group["candidate_boundary_edge_count"] > 0 for group in result["groups"]))
 
+    def test_unparsed_python_marks_only_its_group_context_incomplete(self):
+        branches = [branch("feature/parsed"), branch("feature/unparsed")]
+        units = [
+            unit("cu-parsed", "feature/parsed", path="src/parsed.py"),
+            unit("cu-unparsed", "feature/unparsed", path="src/unparsed.py",
+                 limitations=["python_parse_unsupported"]),
+        ]
+
+        result = build_groups(contribution_artifact(branches, units))
+
+        groups_by_unit = {group["unit_ids"][0]: group for group in result["groups"]}
+        self.assertTrue(groups_by_unit["cu-parsed"]["context_complete"])
+        self.assertFalse(groups_by_unit["cu-unparsed"]["context_complete"])
+        self.assertIn("python_parse_unsupported", groups_by_unit["cu-unparsed"]["limitations"])
+
     def test_dependency_crossing_a_bounded_partition_keeps_context_incomplete(self):
         branches = [branch("feature/a"), branch("feature/b"), branch("feature/c"), branch("feature/d")]
         units = [unit(f"cu-{letter}", f"feature/{letter}", path=f"src/{letter}.py") for letter in "abcd"]
