@@ -111,11 +111,12 @@ def test_synthetic_answers_are_advisory_and_origin_cannot_be_overridden():
                            origin="jev")
 
 
-def test_injected_executor_is_synthetic_and_public_origin_spoof_fails_closed():
+def test_injected_executor_is_synthetic_and_public_origin_spoof_fails_closed(tmp_path, monkeypatch):
     contributions, groups = _artifact()
     plan = build_group_requests(contributions, groups, estimated_input_tokens=100, max_provider_tokens=1000)
     _add_context_contract(plan)
     preview = approved_presence_preview(plan)
+    monkeypatch.setattr(presence_module, "_presence_key_path", lambda: tmp_path / "private" / "key")
 
     def injected(payload, token):
         response = _response(payload)
@@ -125,10 +126,14 @@ def test_injected_executor_is_synthetic_and_public_origin_spoof_fails_closed():
     executed = execute_presence_preview(
         preview, preview["payload_sha256"],
         approved_approval_sha256=preview["approval_sha256"],
-        transport=injected, token="fixture-only",
+        transport=injected, token="fixture-only", checkpoint=tmp_path / "checkpoint.json",
     )
     assert executed["origin"] == "synthetic"
     advisory = reconcile_presence(contributions, groups, executed)
+    assert advisory["project_utility_assessment"] == {
+        "status": "UNKNOWN", "reason": "project_requirements_not_provided",
+        "source": "code_only_presence_review",
+    }
     assert advisory["contributions"][0]["routing_scope"] == "advisory_only"
     assert validate_outcome_presence(advisory, contributions) == {}
 
@@ -156,7 +161,8 @@ def test_trusted_sdk_receipt_binds_answers_and_reconciled_outcome(tmp_path, monk
     executed = execute_presence_preview(
         preview, preview["payload_sha256"],
         approved_approval_sha256=preview["approval_sha256"],
-        token="fixture-only", execution_receipt_path=receipt_path,
+        token="fixture-only", checkpoint=tmp_path / "checkpoint.json",
+        execution_receipt_path=receipt_path,
     )
     assert executed["origin"] == "jev"
     receipt = presence_module.read_json(receipt_path)
@@ -330,6 +336,11 @@ def test_selected_study_chunks_keep_full_cohort_and_dependency_map():
         assert state["cohort_contribution_ids"] == sorted(ids)
         assert state["cohort_dependency_edge_count"] == 4
         assert state["cohort_relationships_non_exhaustive"] is True
+        assert state["study_scope"]["selected_case_count"] == 5
+        assert state["study_scope"]["selected_groups_with_full_context_omitted"] == 1
+        assert state["study_scope"]["relationship_context_non_exhaustive"] is True
+        assert "Size and excerpt caps" in state["study_scope"]["relationship_context_compaction_reason"]
+        assert all("scope_limits" in question for question in request["questions"].values())
     assert sorted(seen) == sorted(ids)
 
 
@@ -485,10 +496,31 @@ def test_source_only_evidence_keeps_destination_unknown_and_transient(tmp_path):
     assert "source_only_unknown_selection" in binding["comparison_context_limitations"]
     presence_question = plan["requests"][0]["questions"]["cu-1:presence"]
     assert "UNKNOWN" in presence_question["criteria"]
+    assert "return UNKNOWN" in presence_question["instructions"]
     usable_delta_question = plan["requests"][0]["questions"]["cu-1:usable_delta"]
-    assert "Judge source content only" in usable_delta_question["instructions"]
-    assert "do not claim destination absence or integration safety" in usable_delta_question["instructions"]
+    assert "bounded source-unit utility only" in usable_delta_question["instructions"]
+    assert "Do not infer destination presence or absence, integration readiness, deduplication, preservation, or deletion" in usable_delta_question["instructions"]
+    assert "source-only usable_delta only" in usable_delta_question["scope_limits"]
+    assert "preservation" in usable_delta_question["scope_limits"]
     assert "missing from destination" not in usable_delta_question["instructions"]
+    assert "cu-1:dependency_context_sufficient" in plan["requests"][0]["questions"]
+    assert "integration readiness remains unassessed" in plan["requests"][0]["questions"]["cu-1:dependency_context_sufficient"]["criteria"]["false"]
+    assert not any(key.startswith("cu-1:dependency:") for key in plan["requests"][0]["questions"])
+
+    mismatched, _ = _artifact()
+    mismatched_unit = mismatched["units"][0]
+    mismatched_unit.update({"source_tip": source_tip, "main_tip": destination_tip, "path": "src.py",
+                            "source_blob": _git(repo, "rev-parse", f"{source_tip}:src.py"),
+                            "range": {"start_line": 1, "end_line": 2},
+                            "destination_ids": ["du-1"], "dependency_context_status": "complete"})
+    mismatched_unit["source"].update({"path": "src.py", "blob": mismatched_unit["source_blob"]})
+    mismatched["branches"][0]["tip"] = source_tip
+    mismatched["contributions_digest"] = digest({key: value for key, value in mismatched.items()
+                                                  if key != "contributions_digest"})
+    mismatched_groups = build_groups(mismatched)
+    with pytest.raises(JgError, match="source-only evidence cannot accompany destination candidates"):
+        build_group_requests(mismatched, mismatched_groups, {"cu-1": evidence},
+                             selected_contribution_ids=["cu-1"], selection_digest="b" * 64)
 
 
 def test_source_only_evidence_rejects_destination_claim(tmp_path):

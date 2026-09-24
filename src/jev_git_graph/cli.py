@@ -145,6 +145,7 @@ def _build_group_presence_preview(args):
         # fails closed for that contribution.
     plan_kwargs = {
         "max_groups": args.max_groups,
+        "max_requests": args.max_requests,
         "max_request_bytes": args.max_request_bytes,
         "model_settings": model_settings,
         "selected_contribution_ids": selected_ids,
@@ -319,7 +320,10 @@ def parser() -> argparse.ArgumentParser:
     group_relate.add_argument("--out", required=True)
     group_relate.add_argument("--show-preview", action="store_true",
                               help="serve exact request content transiently from a loopback no-store page")
-    group_relate.add_argument("--max-groups", type=int, default=32)
+    group_relate.add_argument("--max-groups", type=int, default=64,
+                              help="maximum distinct source groups in the request batch")
+    group_relate.add_argument("--max-requests", type=int, default=64,
+                              help="maximum chunk requests in the bounded batch")
     group_relate.add_argument("--max-request-bytes", type=int, default=64000)
     group_relate.add_argument("--estimated-input-tokens", type=int)
     group_relate.add_argument("--auto-estimate-input-tokens", action="store_true",
@@ -529,6 +533,8 @@ def run(args: argparse.Namespace) -> str:
         if args.show_preview and not args.execute and not args.answers:
             serve_presence_preview(preview)
         if args.execute:
+            if not args.checkpoint:
+                raise JgError("--execute requires --checkpoint for durable fail-closed progress")
             checkpoint = validate_output_path(args.checkpoint, [object_repo]) if args.checkpoint else None
             result = execute_presence_preview(
                 preview, args.approved_payload_sha256,

@@ -15,7 +15,8 @@ from .safety import canonical_json, digest
 from .code_evidence import _path, _reject_sensitive
 
 _OID = re.compile(r"\A[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?\Z")
-DEFAULT_MAX_GROUPS = 32
+DEFAULT_MAX_GROUPS = 64
+DEFAULT_MAX_REQUESTS = 64
 DEFAULT_MAX_REQUEST_BYTES = 64_000
 DEFAULT_MAX_EVIDENCE_BYTES = 24_000
 
@@ -195,12 +196,47 @@ def revalidate_two_sided_evidence(repo: str | Path, evidence: Mapping[str, Any])
     return rebuilt
 
 
+def revalidate_source_only_evidence(repo: str | Path, evidence: Mapping[str, Any]) -> dict[str, Any]:
+    """Re-read bounded source-only ranges while preserving unknown destination status."""
+    if evidence.get("kind") != "branch-presence-source-only-evidence" or evidence.get("schema_version") != 1:
+        raise JgError("invalid source-only presence evidence")
+    expected = evidence.get("evidence_digest")
+    if expected != digest({key: value for key, value in evidence.items() if key != "evidence_digest"}):
+        raise JgError("source-only evidence digest is invalid")
+    records = evidence.get("records")
+    if not isinstance(records, list) or not records:
+        raise JgError("source-only evidence requires records")
+    ranges = []
+    total_lines = 0
+    for item in records:
+        if not isinstance(item, Mapping) or not isinstance(item.get("source"), Mapping):
+            raise JgError("source-only evidence record is malformed")
+        source = item["source"]
+        if "destination" in item:
+            raise JgError("source-only evidence cannot establish destination presence")
+        source_range = source.get("range")
+        if not isinstance(source_range, Mapping):
+            raise JgError("source-only evidence has an invalid source range")
+        total_lines += source_range.get("end_line", 0) - source_range.get("start_line", 0) + 1
+        ranges.append({"evidence_id": item.get("evidence_id"), "source_path": source.get("path"),
+                       "source_range": dict(source_range)})
+    rebuilt = build_source_only_evidence(
+        repo, evidence["source_tip"], evidence["destination_tip"], ranges,
+        max_total_bytes=max(int(evidence.get("total_bytes", 1)), 1),
+        max_excerpt_count=len(records), max_total_lines=max(total_lines, 1),
+    )
+    if rebuilt["evidence_digest"] != expected:
+        raise JgError("pinned source-only presence evidence changed; obtain a new approval")
+    return rebuilt
+
+
 def build_group_requests(
     contributions: Mapping[str, Any],
     groups: Mapping[str, Any],
     evidence_by_contribution: Mapping[str, Mapping[str, Any]] | None = None,
     *,
     max_groups: int = DEFAULT_MAX_GROUPS,
+    max_requests: int = DEFAULT_MAX_REQUESTS,
     max_request_bytes: int = DEFAULT_MAX_REQUEST_BYTES,
     model_settings: Mapping[str, Any] | None = None,
     estimated_input_tokens: int | None = None,
@@ -211,8 +247,9 @@ def build_group_requests(
 ) -> dict[str, Any]:
     """Build one named-question request per bounded group, retaining omissions."""
     if (not isinstance(max_groups, int) or isinstance(max_groups, bool) or max_groups < 1
+            or not isinstance(max_requests, int) or isinstance(max_requests, bool) or max_requests < 1
             or not isinstance(max_request_bytes, int) or isinstance(max_request_bytes, bool) or max_request_bytes < 1):
-        raise JgError("group and request byte budgets must be positive integers")
+        raise JgError("group, request-count, and request-byte budgets must be positive integers")
     if contributions.get("kind") != "contributions" or groups.get("kind") != "contribution-groups":
         raise JgError("group requests require contributions and contribution-groups artifacts")
     if contributions.get("contributions_digest") != digest({k: v for k, v in contributions.items() if k != "contributions_digest"}):
@@ -296,6 +333,26 @@ def build_group_requests(
             raise JgError("study selection includes contributions not assigned to an original group")
     if len(selected_groups) > max_groups:
         raise JgError("selected group request plan exceeds max_groups")
+    cohort_scope = None
+    if selected_ids is not None:
+        cohort_scope = {
+            "permitted_inference": "bounded_case_evidence_only",
+            "prohibited_project_decisions": ["integration", "deduplication", "preservation", "deletion"],
+            "selected_case_count": len(selected_set),
+            "selected_groups_with_full_context_omitted": len(selected_groups),
+            "noncohort_contribution_ids_omitted_count": sum(
+                len(set(group.get("unit_ids", [])) - selected_set) for group in selected_groups),
+            "group_edge_records_compacted_count": sum(
+                len(group.get("edges", [])) for group in selected_groups),
+            "boundary_edge_records_compacted_count": sum(
+                len(group.get("boundary_edges", [])) for group in selected_groups),
+            "cohort_relationship_records_included_count": len(cohort_edge_rows),
+            "relationship_context_non_exhaustive": True,
+            "relationship_context_compaction_reason": (
+                "Size and excerpt caps retain selected IDs and direct selected-cohort edges but compact "
+                "full group/boundary rows to counts, type counts, and digests; omitted context is unresolved."
+            ),
+        }
     seen_group_ids: set[str] = set()
     requests, omitted = [], []
     for group in selected_groups:
@@ -331,11 +388,6 @@ def build_group_requests(
                              "kind": edge.get("kind", edge.get("type", "unknown"))}
                             for edge in unit_edges]
             candidate_ids = unit.get("destination_ids", [])
-            unit_questions = presence_questions(
-                unit_id, dependencies, dependency_context_status=unit.get("dependency_context_status"),
-                source_only=(not candidate_ids and unit.get("dependency_context_status") == "unknown"))
-            for question_id, question in unit_questions.items():
-                questions[f"{unit_id}:{question_id}"] = question
             evidence = evidence_by_contribution.get(unit_id)
             if evidence is not None:
                 if evidence.get("kind") not in {"branch-presence-code-evidence", "branch-presence-source-only-evidence"}:
@@ -345,13 +397,37 @@ def build_group_requests(
                 if evidence.get("source_tip") != unit.get("source_tip") or evidence.get("destination_tip") != unit.get("main_tip"):
                     raise JgError(f"approved evidence pins do not match contribution {unit_id}")
                 _validate_evidence_text(evidence)
+            source_only_evidence = (isinstance(evidence, Mapping)
+                                    and evidence.get("kind") == "branch-presence-source-only-evidence")
+            two_sided_evidence = (isinstance(evidence, Mapping)
+                                  and evidence.get("kind") == "branch-presence-code-evidence")
+            if source_only_evidence and candidate_ids:
+                raise JgError(f"source-only evidence cannot accompany destination candidates for {unit_id}")
+            if two_sided_evidence and not candidate_ids:
+                raise JgError(f"two-sided evidence requires destination candidates for {unit_id}")
+            source_only_case = source_only_evidence or (
+                not candidate_ids and unit.get("dependency_context_status") == "unknown")
+            unit_questions = presence_questions(
+                unit_id, dependencies, dependency_context_status=unit.get("dependency_context_status"),
+                source_only=source_only_case)
+            if cohort_scope is not None:
+                for question in unit_questions.values():
+                    question["scope_limits"] = (
+                        "source-only usable_delta only; no destination, integration, deduplication, "
+                        "preservation, or deletion inference; graph incomplete"
+                        if source_only_case else
+                        "bounded case evidence only; no project-level integration, deduplication, "
+                        "preservation, or deletion inference; graph incomplete"
+                    )
+            for question_id, question in unit_questions.items():
+                questions[f"{unit_id}:{question_id}"] = question
+            if evidence is not None:
                 evidence_ids.extend(record.get("evidence_id") for record in evidence.get("records", [])
                                     if isinstance(record.get("evidence_id"), str))
             source_metadata = {key: unit.get(key) for key in
                                ("source_tip", "main_tip", "path", "kind", "name", "range", "source_blob")
                                if key in unit}
             comparison_limitations = []
-            source_only_evidence = isinstance(evidence, Mapping) and evidence.get("kind") == "branch-presence-source-only-evidence"
             if evidence is None or not evidence.get("records") or source_only_evidence:
                 comparison_limitations.append("approved_two_sided_evidence_missing")
             if not candidate_ids:
@@ -546,6 +622,7 @@ def build_group_requests(
                  "cohort_dependency_edge_count": len(cohort_dependencies),
                  "cohort_dependency_edge_digest": digest(cohort_dependencies),
                  "cohort_relationships_non_exhaustive": True,
+                 "study_scope": cohort_scope,
                  "contributions": chunk,
                  "context_units": context_items,
                  "context_contribution_ids": [],
@@ -579,6 +656,8 @@ def build_group_requests(
                                    "group_destination_ids_summary", "questions")}
         raise JgError(f"group request payload sizes={request_sizes} bytes; oversized_chunks={oversized}; "
                       f"aggregate={size}; field_bytes={field_sizes}")
+    if len(requests) > max_requests:
+        raise JgError(f"group request plan has {len(requests)} requests, exceeding max_requests={max_requests}")
     return {"kind": "branch-presence-request-plan", "schema_version": 1,
             "question_version": PRESENCE_QUESTION_VERSION,
             "snapshot_digest": contributions.get("snapshot_digest"),
@@ -589,7 +668,8 @@ def build_group_requests(
             "request_count": len(requests), "payload_bytes": size,
             "requests": requests, "omitted": omitted,
             "model_settings": settings, "model_settings_digest": digest(settings),
-            "request_budgets": {"max_groups": max_groups, "max_request_bytes": max_request_bytes,
+            "request_budgets": {"max_groups": max_groups, "max_requests": max_requests,
+                                "max_request_bytes": max_request_bytes,
                                 "max_aggregate_request_bytes": 1_000_000 if selected_ids is not None else max_request_bytes,
                                 "estimated_input_tokens": estimated_input_tokens,
                                 "max_provider_tokens": max_provider_tokens,
@@ -603,6 +683,7 @@ def build_group_requests(
                                     "selection_digest": selection_digest,
                                     "model_settings_digest": digest(settings),
                                     "request_budgets": {"max_groups": max_groups,
+                                        "max_requests": max_requests,
                                         "max_request_bytes": max_request_bytes,
                                         "max_aggregate_request_bytes": 1_000_000 if selected_ids is not None else max_request_bytes,
                                         "estimated_input_tokens": estimated_input_tokens,
@@ -621,8 +702,19 @@ def approved_presence_preview(plan: Mapping[str, Any]) -> dict[str, Any]:
     request_sizes = [len(canonical_json(request)) for request in requests]
     if any(size > DEFAULT_MAX_REQUEST_BYTES for size in request_sizes):
         raise JgError("selected request exceeds the fixed per-request byte limit")
-    if len(request_bytes) > 1_000_000:
-        raise JgError("selected request batch exceeds the 1 MB aggregate preview limit")
+    budgets = plan.get("request_budgets")
+    if not isinstance(budgets, Mapping):
+        raise JgError("request plan lacks bounded request budgets")
+    max_requests = budgets.get("max_requests")
+    max_groups = budgets.get("max_groups")
+    group_ids = {request.get("state", {}).get("group_id") for request in requests}
+    aggregate_limit = budgets.get("max_aggregate_request_bytes")
+    request_limit = budgets.get("max_request_bytes")
+    if (not isinstance(max_requests, int) or len(requests) > max_requests
+            or not isinstance(max_groups, int) or len(group_ids) > max_groups
+            or not isinstance(request_limit, int) or any(size > request_limit for size in request_sizes)
+            or not isinstance(aggregate_limit, int) or len(request_bytes) > aggregate_limit):
+        raise JgError("request plan exceeds its group, request-count, per-request, or aggregate budget")
     return {"kind": "branch-presence-preview", "schema_version": 1,
             "question_version": PRESENCE_QUESTION_VERSION,
             "snapshot_digest": plan.get("snapshot_digest"),
@@ -640,7 +732,8 @@ def approved_presence_preview(plan: Mapping[str, Any]) -> dict[str, Any]:
             "no_store": True, "network_performed": False,
             "approval_sha256": digest({"payload_sha256": payload_sha,
                                         "plan_digest": plan.get("plan_digest"),
-                                        "request_count": len(requests)})}
+                                        "request_count": len(requests),
+                                        "request_budgets": plan.get("request_budgets")})}
 
 
 def _validate_evidence_text(evidence: Mapping[str, Any]) -> None:
