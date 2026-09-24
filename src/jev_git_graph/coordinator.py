@@ -55,7 +55,7 @@ REQUIRED_HOME_LAB_CREATORS = frozenset({
 # Installed runtime metadata and caller-provided creator lists never replace
 # these code-owned expected hashes.
 _REVIEWED_HOOK_FILES = {
-    "scripts/cooperative_branch_lease.py": "aada6ce9ad4905b3e49c317d0b49ee587f8486973c6a6aa3b034829a846cac43",
+    "scripts/cooperative_branch_lease.py": "bcbbd43656a437843aca9c49a5642255927d88267d566ac144a8034efe718e93",
     "scripts/bootstrap-worktree.sh": "c63745dae3652141ac7687a54aa03bf997de145c018a0460a6952100da928664",
     "scripts/new-worktree.sh": "ee28b1e34af1638f6c39948c39248a3015c9ed2f3a6f9cc0b87172247b4a10c5",
     "scripts/overnight-codex-backlog-round.sh": "e188e7415c68ca318a298c704cc87b710404ed912d781b79b85ea3000e64dddd",
@@ -66,13 +66,28 @@ _REVIEWED_HOOK_FILES = {
     "scripts/merge_train_parts/candidate_lifecycle.py": "c35db21b44c0d9024b68f802c46f13c9c3e70e0a5ead3eabd45a8c3240d1450e",
     "scripts/merge_train_parts/verdict_lifecycle.py": "eed5e98a608c7998f10d1c9e9a2c8f240d25d08863901438a1dc3e789a4f98c6",
     "scripts/train_builder.py": "289c985aaf9d8b9b00f3934ba767eee9114773240ec67a44207d74625d8ab367",
-    "scripts/train_construction_driver.py": "1d3a54d2a9742a9309c4d801c7feb71a4cd96a1ae7ffda57e9f16f491dad5824",
-    "launchd/start-train-construction.sh": "426320cbed9a581c08e77adf8da3f13c2911ca9d41f03acb02da8213e1bb1102",
+    "scripts/train_construction_driver.py": "4b9c1631c0b940d6df18ae1987fcef9801776a03ff3a6f1abd98e60059403b70",
+    "launchd/start-train-construction.sh": "913dcc6e38b5705a8819dd27ba72556485a976b44b96c416b55c3ce78067589a",
     "scripts/l1_drain/self_reported.py": "662d9cbcd86fc021dad1612347e10a9f23f4456e8d482ca3362419ef63e69fae",
     "scripts/l1_drain/workspace.py": "5aecacb06b3322cc64dc729227d45508eb4ffff7cd0504bcf6f46bce20795b70",
-    "scripts/pr_repair_loop.py": "c4275a0a2988fcd5737e394f3083a10e87eb52178df48ec7edbe00b8c51d36f0",
+    "scripts/pr_repair_loop.py": "2791deaa05197388532898610f3ab3024f617356fcbbfb545724c45782ca108e",
     "scripts/deploy_sync.py": "bb54d9ede1a318951c109b8453c7ace28accc9f38867b3272c4e0891b67ec84d",
     "scripts/forge-coord-deploy.sh": "5ac70ff08333e3d224bbd4d63e10297a3eb1b524ab8f3ba5646ea5e799c36620",
+    "scripts/all_health_controller.py": "f2edfe2d03a65c4b8f2d086a4b1aaf5f13137370a9b6904d6bdb50551697197d",
+    "scripts/coord_wake_consumer.py": "b59ca92f646ff1e07273db1f49fcd7bcf349db581c2d3c465f0a0616092d2f30",
+    "scripts/merge_safe_pr_wake_consumer.py": "fc92956f0c4434e212760400bd22e63974cc3c36caf57fe69e3458aec930ad18",
+    "scripts/merge_safe_pr_wake_producer.py": "00bdb553905418ea8c84e340ee59087cfb2210cdcc1a489067cf93b975661caf",
+    "scripts/wip_convergence_entrypoint.py": "c63df09d73b0da24fafb87a9de3b5a6234ff8f88f83cdc397b72c6056650cfb5",
+    "scripts/ahc_inventory_alarm.py": "1a5f84b7bf227cb8037c37ce0ecaafb0a467484b1f3d00dd3d2980c809bba6be",
+    "scripts/merge-safe-prs-loop.sh": "d1cf64287ffd7361811ae41a4f1cf54bdce0f1bbebb639de2eea53add69f1531",
+    "watcher/coord-wake.sh": "a873236f7fe2787a6291a15fc44156190384e5fb46e3eb4dbb1c23b62a300ee0",
+    "launchd/com.mikebook.wip-convergence-loop.plist": "af41fa095438701d1aab7127778550e373c8a1e966738f77644f9df7ed5cc7bd",
+    "launchd/start-all-health-controller.sh": "26e5e394a4593ed9c05fa30c278c090ecb328c2efb6bd58fcc7ba4a3bcaad517",
+    "launchd/start-all-health-coord-wake-consumer.sh": "37fc614e8659c5e0098a5ea85500c157478d35273bc5e7d1be7aa3e400a84ee9",
+    "launchd/start-pr-convergence-wake-consumer.sh": "0feea9285380c6992e783cf0af425f4c22d488c9672f7c59d622edebaa09bf57",
+    "launchd/start-pr-convergence-wake-producer.sh": "4277f8268de31b878dec72c488fe29b51b62434e257d66a47a35597c8cfd9537",
+    "launchd/start-pr-repair-loop.sh": "0ec1816b6c2ed02b59fd4cc2d2508ae22e773dd9cc8f30a947cd9742a6281de1",
+    "launchd/start-ahc-inventory-alarm.sh": "dde12dd429a48247549a2eb7159a5acb26577c19bdaa12a0b8af9de8d719ef1b",
 }
 _RUNTIME_SELECTORS = (
     "code/.runtime/releases/home-lab/stable",
@@ -334,23 +349,87 @@ def _verify_train_construction_runtime(
 
 
 def _attest_process_generation(runtime_root: Path, pid: int, started_at: float) -> str:
-    """Bind a live process generation to the exact reviewed hook bytes on disk.
+    """Keep the prior process start-time gate as a conservative freshness check.
 
-    A path and cwd check alone accepts a long-lived process that imported older
-    Python code before the reviewed lease hook was installed. Fail closed unless
-    the process started after every hook file in this runtime was last changed.
+    The authoritative loaded-code proof is the per-PID startup receipt checked
+    by :func:`_verify_process_startup_attestation`; source mtimes alone cannot
+    establish which Python code object is executing.
     """
     hooks = _verify_runtime_hook_files(runtime_root)
-    latest_hook_mtime = max((runtime_root / relative).stat().st_mtime
-                            for _root, relative, _sha in hooks)
-    if started_at < latest_hook_mtime:
-        raise JgError("runtime_adoption_unverified: creator process predates reviewed hook bytes")
     return digest({
         "pid": pid,
         "started_at": datetime.fromtimestamp(started_at, timezone.utc).isoformat(),
         "runtime_root_sha256": hashlib.sha256(str(runtime_root.resolve()).encode()).hexdigest(),
         "hooks": sorted((relative, sha) for _root, relative, sha in hooks),
     })
+
+
+def _verify_process_startup_attestation(
+    home: Path, runtime_root: Path, pid: int, process_start: str,
+    label: str, process_rel: str,
+) -> str:
+    """Require a mode-0600 self-attestation for this exact process generation."""
+    directory = home / ".local/state/jev-git-graph/creator-runtime-attestations"
+    receipt_path = directory / f"{pid}.json"
+    if (directory.is_symlink() or not directory.is_dir() or receipt_path.is_symlink()
+            or not receipt_path.is_file()):
+        raise JgError(f"runtime_adoption_unverified: startup attestation missing: {label}")
+    try:
+        for parent in (directory.parent, *directory.parent.parents):
+            if parent == home or parent == Path("/"):
+                break
+            if (parent.is_symlink() or not parent.is_dir()
+                    or parent.stat().st_uid != os.getuid() or parent.stat().st_mode & 0o022):
+                raise JgError(f"runtime_adoption_unverified: startup attestation parent unsafe: {label}")
+        directory_stat = directory.stat()
+        receipt_stat = receipt_path.stat()
+        if (directory_stat.st_uid != os.getuid() or directory_stat.st_mode & 0o077
+                or receipt_stat.st_uid != os.getuid() or receipt_stat.st_mode & 0o077):
+            raise JgError(f"runtime_adoption_unverified: startup attestation permissions invalid: {label}")
+        payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise JgError(f"runtime_adoption_unverified: startup attestation unreadable: {label}") from exc
+    if (not isinstance(payload, dict)
+            or payload.get("contract") != "jev-git-graph/creator-runtime-attestation-v1"
+            or payload.get("pid") != pid
+            or payload.get("process_start") != process_start
+            or payload.get("creator") != label
+            or payload.get("runtime_root_sha256") != hashlib.sha256(str(runtime_root.resolve()).encode()).hexdigest()):
+        raise JgError(f"runtime_adoption_unverified: startup attestation generation mismatch: {label}")
+    runtime_commit = payload.get("runtime_commit")
+    try:
+        git_head = subprocess.run(["git", "-C", str(runtime_root), "rev-parse", "--verify", "HEAD^{commit}"],
+                                  capture_output=True, text=True, check=False, timeout=15)
+        if git_head.returncode:
+            release = json.loads((runtime_root / "release-metadata.json").read_text(encoding="utf-8"))
+            expected_commit = str(release["release_sha"]).lower()
+            if (str(release["source_sha"]).lower() != expected_commit
+                    or Path(str(release["release_path"])).resolve(strict=True) != runtime_root.resolve(strict=True)):
+                raise ValueError("release metadata mismatch")
+        else:
+            expected_commit = git_head.stdout.strip().lower()
+    except (OSError, KeyError, json.JSONDecodeError, ValueError) as exc:
+        raise JgError(f"runtime_adoption_unverified: startup runtime commit unavailable: {label}") from exc
+    if runtime_commit != expected_commit:
+        raise JgError(f"runtime_adoption_unverified: startup runtime commit mismatch: {label}")
+    expected_sha = _REVIEWED_HOOK_FILES.get(process_rel)
+    if expected_sha is None:
+        raise JgError(f"runtime_adoption_unverified: creator process source is not pinned: {label}")
+    attestations = payload.get("attestations")
+    if not isinstance(attestations, list):
+        raise JgError(f"runtime_adoption_unverified: startup source attestations missing: {label}")
+    expected_kind = "shell_source" if process_rel.endswith(".sh") else "python_code"
+    match = next((item for item in attestations if isinstance(item, dict)
+                  and item.get("source_path") == process_rel
+                  and item.get("creator") == label
+                  and item.get("kind") == expected_kind), None)
+    helper_digest = _REVIEWED_HOOK_FILES["scripts/cooperative_branch_lease.py"]
+    if (match is None or match.get("source_sha256") != expected_sha
+            or match.get("helper_path") != "scripts/cooperative_branch_lease.py"
+            or match.get("helper_sha256") != helper_digest
+            or not re.fullmatch(r"[0-9a-f]{64}", str(match.get("loaded_code_sha256", "")))):
+        raise JgError(f"runtime_adoption_unverified: startup source digest mismatch: {label}")
+    return digest(payload)
 
 
 def _verify_loaded_runtime_jobs(home: Path, runtime_roots: tuple[Path, ...]) -> tuple[tuple[str, str, str, str], ...]:
@@ -442,7 +521,13 @@ def _verify_loaded_runtime_jobs(home: Path, runtime_roots: tuple[Path, ...]) -> 
             started_at = datetime.strptime(start_result.stdout.strip(), "%a %b %d %H:%M:%S %Y").timestamp()
         except (ValueError, OverflowError):
             raise JgError(f"runtime_adoption_unverified: creator process start time is unavailable: {label}") from None
-        generation = _attest_process_generation(root, pid, started_at)
+        receipt_digest = _verify_process_startup_attestation(
+            home, root, pid, start_result.stdout.strip(), label, process_rel,
+        )
+        generation = digest({
+            "mtime_generation": _attest_process_generation(root, pid, started_at),
+            "startup_receipt_sha256": receipt_digest,
+        })
         jobs.append((label, str(plist_path.resolve()), str(root), generation))
     return tuple(jobs)
 
