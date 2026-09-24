@@ -7,7 +7,9 @@ from unittest.mock import patch
 
 from jev_git_graph.cli import parser, run
 from jev_git_graph.errors import JgError
-from jev_git_graph.safety import opaque_path_id
+from jev_git_graph.inventory import build_inventory
+from jev_git_graph.review import object_fingerprint, object_id
+from jev_git_graph.safety import digest, opaque_path_id
 
 
 def git(repo, *args):
@@ -16,6 +18,55 @@ def git(repo, *args):
 
 
 class CodeCliTests(unittest.TestCase):
+    def test_preservation_queue_cli_writes_canonical_review_page_offline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            repo = base / "repo"
+            repo.mkdir()
+            git(repo, "init", "-q", "-b", "main")
+            git(repo, "config", "user.name", "Fixture")
+            git(repo, "config", "user.email", "fixture@example.invalid")
+            (repo / "unit.py").write_text("def result():\n    return 1\n")
+            git(repo, "add", ".")
+            git(repo, "commit", "-qm", "base")
+            inventory, _paths, _runner = build_inventory(repo)
+            inventory_path = base / "inventory.json"
+            outcomes_path = base / "outcomes.json"
+            inventory_path.write_text(json.dumps(inventory), encoding="utf-8")
+            outcome_objects = []
+            for kind, field in (("branch", "branches"), ("worktree", "worktrees"), ("stash", "stashes")):
+                for item in inventory[field]:
+                    outcome_objects.append({
+                        "object_id": object_id(kind, item), "kind": kind,
+                        "source_fingerprint": object_fingerprint(kind, item),
+                        "review_status": "unreviewed", "human_decision": None,
+                        "contribution_ids": [], "contribution_reviews": [],
+                    })
+            outcomes = {
+                "kind": "object-outcomes", "schema_version": 1,
+                "repository_id": inventory["repository"]["id"],
+                "inventory_digest": digest(inventory),
+                "snapshot_digest": "a" * 64, "contributions_digest": "b" * 64,
+                "presence_digest": None,
+                "review_provenance": {
+                    "repository_id": inventory["repository"]["id"],
+                    "inventory_digest": digest(inventory), "snapshot_digest": "a" * 64,
+                    "contributions_digest": "b" * 64, "presence_digest": None,
+                    "coverage_digest": None,
+                },
+                "objects": outcome_objects, "integration_tasks": [],
+            }
+            outcomes["outcomes_digest"] = digest(outcomes)
+            outcomes_path.write_text(json.dumps(outcomes), encoding="utf-8")
+            args = parser().parse_args([
+                "preservation-queue", "--repo", str(repo), "--inventory", str(inventory_path),
+                "--outcomes", str(outcomes_path), "--out", str(base / "queue"),
+            ])
+            output = run(args)
+            self.assertTrue(output.endswith("preservation-plan.json"))
+            self.assertTrue((base / "queue" / "index.html").exists())
+            self.assertTrue((base / "queue" / "preservation-plan.json").exists())
+
     def test_preview_prints_exact_bytes_without_artifact_or_network(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

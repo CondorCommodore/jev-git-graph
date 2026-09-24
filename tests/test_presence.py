@@ -22,8 +22,9 @@ from jev_git_graph.presence import (
 )
 from jev_git_graph.presence_calibration import build_presence_calibration
 from jev_git_graph.questions import presence_questions
-from jev_git_graph.safety import digest
+from jev_git_graph.safety import digest, read_json, write_json
 from jev_git_graph.outcomes import build_outcomes
+from jev_git_graph.preservation import build_preservation_plan, write_preservation_plan
 
 
 def _artifact():
@@ -396,10 +397,10 @@ def test_control_presence_flows_to_outcomes_review_and_stales_on_evidence_change
     })
     groups = build_groups(contributions)
     inventory = {
-        "repository": {"id": "fixture"},
+        "repository": {"id": "fixture", "default_branch": "main"},
         "branches": [{"name": "main", "tip": "b" * 40},
                      {"name": "feature/task", "tip": "c" * 40}],
-        "worktrees": [], "stashes": [],
+        "worktrees": [], "stashes": [], "collection": {"complete": True},
     }
     snapshot = {
         "repository_id": "fixture", "inventory_digest": digest(inventory),
@@ -428,6 +429,11 @@ def test_control_presence_flows_to_outcomes_review_and_stales_on_evidence_change
     assert initial["integration_tasks"] == []
     assert initial["cleanup_authorized"] is False
     assert initial["project_utility_assessment"]["status"] == "UNKNOWN"
+    queue = build_preservation_plan(inventory, outcomes=initial)
+    queue_branch = next(row for row in queue["objects"] if row["object_id"] == branch["object_id"])
+    assert queue_branch["outcome_review"]["contribution_reviews"][0]["routing_scope"] == "advisory_only"
+    assert queue_branch["integration_actions"] == []
+    assert any(item["queue"] == "PRESENCE_EVIDENCE_HOLD" for item in queue_branch["suggestions"])
 
     review = {
         "kind": "outcome-review", "schema_version": 2, "repository_id": "fixture",
@@ -457,6 +463,127 @@ def test_control_presence_flows_to_outcomes_review_and_stales_on_evidence_change
     stale_branch = next(row for row in stale["objects"] if row["object_id"] == branch["object_id"])
     assert stale_branch["review_status"] == "stale"
     assert "review_evidence_stale" in stale_branch["reasons"]
+
+
+def test_preservation_queue_requires_current_review_and_trusted_routeable_unit(tmp_path, monkeypatch):
+    contributions, groups = _artifact()
+    contributions["branches"][0]["analysis_status"] = "complete"
+    contributions["branches"].append({"name": "main", "tip": "b" * 40,
+                                      "eligible": True, "unit_ids": [],
+                                      "exclusion_reasons": [], "analysis_status": "complete"})
+    contributions["paths"] = [{"branch": "feature/task", "path": "src.py", "exact": False}]
+    inventory = {
+        "repository": {"id": "fixture", "default_branch": "main"},
+        "branches": [{"name": "main", "tip": "b" * 40},
+                     {"name": "feature/task", "tip": "c" * 40}],
+        "worktrees": [], "stashes": [], "collection": {"complete": True},
+    }
+    snapshot = {
+        "repository_id": "fixture", "inventory_digest": digest(inventory),
+        "main": {"name": "main", "tip": "b" * 40},
+        "branches": [{"name": "main", "tip": "b" * 40, "eligible": True},
+                     {"name": "feature/task", "tip": "c" * 40, "eligible": True}],
+    }
+    snapshot["snapshot_digest"] = digest(snapshot)
+    contributions["snapshot_digest"] = snapshot["snapshot_digest"]
+    contributions["contributions_digest"] = digest({
+        key: value for key, value in contributions.items() if key != "contributions_digest"
+    })
+    groups = build_groups(contributions)
+    monkeypatch.setattr(presence_module, "_presence_key_path", lambda: tmp_path / "private" / "key")
+    body = {
+        "kind": "branch-presence-result", "schema": presence_module.RESULT_SCHEMA,
+        "schema_version": 1, "question_version": presence_module.PRESENCE_QUESTION_VERSION,
+        "origin": "jev", "snapshot_digest": snapshot["snapshot_digest"],
+        "groups_digest": groups["groups_digest"],
+        "contributions_digest": contributions["contributions_digest"],
+        "contributions": [{
+            "contribution_id": "cu-1", "disposition": "USABLE_WORK_REMAINS",
+            "presence": "ABSENT", "evidence_sufficient": True, "usable_delta": True,
+            "comparison_context_complete": True, "comparison_context_limitations": [],
+            "dependency_context_status": "complete", "dependency_context_sufficient": True,
+            "dependency_context_limitations": [], "group_context_complete": True,
+            "group_context_limitations": [], "dependencies": [], "evidence_ids": ["range-1"],
+            "answer_request_ids": ["a" * 64], "routing_scope": "production_review_candidate",
+            "reasons": [],
+        }],
+        "project_utility_assessment": {"status": "UNKNOWN",
+                                       "reason": "project_requirements_not_provided",
+                                       "source": "code_only_presence_review"},
+        "network_performed": False,
+    }
+    body["trusted_provenance"] = presence_module._signed_record(
+        "branch-presence-reconciliation-receipt",
+        {"executor_receipt_sha256": "b" * 64,
+         "result_body_sha256": digest(body)}, create_key=True,
+    )
+    body["presence_digest"] = digest(body)
+    unreviewed = build_outcomes(inventory, snapshot, contributions, presence=body)
+    assert len(unreviewed["integration_tasks"]) == 1
+    queue = build_preservation_plan(inventory, outcomes=unreviewed)
+    branch = next(row for row in queue["objects"] if row["object_id"] == "branch:feature/task")
+    task = branch["integration_actions"][0]
+    assert task["action_state"] == "BLOCKED"
+    assert task["blocked_reason"] == "current_human_integration_review_required"
+
+    reviewed_branch = next(row for row in unreviewed["objects"]
+                           if row["object_id"] == "branch:feature/task")
+    review = {
+        "kind": "outcome-review", "schema_version": 2, "repository_id": "fixture",
+        "provenance": unreviewed["review_provenance"],
+        "decisions": [{
+            "object_id": reviewed_branch["object_id"], "kind": "branch",
+            "source_fingerprint": reviewed_branch["source_fingerprint"],
+            "evidence_fingerprint": reviewed_branch["review_evidence_fingerprint"],
+            "disposition": "INTEGRATE", "rationale": "Review the proposed package behavior",
+            "reviewer_id": "operator", "reviewed_at": "2026-09-24T12:00:00Z",
+            "proposed_destination": "main", "preservation_proof": None,
+        }],
+    }
+    current = build_outcomes(inventory, snapshot, contributions, presence=body, review=review)
+    queue = build_preservation_plan(inventory, outcomes=current)
+    branch = next(row for row in queue["objects"] if row["object_id"] == "branch:feature/task")
+    assert branch["integration_actions"][0]["action_state"] == "READY_FOR_IMPLEMENTATION"
+    assert branch["cleanup_authority"] is False
+    wrong_destination_review = {**review, "decisions": [{
+        **review["decisions"][0], "proposed_destination": "unverified-branch",
+    }]}
+    wrong_destination = build_outcomes(inventory, snapshot, contributions,
+                                       presence=body, review=wrong_destination_review)
+    blocked_queue = build_preservation_plan(inventory, outcomes=wrong_destination)
+    blocked_branch = next(row for row in blocked_queue["objects"]
+                          if row["object_id"] == "branch:feature/task")
+    assert blocked_branch["integration_actions"][0]["action_state"] == "BLOCKED"
+    assert blocked_branch["integration_actions"][0]["blocked_reason"] == "integration_destination_not_pinned_default"
+    inventory_path = tmp_path / "inventory.json"
+    outcomes_path = tmp_path / "outcomes.json"
+    write_json(inventory_path, inventory)
+    write_json(outcomes_path, current)
+    queue_file = write_preservation_plan(inventory_path, tmp_path / "queue",
+                                        outcomes_path=outcomes_path)
+    saved_queue = read_json(queue_file)
+    assert saved_queue["integration_action_count"] == 1
+    assert "READY_FOR_IMPLEMENTATION" in (tmp_path / "queue" / "index.html").read_text()
+
+    changed_presence = {**body, "contributions": [dict(body["contributions"][0])],
+                        "presence_digest": None}
+    changed_presence["contributions"][0]["evidence_ids"] = ["different-range"]
+    changed_presence.pop("trusted_provenance")
+    changed_presence["trusted_provenance"] = presence_module._signed_record(
+        "branch-presence-reconciliation-receipt",
+        {"executor_receipt_sha256": "b" * 64,
+         "result_body_sha256": digest({key: value for key, value in changed_presence.items()
+                                      if key not in {"trusted_provenance", "presence_digest"}})},
+    )
+    changed_presence["presence_digest"] = digest({
+        key: value for key, value in changed_presence.items() if key != "presence_digest"
+    })
+    stale = build_outcomes(inventory, snapshot, contributions, presence=changed_presence, review=review)
+    stale_queue = build_preservation_plan(inventory, outcomes=stale)
+    branch = next(row for row in stale_queue["objects"] if row["object_id"] == "branch:feature/task")
+    assert branch["outcome_review"]["status"] == "stale"
+    assert branch["integration_actions"][0]["action_state"] == "BLOCKED"
+    assert branch["integration_actions"][0]["blocked_reason"] == "outcome_review_stale"
 
 
 def test_calibration_excludes_unreviewed_labels_and_uses_matched_cases(tmp_path, monkeypatch):

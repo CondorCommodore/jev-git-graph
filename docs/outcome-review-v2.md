@@ -31,3 +31,20 @@ historical-limited and never override current derived actions.
 Use a new output directory for each refreshed ledger so prior reports remain
 available for comparison. The JSON and HTML outputs are local review artifacts;
 the page does not write Git refs, execute preservation tasks, or call Jev.
+
+To carry the ledger into the canonical object queue, run:
+
+```text
+jg preservation-queue --repo PATH --inventory INVENTORY.json \
+  --outcomes OUTCOMES.json --out NEW_PRIVATE_DIR
+```
+
+The queue verifies the outcome digest, repository and inventory pins, object
+fingerprints, and contribution/task bindings. Per-unit evidence with advisory,
+unknown, or unresolved routing is retained as a hold. A Jev task is marked
+`READY_FOR_IMPLEMENTATION` only when its contribution is a validated production
+candidate and the matching object has a current human `INTEGRATE` decision.
+Missing and stale reviews remain visible with a blocked reason. This is a
+proposed implementation task; package tests and outcome verification still
+have to pass before the work can be called integrated or preserved. The queue
+does not execute integration, certify preservation, or authorize cleanup.

@@ -29,6 +29,7 @@ from .snapshot import load_snapshot, write_snapshot
 from .contributions import write_contributions
 from .groups import write_groups
 from .outcomes import write_outcomes
+from .preservation import write_preservation_plan
 from .study import (build_selected_study, validate_selected_range_manifest,
                     write_selected_study_artifacts, write_study)
 from .snapshot import load_snapshot
@@ -375,6 +376,17 @@ def parser() -> argparse.ArgumentParser:
     outcomes.add_argument("--review")
     outcomes.add_argument("--out", required=True)
 
+    preservation_queue = commands.add_parser(
+        "preservation-queue", help="build the canonical non-destructive queue from pinned outcomes"
+    )
+    preservation_queue.add_argument("--repo", required=True)
+    preservation_queue.add_argument("--inventory", required=True)
+    preservation_queue.add_argument("--outcomes", required=True)
+    preservation_queue.add_argument("--candidates")
+    preservation_queue.add_argument("--relations")
+    preservation_queue.add_argument("--review")
+    preservation_queue.add_argument("--out", required=True)
+
     candidates = commands.add_parser("candidates", help="build bounded deterministic relationship candidates")
     candidates.add_argument("--repo", required=True)
     candidates.add_argument("--inventory", required=True)
@@ -593,6 +605,15 @@ def run(args: argparse.Namespace) -> str:
         target = validate_output_path(args.out, [*protected_worktree_paths(args.repo), common])
         return str(write_outcomes(args.inventory, args.snapshot, args.contributions, target,
                                   args.presence, args.coverage, args.review))
+    if args.command == "preservation-queue":
+        inventory = read_json(args.inventory)
+        root, common, _runner = git.open_repository(args.repo)
+        if inventory.get("repository", {}).get("id") != opaque_path_id(root):
+            raise JgError("inventory belongs to a different local repository")
+        target = validate_output_path(args.out, [*protected_worktree_paths(args.repo), common])
+        return str(write_preservation_plan(
+            args.inventory, target, args.candidates, args.relations, args.review, args.outcomes,
+        ))
     if args.command == "groups":
         contributions = read_json(args.contributions)
         root, common, _runner = git.open_repository(args.repo)
