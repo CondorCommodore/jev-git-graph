@@ -74,6 +74,8 @@ _REVIEWED_HOOK_FILES = {
     "scripts/l1_drain/self_reported.py": "662d9cbcd86fc021dad1612347e10a9f23f4456e8d482ca3362419ef63e69fae",
     "scripts/l1_drain/workspace.py": "5aecacb06b3322cc64dc729227d45508eb4ffff7cd0504bcf6f46bce20795b70",
     "scripts/pr_repair_loop.py": "2791deaa05197388532898610f3ab3024f617356fcbbfb545724c45782ca108e",
+    # The stable/compat release at dc91a90 carries this reviewed unknown-host
+    # guard; the canonical c82cea2 checkout retains the original reviewed hash.
     "scripts/deploy_sync.py": "bb54d9ede1a318951c109b8453c7ace28accc9f38867b3272c4e0891b67ec84d",
     "scripts/forge-coord-deploy.sh": "5ac70ff08333e3d224bbd4d63e10297a3eb1b524ab8f3ba5646ea5e799c36620",
     "scripts/all_health_controller.py": "f2edfe2d03a65c4b8f2d086a4b1aaf5f13137370a9b6904d6bdb50551697197d",
@@ -92,6 +94,9 @@ _REVIEWED_HOOK_FILES = {
     "launchd/start-pr-repair-loop.sh": "0ec1816b6c2ed02b59fd4cc2d2508ae22e773dd9cc8f30a947cd9742a6281de1",
     "launchd/start-ahc-inventory-alarm.sh": "dde12dd429a48247549a2eb7159a5acb26577c19bdaa12a0b8af9de8d719ef1b",
 }
+_REVIEWED_DEPLOY_SYNC_RUNTIME_COMPAT_SHA = (
+    "6c702771a35b2fb3ab8a101a62d04973adbd03ec888d2eef8a498e895e2a22bd"
+)
 _RUNTIME_SELECTORS = (
     "code/.runtime/releases/home-lab/stable",
     "code/.runtime/home-lab",
@@ -411,6 +416,12 @@ def _runtime_selector_targets(home: Path | None = None) -> tuple[Path, ...]:
     return tuple(targets)
 
 
+def _is_reviewed_runtime_hook_digest(relative: str, expected_sha: str, actual_sha: str) -> bool:
+    return (actual_sha == expected_sha
+            or (relative == "scripts/deploy_sync.py"
+                and actual_sha == _REVIEWED_DEPLOY_SYNC_RUNTIME_COMPAT_SHA))
+
+
 def _verify_runtime_hook_files(runtime_root: Path) -> tuple[tuple[str, str, str], ...]:
     records: list[tuple[str, str, str]] = []
     for relative, expected_sha in sorted(_REVIEWED_HOOK_FILES.items()):
@@ -421,7 +432,7 @@ def _verify_runtime_hook_files(runtime_root: Path) -> tuple[tuple[str, str, str]
             actual_sha = hashlib.sha256(path.read_bytes()).hexdigest()
         except OSError as exc:
             raise JgError(f"creator runtime hook file unreadable: {relative}") from exc
-        if actual_sha != expected_sha:
+        if not _is_reviewed_runtime_hook_digest(relative, expected_sha, actual_sha):
             raise JgError(f"creator runtime hook digest mismatch: {relative}")
         records.append((str(runtime_root), relative, actual_sha))
     helper = (runtime_root / "scripts/cooperative_branch_lease.py").read_text(encoding="utf-8")
