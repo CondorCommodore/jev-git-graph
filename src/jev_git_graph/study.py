@@ -218,16 +218,9 @@ def _behavior_rank(unit: dict, destinations: dict) -> tuple[int, list[str]]:
         reasons.append("large definition is demoted by range budget")
     destination_rows = [destinations[d] for d in unit.get("destination_ids", []) if d in destinations]
     if destination_rows and span > 0:
-        source_lines = span
-        destination_lines = []
-        for row in destination_rows:
-            candidate_range = row.get("range")
-            start, end = (candidate_range.get("start_line"), candidate_range.get("end_line")) if isinstance(candidate_range, dict) else (None, None)
-            if isinstance(start, int) and isinstance(end, int):
-                destination_lines.append(end - start + 1)
-        if len(destination_lines) == len(destination_rows):
-            estimated_lines = sum(max(source_lines, lines) for lines in destination_lines)
-            estimated_specs = sum(max((source_lines + 79) // 80, (lines + 79) // 80) for lines in destination_lines)
+        destination_ranges = [row.get("range") for row in destination_rows]
+        if all(isinstance(value, dict) for value in destination_ranges):
+            estimated_specs, estimated_lines = _complete_range_budget(line_range, destination_ranges)
             if estimated_lines > 240 or estimated_specs > 8:
                 score -= 30
                 reasons.append("complete source/destination ranges exceed excerpt budget")
@@ -251,6 +244,34 @@ def _is_behavior_test(unit: dict) -> bool:
     path, name = unit.get("path") or "", unit.get("name") or ""
     test_path = bool(re.search(r"(^|/)(tests?|__tests__)(/|$)|(^|/)test_[^/]+$", path))
     return test_path and bool(re.search(r"(?:^|\.)test_[A-Za-z0-9_]+$", name))
+
+
+def _complete_range_budget(source_range: dict, destination_ranges: list[dict]) -> tuple[int, int]:
+    """Return spec count and combined lines using the evidence manifest chunk rules."""
+    def lengths(value: dict) -> list[int]:
+        start, end = value.get("start_line"), value.get("end_line")
+        if (not isinstance(start, int) or isinstance(start, bool)
+                or not isinstance(end, int) or isinstance(end, bool)
+                or start < 1 or end < start):
+            return []
+        return [min(80, end - line + 1) for line in range(start, end + 1, 80)]
+
+    source_chunks = lengths(source_range)
+    if not source_chunks:
+        return 0, 0
+    if not destination_ranges:
+        return len(source_chunks), sum(source_chunks)
+    specs = total_lines = 0
+    for destination_range in destination_ranges:
+        destination_chunks = lengths(destination_range)
+        if not destination_chunks:
+            return 0, 0
+        for index in range(max(len(source_chunks), len(destination_chunks))):
+            source_lines = source_chunks[index] if index < len(source_chunks) else 1
+            destination_lines = destination_chunks[index] if index < len(destination_chunks) else 1
+            specs += 1
+            total_lines += source_lines + destination_lines
+    return specs, total_lines
 
 
 def _behavior_identity(unit: dict, destinations: dict) -> tuple:
@@ -331,14 +352,20 @@ def _build_behavior_focused_study(contributions: dict, groups: dict, units: dict
             seen.add(behavior)
             taken += 1
         return taken
-    take(ordered_uncertain, uncertain_target)
-    take(ordered_supported, supported_target)
-    selected_test_count = sum(_is_behavior_test(case["source"]) for case in selected)
-    test_target = min(4, count // 4)
-    if selected_test_count < test_target:
-        test_rows = sorted((row for row in ranked if _is_behavior_test(row[0])),
-                           key=lambda row: (-row[3], row[0]["id"]))
-        take(test_rows, test_target - selected_test_count)
+    test_rows = sorted((row for row in ranked if _is_behavior_test(row[0])),
+                       key=lambda row: (-row[3], row[0]["id"]))
+    test_identities: dict[str, set[tuple]] = defaultdict(set)
+    for unit, _context, _stratum, _score, _reasons in test_rows:
+        test_identities[_family(unit["branch"]) or unit["branch"]].add(_behavior_identity(unit, destinations))
+    feasible_test_capacity = sum(min(max_per_family, len(identities))
+                                 for identities in test_identities.values())
+    test_target = min(4, count // 4, feasible_test_capacity)
+    # Protect reserved test examples from earlier context picks consuming their families.
+    take(test_rows, test_target)
+    supported_already = sum(case["context_stratum"] == supported for case in selected)
+    uncertain_already = sum(case["context_stratum"] == uncertain for case in selected)
+    take(ordered_supported, max(0, supported_target - supported_already))
+    take(ordered_uncertain, max(0, uncertain_target - uncertain_already))
     combined = sorted(ordered_supported + ordered_uncertain,
                       key=lambda row: (-row[3], row[0]["id"]))
     take(combined, count - len(selected))
@@ -366,6 +393,8 @@ def _build_behavior_focused_study(contributions: dict, groups: dict, units: dict
                   "uncertainty_target": uncertain_target, "supported_target": supported_target,
                   "actual_test_body_target": test_target,
                   "actual_test_body_count": sum(_is_behavior_test(case["source"]) for case in selected),
+                  "supported_case_count": sum(case["context_stratum"] == supported for case in selected),
+                  "uncertainty_case_count": sum(case["context_stratum"] == uncertain for case in selected),
                   "identity_key": "source AST fingerprint, name, path, and destination path/AST/blob/mode signatures",
                   "selection_limits": ["metadata ranking does not establish usefulness", "range length is a proxy, not a semantic test", "family caps and context diversity can override rank"]},
               "expansion_gate": "UNMEASURED", "split_policy": "Keep entire families together; label before viewing model answers"}

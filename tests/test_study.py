@@ -4,7 +4,8 @@ from jev_git_graph.groups import build_groups
 from jev_git_graph.errors import JgError
 from jev_git_graph.safety import digest
 from jev_git_graph.study import (build_selected_study, build_study, build_study_range_manifest,
-                                 validate_selected_range_manifest)
+                                 validate_selected_range_manifest, _behavior_rank,
+                                 _complete_range_budget)
 
 
 def _artifact(complete_count=20, total=32):
@@ -114,7 +115,7 @@ def test_behavior_focused_policy_ranks_production_and_test_bodies_and_keeps_unce
     assert not any(name.startswith("FakeResult_") for name in selected_names)
     assert any(case["context_stratum"] == "uncertainty_dependency_or_destination_context"
                and case["source"]["name"].startswith("test_flow_") for case in study["cases"])
-    assert study["selection_policy_details"]["actual_test_body_count"] >= 3
+    assert study["selection_policy_details"]["actual_test_body_count"] >= 4
     assert study["selection_policy_details"]["supported_target"] == 4
     assert study["selection_policy_details"]["uncertainty_target"] == 4
     assert all(case["selection_reasons"] and isinstance(case["selection_rank"], int)
@@ -123,6 +124,55 @@ def test_behavior_focused_policy_ranks_production_and_test_bodies_and_keeps_unce
     assert details["ledger_contribution_units"] == 32
     assert details["selected_units"] + details["unselected_contribution_units"] == 32
     assert "metadata ranking does not establish usefulness" in details["selection_limits"]
+
+
+def test_behavior_focused_test_quota_precedes_shared_family_context_selection():
+    contributions, _ = _artifact(complete_count=24, total=32)
+    branch_by_name = {branch["name"]: branch for branch in contributions["branches"]}
+    for index in (*range(4), *range(24, 28)):
+        unit = contributions["units"][index]
+        old_branch = unit["source"]["branch"]
+        new_branch = f"fix/shared/branch-{index}"
+        branch_by_name[old_branch]["name"] = new_branch
+        unit["branch"] = new_branch
+        unit["source"]["branch"] = new_branch
+        if index < 4:
+            path, name = f"tests/test_flow_{index}.py", f"test_flow_{index}"
+        else:
+            path, name = f"src/run_{index}.py", f"run_flow_{index}"
+        unit.update({"path": path, "name": name, "range": {"start_line": 1, "end_line": 18}})
+        unit["source"].update({"path": path, "name": name})
+        contributions["destination_units"][index]["range"] = {"start_line": 1, "end_line": 18}
+    contributions["contributions_digest"] = digest({k: v for k, v in contributions.items()
+                                                     if k != "contributions_digest"})
+    groups = build_groups(contributions)
+
+    study = build_study(contributions, groups, count=24, max_per_family=4,
+                        selection_policy="behavior-focused-v1")
+
+    assert study["selection_policy_details"]["actual_test_body_target"] == 4
+    assert study["selection_policy_details"]["actual_test_body_count"] == 4
+    assert study["selection_policy_details"]["uncertainty_case_count"] >= 4
+
+
+def test_behavior_rank_uses_manifest_budget_for_multiple_destination_candidates():
+    unit = {"kind": "python_definition", "path": "src/flow.py", "name": "run_flow",
+            "range": {"start_line": 1, "end_line": 60}, "destination_ids": ["d1", "d2", "d3"]}
+    destinations = {name: {"path": f"src/{name}.py", "range": {"start_line": 1, "end_line": 60}}
+                    for name in unit["destination_ids"]}
+
+    assert _complete_range_budget(unit["range"], [row["range"] for row in destinations.values()]) == (3, 360)
+    _score, reasons = _behavior_rank(unit, destinations)
+    assert "complete source/destination ranges exceed excerpt budget" in reasons
+    study = {"snapshot_digest": "a" * 64, "contributions_digest": "b" * 64,
+             "groups_digest": "c" * 64,
+             "cases": [{"contribution_id": "case-1", "source": {"path": "src/flow.py",
+                         "source_tip": "d" * 40, "range": unit["range"]},
+                         "destination_candidates": [{"id": name, **row} for name, row in destinations.items()]}]}
+    manifest = build_study_range_manifest(study, "e" * 40)
+    assert manifest["ranges"] == []
+    assert manifest["omissions"] == [{"contribution_id": "case-1",
+                                      "reason": "complete_definition_exceeds_evidence_bounds"}]
 
 
 def test_behavior_focused_deduplicates_same_ast_with_matching_destination_context():
