@@ -257,6 +257,11 @@ class CleanupTests(unittest.TestCase):
             home = root / "home"
             runtime = home / ".local/share/home-lab/train-promotion-runtime"
             runtime.parent.mkdir(parents=True)
+            absent_root, absent_commit, absent_records = _verify_train_construction_runtime(
+                home, _common_dir(repository))
+            self.assertEqual(absent_root, runtime.resolve(strict=False))
+            self.assertIsNone(absent_commit)
+            self.assertEqual(absent_records, ())
             run(repository, "worktree", "add", "--detach", str(runtime), "HEAD")
             with patch("jev_git_graph.coordinator._REVIEWED_HOOK_FILES", expected):
                 verified_root, verified_commit, records = _verify_train_construction_runtime(
