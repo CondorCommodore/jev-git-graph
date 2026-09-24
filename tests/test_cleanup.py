@@ -370,6 +370,32 @@ class CleanupTests(unittest.TestCase):
             self.assertTrue(plan["bundle"]["restoration_verified"])
             self.assertEqual(hashlib.sha256(Path(plan["bundle"]["path"]).read_bytes()).hexdigest(), plan["bundle"]["sha256"])
 
+    def test_pinned_exact_coverage_is_reproved_against_advanced_live_main(self):
+        repo, topic_tip, coverage_main_tip = self.make_repo()
+        coverage = coverage_for(repo, [{
+            "name": "topic", "tip": topic_tip, "main_tip": coverage_main_tip,
+            "verdict": "EXACT", "reason": None, "last_activity_epoch": 1,
+            "paths": [{"path": "topic", "verdict": "EXACT_PRESENT"}],
+        }])
+        (repo / "unrelated").write_text("new main work\n")
+        run(repo, "add", ".")
+        run(repo, "commit", "-qm", "advance main without changing topic")
+        live_main_tip = run(repo, "rev-parse", "main")
+        with tempfile.TemporaryDirectory() as directory:
+            plan = build_old_plan(repo, coverage, bundle_dir=Path(directory))
+            self.assertEqual(["topic"], [item["name"] for item in plan["candidates"]])
+            self.assertEqual(plan["coverage_main_tip"], coverage_main_tip)
+            self.assertEqual(plan["main"]["tip"], live_main_tip)
+            self.assertEqual(plan["bundle"]["tips"]["main"], live_main_tip)
+
+        (repo / "topic").write_text("replaced on main\n")
+        run(repo, "add", ".")
+        run(repo, "commit", "-qm", "replace topic behavior")
+        with tempfile.TemporaryDirectory() as directory:
+            plan = build_old_plan(repo, coverage, bundle_dir=Path(directory))
+            self.assertEqual([], plan["candidates"])
+            self.assertEqual("live_content_not_exact", plan["observed"][1]["reason"])
+
     def test_checked_out_branch_is_held(self):
         repo, topic_tip, main_tip = self.make_repo()
         worktree = repo.parent / "linked"
