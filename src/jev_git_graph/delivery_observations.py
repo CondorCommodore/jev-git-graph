@@ -15,7 +15,7 @@ from .errors import JgError
 
 KIND = "delivery-observations"
 SCHEMA_VERSION = 1
-_SHA = re.compile(r"^[0-9a-f]{40,64}$")
+_SHA = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _TOP_FIELDS = {"kind", "schema_version", "repository_id", "snapshot_digest",

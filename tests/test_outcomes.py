@@ -165,6 +165,24 @@ def test_delivery_observation_is_pinned_display_only_and_does_not_change_actiona
     assert "Delivery observation (reported only)" in queue_page
     assert "analysis destination remains pinned separately" in queue_page
 
+    sha64 = {**sidecar, "observations": [dict(sidecar["observations"][0])]}
+    sha64["observations"][0]["pull_request"] = {
+        **sidecar["observations"][0]["pull_request"], "head_sha": "e" * 64,
+    }
+    assert build_outcomes(inventory, snapshot, contributions,
+                          delivery_observations=sha64)["delivery_observations"]["observations"][0]["pull_request"]["head_sha"] == "e" * 64
+
+    sha41 = {**sidecar, "observations": [dict(sidecar["observations"][0])]}
+    sha41["observations"][0]["pull_request"] = {
+        **sidecar["observations"][0]["pull_request"], "head_sha": "e" * 41,
+    }
+    try:
+        build_outcomes(inventory, snapshot, contributions, delivery_observations=sha41)
+    except JgError as exc:
+        assert "pull request metadata" in str(exc)
+    else:
+        raise AssertionError("intermediate-length SHA was accepted")
+
     wrong_pins = {**sidecar, "observations": [dict(sidecar["observations"][0])]}
     wrong_pins["observations"][0]["destination"] = {"branch": "main", "tip": "9" * 40}
     try:
