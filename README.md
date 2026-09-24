@@ -88,6 +88,17 @@ dispatch and destructive cleanup remain approval- and gate-bound. See the
 [delivery ledger](docs/outcome-delivery-ledger.md) for the exact tested and
 pending evidence.
 
+The local outcomes page now includes contribution-level presence observations
+and exports a fingerprinted, versioned human review ledger. See the
+[outcome review v2 contract](docs/outcome-review-v2.md) for stale-review and
+preservation-proof handling. Feed the resulting `outcomes.json` and the same
+inventory to `jg preservation-queue --repo PATH --inventory INVENTORY.json
+--outcomes OUTCOMES.json --out NEW_PRIVATE_DIR` to build the canonical
+object-by-object queue. It blocks stale, unknown, and advisory evidence from
+integration routing; current human `INTEGRATE` decisions and validated Jev
+units produce proposed implementation tasks only. No command performs the
+integration or cleanup.
+
 The [local artifact viewer](docs/index.html) starts empty and renders only JSON selected by the operator. It makes no API calls.
 
 ## View local artifacts
