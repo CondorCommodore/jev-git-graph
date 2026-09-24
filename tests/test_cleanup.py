@@ -100,6 +100,18 @@ class CleanupTests(unittest.TestCase):
                     "arguments = {\n    /bin/sh\n    /tmp/unreviewed.sh\n}\n")
                 with self.assertRaisesRegex(JgError, "loaded creator command differs"):
                     _verify_loaded_runtime_jobs(home, (runtime, runtime, runtime))
+                unavailable = subprocess.CompletedProcess(["launchctl"], 113, stdout="", stderr="not found")
+                disabled = subprocess.CompletedProcess(
+                    ["launchctl"], 0,
+                    stdout='"com.example.creator" => disabled\n', stderr="")
+                with patch("jev_git_graph.coordinator.subprocess.run",
+                           side_effect=lambda command, **_kwargs: (
+                               disabled if command[1] == "print-disabled" else unavailable)):
+                    self.assertEqual(len(_verify_loaded_runtime_jobs(
+                        home, (runtime, runtime, runtime))), 1)
+                    disabled.stdout = '"com.example.creator" => enabled\n'
+                    with self.assertRaisesRegex(JgError, "unavailable and not disabled"):
+                        _verify_loaded_runtime_jobs(home, (runtime, runtime, runtime))
 
     def test_creator_generation_is_bound_to_pid_and_reviewed_hook_bytes(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -20,8 +20,10 @@ interval jobs are admitted only when launchd's loaded command matches the
 reviewed plist and source; a start or exit changes the capability generation
 and stops an in-progress cleanup before another ref transaction. A running
 job with a missing or unsafe receipt, stale source, or unreviewed process
-remains plan-only. Receipts become available only after the relevant creator
-starts with the attestation-enabled launcher; no running process is
+remains plan-only. An unloaded job is admitted only when its reviewed plist is
+installed and launchd explicitly reports the label disabled; an enabled but
+unloaded job blocks execution. Receipts become available only after the
+relevant creator starts with the attestation-enabled launcher; no running process is
 retroactively trusted. The train-construction job loads code from a
 separate worktree after fetching `origin/main`; its live worktree must be clean,
 registered with the same Git common directory, exactly at the current local

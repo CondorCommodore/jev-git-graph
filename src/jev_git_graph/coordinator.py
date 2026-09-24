@@ -514,7 +514,17 @@ def _verify_loaded_runtime_jobs(home: Path, runtime_roots: tuple[Path, ...]) -> 
                     raise JgError("train-construction-runtime_override_unverified")
         check = subprocess.run(["launchctl", "print", f"gui/{uid}/{label}"],
                                capture_output=True, text=True, check=False, timeout=10)
-        if check.returncode or f"path = {plist_path}" not in check.stdout:
+        if check.returncode:
+            disabled = subprocess.run(["launchctl", "print-disabled", f"gui/{uid}"],
+                                      capture_output=True, text=True, check=False, timeout=10)
+            if (disabled.returncode == 0
+                    and re.search(rf'(?m)^\s*"{re.escape(label)}"\s*=>\s*disabled\s*$',
+                                  disabled.stdout)):
+                jobs.append((label, str(plist_path.resolve()), str(root),
+                             digest({"disabled": True, "configured_arguments": args})))
+                continue
+            raise JgError(f"creator runtime launchd job is unavailable and not disabled: {label}")
+        if f"path = {plist_path}" not in check.stdout:
             raise JgError(f"creator runtime launchd job is not loaded from the reviewed plist: {label}")
         loaded_arguments = re.search(r"(?m)^\s*arguments = \{\s*\n(.*?)^\s*\}",
                                      check.stdout, re.DOTALL)
