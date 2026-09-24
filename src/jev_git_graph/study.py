@@ -328,17 +328,76 @@ def validate_selected_range_manifest(study: dict, range_manifest: dict) -> None:
         raise JgError("explicit study and evidence range arms do not match")
 
 
+def build_study_range_manifest(study: dict, main_tip: str) -> dict:
+    """Select complete bounded definition ranges; omit cases that exceed a bound."""
+    def chunks(value: dict) -> list[dict[str, int]]:
+        start, end = value["start_line"], value["end_line"]
+        return [{"start_line": line, "end_line": min(line + 79, end)}
+                for line in range(start, end + 1, 80)]
+
+    ranges, omissions = [], []
+    for case in study["cases"]:
+        source = case["source"]
+        source_range = source.get("range")
+        if not isinstance(source_range, dict):
+            omissions.append({"contribution_id": case["contribution_id"], "reason": "source_definition_range_unavailable"})
+            continue
+        source_chunks = chunks(source_range)
+        specs = []
+        candidates = case["destination_candidates"]
+        if not candidates:
+            for index, source_chunk in enumerate(source_chunks):
+                specs.append({"evidence_id": f"{case['contribution_id']}:source:{index}",
+                              "source_path": source["path"], "source_range": source_chunk})
+        for candidate in candidates:
+            destination_range = candidate.get("range")
+            if not isinstance(destination_range, dict):
+                specs = []
+                break
+            destination_chunks = chunks(destination_range)
+            for index in range(max(len(source_chunks), len(destination_chunks))):
+                source_chunk = source_chunks[min(index, len(source_chunks) - 1)]
+                destination_chunk = destination_chunks[min(index, len(destination_chunks) - 1)]
+                if index >= len(source_chunks):
+                    source_chunk = {"start_line": source_range["end_line"],
+                                    "end_line": source_range["end_line"]}
+                if index >= len(destination_chunks):
+                    destination_chunk = {"start_line": destination_range["end_line"],
+                                         "end_line": destination_range["end_line"]}
+                specs.append({"evidence_id": f"{case['contribution_id']}:{candidate['id']}:{index}",
+                              "source_path": source["path"], "source_range": source_chunk,
+                              "destination_path": candidate["path"], "destination_range": destination_chunk})
+        total_lines = sum(spec["source_range"]["end_line"] - spec["source_range"]["start_line"] + 1
+                          + (spec["destination_range"]["end_line"] - spec["destination_range"]["start_line"] + 1
+                             if "destination_range" in spec else 0) for spec in specs)
+        if not specs or len(specs) > 8 or total_lines > 240:
+            omissions.append({"contribution_id": case["contribution_id"],
+                              "reason": "complete_definition_exceeds_evidence_bounds"})
+            continue
+        ranges.append({"contribution_id": case["contribution_id"],
+                       "source_tip": source["source_tip"], "destination_tip": main_tip,
+                       "ranges": specs})
+    return {"kind": "branch-presence-range-manifest", "schema_version": 1,
+            "snapshot_digest": study["snapshot_digest"],
+            "contributions_digest": study["contributions_digest"],
+            "groups_digest": study["groups_digest"],
+            "ranges": ranges, "omissions": omissions}
+
+
 def write_study(contributions_path: str, groups_path: str, out: str | Path,
                 count: int = 32, max_per_family: int = 4,
                 excluded_branches: list[str] | None = None, project_goals: str = "",
                 selection_policy: str = "candidate-availability-24-8-v2") -> Path:
-    result = build_study(read_json(contributions_path), read_json(groups_path), count,
+    contributions = read_json(contributions_path)
+    result = build_study(contributions, read_json(groups_path), count,
                          max_per_family, excluded_branches, project_goals, selection_policy)
     destination = Path(out)
     if destination.exists():
         raise JgError("study output already exists")
     destination.mkdir(mode=0o700, parents=True)
     write_json(destination / "study.json", result)
+    write_json(destination / "evidence-ranges.json",
+               build_study_range_manifest(result, contributions["main"]["tip"]))
     labels_path = destination / "owner-labels.json"
     if not labels_path.exists():
         labels = {
