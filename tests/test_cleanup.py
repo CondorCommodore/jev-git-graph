@@ -572,6 +572,7 @@ class CleanupTests(unittest.TestCase):
             path = directory_path / f"{pid}.json"
             path.write_text(json.dumps(receipt))
             os.chmod(path, 0o600)
+            canonical_helper_sha = _REVIEWED_HOOK_FILES["scripts/cooperative_branch_lease.py"]
             with patch("jev_git_graph.coordinator._REVIEWED_HOOK_FILES", {
                     "scripts/cooperative_branch_lease.py": helper_sha,
                     "scripts/entry.py": source_sha,
@@ -579,6 +580,75 @@ class CleanupTests(unittest.TestCase):
                 self.assertEqual(_verify_process_startup_attestation(
                     home, runtime, pid, process_start, label, "scripts/entry.py"),
                     digest(receipt))
+
+                helper_rel = "scripts/cooperative_branch_lease.py"
+                entry_rel = "scripts/entry.py"
+                reviewed_helper_variant = _REVIEWED_COOPERATIVE_BRANCH_LEASE_RUNTIME_8603_SHA
+                variant_receipt = json.loads(json.dumps(receipt))
+                variant_receipt["attestations"][0]["helper_sha256"] = reviewed_helper_variant
+                path.write_text(json.dumps(variant_receipt))
+                verified_hooks = (
+                    (str(runtime), helper_rel, reviewed_helper_variant),
+                    (str(runtime), entry_rel, source_sha),
+                    (str(runtime), "launchd/start.sh", shell_sha),
+                )
+                variant_reviewed_files = {
+                    helper_rel: canonical_helper_sha,
+                    entry_rel: source_sha,
+                    "launchd/start.sh": shell_sha,
+                }
+                with patch("jev_git_graph.coordinator._REVIEWED_HOOK_FILES",
+                           variant_reviewed_files), \
+                        patch("jev_git_graph.coordinator._verify_runtime_hook_files",
+                              return_value=verified_hooks):
+                    self.assertEqual(_verify_process_startup_attestation(
+                        home, runtime, pid, process_start, label, entry_rel),
+                        digest(variant_receipt))
+
+                    for field, value in (
+                        ("pid", pid + 1),
+                        ("runtime_root_sha256", "0" * 64),
+                        ("process_start", process_start + " stale"),
+                    ):
+                        with self.subTest(attestation_field=field):
+                            stale_receipt = json.loads(json.dumps(variant_receipt))
+                            stale_receipt[field] = value
+                            path.write_text(json.dumps(stale_receipt))
+                            with self.assertRaises(CreatorRuntimeValidationError) as stale_error:
+                                _verify_process_startup_attestation(
+                                    home, runtime, pid, process_start, label, entry_rel)
+                            self.assertEqual(
+                                "attestation_generation_mismatch",
+                                stale_error.exception.safe_diagnostic()["failure_stage"],
+                            )
+                    path.write_text(json.dumps(variant_receipt))
+
+                    unknown_digest = "0" * 64
+                    unknown_receipt = json.loads(json.dumps(variant_receipt))
+                    unknown_receipt["attestations"][0]["helper_sha256"] = unknown_digest
+                    path.write_text(json.dumps(unknown_receipt))
+                    with patch("jev_git_graph.coordinator._verify_runtime_hook_files",
+                               return_value=(
+                                   (str(runtime), helper_rel, unknown_digest),
+                                   (str(runtime), entry_rel, source_sha),
+                               )):
+                        with self.assertRaises(CreatorRuntimeValidationError) as unknown_error:
+                            _verify_process_startup_attestation(
+                                home, runtime, pid, process_start, label, entry_rel)
+                    self.assertEqual("attestation_source_mismatch",
+                                     unknown_error.exception.safe_diagnostic()["failure_stage"])
+
+                    wrong_path_receipt = json.loads(json.dumps(variant_receipt))
+                    wrong_path_receipt["attestations"][0]["helper_path"] = entry_rel
+                    path.write_text(json.dumps(wrong_path_receipt))
+                    with self.assertRaises(CreatorRuntimeValidationError) as wrong_path_error:
+                        _verify_process_startup_attestation(
+                            home, runtime, pid, process_start, label, entry_rel)
+                    self.assertEqual("attestation_source_mismatch",
+                                     wrong_path_error.exception.safe_diagnostic()["failure_stage"])
+
+                path.write_text(json.dumps(receipt))
+                os.chmod(path, 0o600)
                 with self.assertRaises(CreatorRuntimeValidationError) as shell_error:
                     _verify_process_startup_attestation(
                         home, runtime, pid, process_start, label, "launchd/start.sh")
