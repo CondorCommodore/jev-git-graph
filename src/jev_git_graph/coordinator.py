@@ -1086,6 +1086,8 @@ def resolve_production_creator_capability_when_ready(
         if remaining > 0:
             time.sleep(min(_PR_WAKE_READINESS_INTERVAL, remaining))
     for attempt in range(start_attempt, _PR_WAKE_READINESS_ATTEMPTS):
+        if first is not None and time.monotonic() >= deadline:
+            break
         try:
             capability, observations, hook_context = \
                 _resolve_production_creator_capability_snapshot(repository)

@@ -162,7 +162,7 @@ class CleanupTests(unittest.TestCase):
                     patch("jev_git_graph.coordinator.time.sleep") as sleep:
                 with self.assertRaises(CreatorRuntimeValidationError):
                     resolve_production_creator_capability_when_ready(root)
-            self.assertEqual(2, resolver.call_count)
+            self.assertEqual(1, resolver.call_count)
             sleep.assert_called_once_with(0.2)
 
     def test_pr_wake_readiness_unrelated_failure_fails_without_retry(self):
