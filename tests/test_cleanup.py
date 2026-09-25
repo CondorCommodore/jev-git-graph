@@ -18,10 +18,13 @@ from jev_git_graph.coordinator import (CleanupActionJournal,
                                        CooperativeBranchLeaseAdapter,
                                        CreatorLeaseCapability,
                                        CreatorRuntimeValidationError,
+                                       _REVIEWED_COOPERATIVE_BRANCH_LEASE_RUNTIME_8603_SHA,
+                                       _REVIEWED_CANDIDATE_LIFECYCLE_RUNTIME_FF1EF33_SHA,
                                        _REVIEWED_DEPLOY_SYNC_RUNTIME_COMPAT_SHA,
                                        _REVIEWED_DEPLOY_SYNC_RUNTIME_COMPAT_7227_SHA,
                                        _REVIEWED_VERDICT_LIFECYCLE_RUNTIME_COMPAT_SHA,
                                        _REVIEWED_VERDICT_LIFECYCLE_RUNTIME_EB54_SHA,
+                                       _REVIEWED_VERDICT_LIFECYCLE_RUNTIME_7A305FF_SHA,
                                        _REVIEWED_HOOK_FILES,
                                        _is_reviewed_runtime_hook_digest,
                                        _common_dir,
@@ -690,6 +693,50 @@ class CleanupTests(unittest.TestCase):
         self.assertFalse(_is_reviewed_runtime_hook_digest(
             "scripts/cooperative_branch_lease.py", "1" * 64,
             _REVIEWED_DEPLOY_SYNC_RUNTIME_COMPAT_7227_SHA))
+
+    def test_pr8603_runtime_hook_variants_are_exact_and_path_bound(self):
+        helper = "scripts/cooperative_branch_lease.py"
+        candidate = "scripts/merge_train_parts/candidate_lifecycle.py"
+        verdict = "scripts/merge_train_parts/verdict_lifecycle.py"
+        unknown = "0" * 64
+
+        self.assertTrue(_is_reviewed_runtime_hook_digest(
+            helper, _REVIEWED_HOOK_FILES[helper], _REVIEWED_HOOK_FILES[helper]))
+        self.assertTrue(_is_reviewed_runtime_hook_digest(
+            helper, _REVIEWED_HOOK_FILES[helper],
+            _REVIEWED_COOPERATIVE_BRANCH_LEASE_RUNTIME_8603_SHA))
+        self.assertFalse(_is_reviewed_runtime_hook_digest(
+            helper, _REVIEWED_HOOK_FILES[helper], unknown))
+        self.assertFalse(_is_reviewed_runtime_hook_digest(
+            candidate, _REVIEWED_HOOK_FILES[candidate],
+            _REVIEWED_COOPERATIVE_BRANCH_LEASE_RUNTIME_8603_SHA))
+
+        self.assertTrue(_is_reviewed_runtime_hook_digest(
+            candidate, _REVIEWED_HOOK_FILES[candidate],
+            _REVIEWED_HOOK_FILES[candidate]))
+        self.assertTrue(_is_reviewed_runtime_hook_digest(
+            candidate, _REVIEWED_HOOK_FILES[candidate],
+            _REVIEWED_CANDIDATE_LIFECYCLE_RUNTIME_FF1EF33_SHA))
+        self.assertTrue(_is_reviewed_runtime_hook_digest(
+            candidate, _REVIEWED_HOOK_FILES[candidate],
+            "b798333fe2373716c80520ec37d9349e98e6dcc09147b808058addfab707d6f7"))
+        self.assertFalse(_is_reviewed_runtime_hook_digest(
+            candidate, _REVIEWED_HOOK_FILES[candidate], unknown))
+
+        self.assertTrue(_is_reviewed_runtime_hook_digest(
+            verdict, _REVIEWED_HOOK_FILES[verdict],
+            _REVIEWED_HOOK_FILES[verdict]))
+        self.assertTrue(_is_reviewed_runtime_hook_digest(
+            verdict, _REVIEWED_HOOK_FILES[verdict],
+            _REVIEWED_VERDICT_LIFECYCLE_RUNTIME_7A305FF_SHA))
+        self.assertTrue(_is_reviewed_runtime_hook_digest(
+            verdict, _REVIEWED_HOOK_FILES[verdict],
+            _REVIEWED_VERDICT_LIFECYCLE_RUNTIME_COMPAT_SHA))
+        self.assertTrue(_is_reviewed_runtime_hook_digest(
+            verdict, _REVIEWED_HOOK_FILES[verdict],
+            _REVIEWED_VERDICT_LIFECYCLE_RUNTIME_EB54_SHA))
+        self.assertFalse(_is_reviewed_runtime_hook_digest(
+            verdict, _REVIEWED_HOOK_FILES[verdict], unknown))
 
     def test_deploy_sync_hash_change_remains_a_capability_change(self):
         root = Path("/fixture/home-lab")
