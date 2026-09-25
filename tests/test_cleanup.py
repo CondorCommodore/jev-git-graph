@@ -30,6 +30,7 @@ from jev_git_graph.coordinator import (CleanupActionJournal,
                                        _verify_loaded_runtime_jobs,
                                        _verify_train_construction_runtime,
                                        _verify_runtime_hook_files,
+                                       resolve_production_creator_capability_when_ready,
                                        build_disposable_fixture_inventory,
                                        capability_receipt_metadata,
                                        cleanup_action_id,
@@ -77,6 +78,210 @@ def build_old_plan(*args, **kwargs):
 
 
 class CleanupTests(unittest.TestCase):
+    @staticmethod
+    def _readiness_capability(root: Path) -> CreatorLeaseCapability:
+        label = "com.mikebook.pr-convergence-wake-consumer"
+        return CreatorLeaseCapability(
+            common_dir=root, runtime_roots=(root / "stable", root / "compat", root / "canonical"),
+            hook_digests=((str(root / "stable"), "hook.py", "1" * 64),),
+            loaded_runtime_jobs=((label, str(root / "consumer.plist"), str(root / "stable"), "a" * 64),),
+            lock_root=root / "locks", train_construction_runtime=root / "train",
+            train_construction_commit=None,
+        )
+
+    @staticmethod
+    def _readiness_wrapper_error(*, label="com.mikebook.pr-convergence-wake-consumer",
+                                 pid=7312, start="start-one", root="/runtime",
+                                 cwd="/runtime", kind="reviewed_wrapper"):
+        return CreatorRuntimeValidationError(
+            f"runtime_adoption_unverified: wrapper {label}",
+            failure_stage="process_image_mismatch", label=label, pid=pid,
+            expected_root=root, observed_root=cwd, process_command="bash reviewed launcher",
+            process_cwd=cwd, process_start=start, observed_process_kind=kind,
+        )
+
+    def test_pr_wake_readiness_wrapper_to_verified_daemon_returns_fresh_capability(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            capability = self._readiness_capability(root)
+            wrapper = self._readiness_wrapper_error()
+            wrapper._readiness_hook_context = "hooks-one"
+            observations = {"com.mikebook.pr-convergence-wake-consumer": {
+                "kind": "reviewed_daemon", "pid": 7312,
+                "start_sha256": hashlib.sha256(b"start-one").hexdigest(),
+                "root_sha256": hashlib.sha256(b"/runtime").hexdigest(),
+                "cwd_sha256": hashlib.sha256(b"/runtime").hexdigest(),
+            }}
+            with patch("jev_git_graph.coordinator._resolve_production_creator_capability_snapshot",
+                       side_effect=[wrapper, (capability, observations, "hooks-one")]) as resolver, \
+                    patch("jev_git_graph.coordinator.time.sleep") as sleep:
+                result = resolve_production_creator_capability_when_ready(root)
+            self.assertIs(capability, result)
+            self.assertEqual(2, resolver.call_count)
+            sleep.assert_called_once_with(0.2)
+
+    def test_pr_wake_readiness_wrapper_to_valid_idle_returns_fresh_capability(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            capability = self._readiness_capability(root)
+            wrapper = self._readiness_wrapper_error()
+            wrapper._readiness_hook_context = "hooks-one"
+            observations = {"com.mikebook.pr-convergence-wake-consumer": {
+                "kind": "idle", "pid": None,
+            }}
+            with patch("jev_git_graph.coordinator._resolve_production_creator_capability_snapshot",
+                       side_effect=[wrapper, (capability, observations, "hooks-one")]) as resolver, \
+                    patch("jev_git_graph.coordinator.time.sleep"):
+                result = resolve_production_creator_capability_when_ready(root)
+            self.assertIs(capability, result)
+            self.assertEqual(2, resolver.call_count)
+
+    def test_pr_wake_readiness_permanent_wrapper_is_bounded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wrapper = self._readiness_wrapper_error()
+            wrapper._readiness_hook_context = "hooks-one"
+            with patch("jev_git_graph.coordinator._resolve_production_creator_capability_snapshot",
+                       side_effect=wrapper) as resolver, \
+                    patch("jev_git_graph.coordinator.time.sleep") as sleep:
+                with self.assertRaises(CreatorRuntimeValidationError) as caught:
+                    resolve_production_creator_capability_when_ready(root)
+            self.assertIs(wrapper, caught.exception)
+            self.assertEqual(6, resolver.call_count)
+            self.assertEqual(5, sleep.call_count)
+
+    def test_pr_wake_readiness_elapsed_deadline_stops_early(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wrapper = self._readiness_wrapper_error()
+            wrapper._readiness_hook_context = "hooks-one"
+            with patch("jev_git_graph.coordinator._resolve_production_creator_capability_snapshot",
+                       side_effect=wrapper) as resolver, \
+                    patch("jev_git_graph.coordinator.time.monotonic",
+                          side_effect=[0.0, 0.0, 3.0]), \
+                    patch("jev_git_graph.coordinator.time.sleep") as sleep:
+                with self.assertRaises(CreatorRuntimeValidationError):
+                    resolve_production_creator_capability_when_ready(root)
+            self.assertEqual(1, resolver.call_count)
+            sleep.assert_called_once_with(0.2)
+
+    def test_pr_wake_readiness_unrelated_failure_fails_without_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            unrelated = self._readiness_wrapper_error(label="com.mikebook.merge-safe-prs-loop")
+            with patch("jev_git_graph.coordinator._resolve_production_creator_capability_snapshot",
+                       side_effect=unrelated) as resolver, \
+                    patch("jev_git_graph.coordinator.time.sleep") as sleep:
+                with self.assertRaises(CreatorRuntimeValidationError) as caught:
+                    resolve_production_creator_capability_when_ready(root)
+            self.assertIs(unrelated, caught.exception)
+            resolver.assert_called_once_with(root)
+            sleep.assert_not_called()
+
+    def test_pr_wake_readiness_wrong_stage_or_kind_fails_without_retry(self):
+        label = "com.mikebook.pr-convergence-wake-consumer"
+        cases = (
+            CreatorRuntimeValidationError(
+                "cwd mismatch", failure_stage="cwd_mismatch", label=label,
+                observed_process_kind="reviewed_wrapper"),
+            CreatorRuntimeValidationError(
+                "not reviewed wrapper", failure_stage="process_image_mismatch",
+                label=label, observed_process_kind="other"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for failure in cases:
+                with self.subTest(diagnostic=failure.safe_diagnostic()):
+                    with patch("jev_git_graph.coordinator._resolve_production_creator_capability_snapshot",
+                               side_effect=failure) as resolver, \
+                            patch("jev_git_graph.coordinator.time.sleep") as sleep:
+                        with self.assertRaises(CreatorRuntimeValidationError) as caught:
+                            resolve_production_creator_capability_when_ready(root)
+                    self.assertIs(failure, caught.exception)
+                    resolver.assert_called_once_with(root)
+                    sleep.assert_not_called()
+
+    def test_pr_wake_readiness_rejects_changed_process_or_hook_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original = self._readiness_wrapper_error()
+            original._readiness_hook_context = "hooks-one"
+            changed_pid = self._readiness_wrapper_error(pid=7313)
+            changed_pid._readiness_hook_context = "hooks-one"
+            with patch("jev_git_graph.coordinator._resolve_production_creator_capability_snapshot",
+                       side_effect=[original, changed_pid]) as resolver, \
+                    patch("jev_git_graph.coordinator.time.sleep") as sleep:
+                with self.assertRaises(CreatorRuntimeValidationError) as caught:
+                    resolve_production_creator_capability_when_ready(root)
+            self.assertIs(changed_pid, caught.exception)
+            self.assertEqual(2, resolver.call_count)
+            sleep.assert_called_once_with(0.2)
+
+            original = self._readiness_wrapper_error()
+            original._readiness_hook_context = "hooks-one"
+            changed_hooks = self._readiness_wrapper_error()
+            changed_hooks._readiness_hook_context = "hooks-two"
+            with patch("jev_git_graph.coordinator._resolve_production_creator_capability_snapshot",
+                       side_effect=[original, changed_hooks]) as resolver:
+                with self.assertRaises(CreatorRuntimeValidationError) as caught:
+                    resolve_production_creator_capability_when_ready(root)
+            self.assertIs(changed_hooks, caught.exception)
+            self.assertEqual(2, resolver.call_count)
+
+            for changed in (
+                    self._readiness_wrapper_error(start="start-two"),
+                    self._readiness_wrapper_error(root="/other", cwd="/other")):
+                original = self._readiness_wrapper_error()
+                original._readiness_hook_context = "hooks-one"
+                changed._readiness_hook_context = "hooks-one"
+                with self.subTest(changed=changed.safe_diagnostic()):
+                    with patch("jev_git_graph.coordinator._resolve_production_creator_capability_snapshot",
+                               side_effect=[original, changed]) as resolver:
+                        with self.assertRaises(CreatorRuntimeValidationError) as caught:
+                            resolve_production_creator_capability_when_ready(root)
+                    self.assertIs(changed, caught.exception)
+                    self.assertEqual(2, resolver.call_count)
+
+            original = self._readiness_wrapper_error()
+            original._readiness_hook_context = "hooks-one"
+            terminal = self._readiness_capability(root)
+            different_process = {"com.mikebook.pr-convergence-wake-consumer": {
+                "kind": "reviewed_daemon", "pid": 7313,
+                "start_sha256": hashlib.sha256(b"start-one").hexdigest(),
+                "root_sha256": hashlib.sha256(b"/runtime").hexdigest(),
+                "cwd_sha256": hashlib.sha256(b"/runtime").hexdigest(),
+            }}
+            with patch("jev_git_graph.coordinator._resolve_production_creator_capability_snapshot",
+                       side_effect=[original, (terminal, different_process, "hooks-one")]):
+                with self.assertRaises(CreatorRuntimeValidationError) as caught:
+                    resolve_production_creator_capability_when_ready(root)
+            self.assertEqual("other", caught.exception.safe_diagnostic()["failure_stage"])
+
+    def test_post_intent_wrapper_readiness_keeps_generation_diff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            label = "com.mikebook.pr-convergence-wake-consumer"
+            expected = self._readiness_capability(root)
+            current = replace(expected, loaded_runtime_jobs=((
+                label, str(root / "consumer.plist"), str(root / "stable"), "b" * 64),))
+            wrapper = self._readiness_wrapper_error()
+            wrapper._readiness_hook_context = "hooks-one"
+            observations = {label: {
+                "kind": "reviewed_daemon", "pid": 7312,
+                "start_sha256": hashlib.sha256(b"start-one").hexdigest(),
+                "root_sha256": hashlib.sha256(b"/runtime").hexdigest(),
+                "cwd_sha256": hashlib.sha256(b"/runtime").hexdigest(),
+            }}
+            with patch("jev_git_graph.coordinator.resolve_production_creator_capability",
+                       side_effect=wrapper), \
+                    patch("jev_git_graph.coordinator._resolve_production_creator_capability_snapshot",
+                          return_value=(current, observations, "hooks-one")), \
+                    patch("jev_git_graph.coordinator.time.sleep"):
+                result = production_capability_diagnostic(expected, root)
+            self.assertFalse(result["ok"])
+            self.assertEqual(["loaded_job_generation"], result["changed_fields"])
+            self.assertEqual(1, len(result["current_generation_hashes"]))
+
     def test_cli_plan_keeps_private_recovery_bundle_beside_manifest(self):
         repo, topic_tip, main_tip = self.make_repo()
         coverage = coverage_for(repo, [{

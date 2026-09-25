@@ -412,7 +412,17 @@ def production_capability_diagnostic(
     allowlisted launchd labels.
     """
     try:
-        current = resolve_production_creator_capability(repository)
+        try:
+            current = resolve_production_creator_capability(repository)
+        except CreatorRuntimeValidationError as exc:
+            diagnostic = exc.safe_diagnostic()
+            if (exc.label == _PR_WAKE_CONSUMER_LABEL
+                    and diagnostic.get("failure_stage") == "process_image_mismatch"
+                    and diagnostic.get("observed_process_kind") == "reviewed_wrapper"):
+                current = resolve_production_creator_capability_when_ready(
+                    repository, _first_error=exc)
+            else:
+                raise
     except (JgError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
         failure, label, details = _safe_validation_failure(exc)
         return {
@@ -730,6 +740,7 @@ def _verify_process_startup_attestation(
 def _verify_loaded_runtime_jobs(
     home: Path, runtime_roots: tuple[Path, ...],
     verified_hook_digests: Mapping[tuple[str, str], str] | None = None,
+    process_observations: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[tuple[str, str, str, str], ...]:
     """Verify configured launchd entrypoints and their currently loaded processes."""
     expected_roots = {selector: root for selector, root in zip(_RUNTIME_SELECTORS, runtime_roots)}
@@ -827,12 +838,23 @@ def _verify_loaded_runtime_jobs(
                 failure_stage="loaded_job_contract_mismatch", label=label,
                 expected_root=root, pid=pid,
             )
+        job_context = digest({
+            "label": label, "root": str(root), "arguments": loaded_tokens,
+            "working_directory": loaded_wd.group(1).strip() if loaded_wd else None,
+        })
+        if process_observations is not None:
+            process_observations[label] = {"job_context": job_context}
         if pid is None:
             # Interval jobs may be idle. Their next invocation loads the
             # currently reviewed entrypoint. A start during cleanup changes
             # this capability generation and stops the next ref transaction.
             jobs.append((label, str(plist_path.resolve()), str(root),
                          digest({"idle": True, "loaded_arguments": loaded_tokens})))
+            if process_observations is not None:
+                process_observations[label].update({
+                    "kind": "idle", "pid": None,
+                    "root_sha256": _diagnostic_sha256(root),
+                })
             continue
         try:
             process = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
@@ -954,16 +976,20 @@ def _verify_loaded_runtime_jobs(
             "startup_receipt_sha256": receipt_digest,
         })
         jobs.append((label, str(plist_path.resolve()), str(root), generation))
+        if process_observations is not None:
+            process_observations[label].update({
+                "kind": process_kind, "pid": pid,
+                "start_sha256": _diagnostic_sha256(start_result.stdout.strip()),
+                "root_sha256": _diagnostic_sha256(expected_cwd),
+                "cwd_sha256": _diagnostic_sha256(cwd_path),
+            })
     return tuple(jobs)
 
 
-def resolve_production_creator_capability(repository: str | Path) -> CreatorLeaseCapability:
-    """Derive production readiness from both configured installed runtime trees.
-
-    No serialized attestation or in-memory creator registration is authoritative.
-    Every execute attempt calls this resolver again, so symlink/release drift fails
-    closed before another branch lease is acquired.
-    """
+def _resolve_production_creator_capability_snapshot(
+    repository: str | Path,
+) -> tuple[CreatorLeaseCapability, dict[str, dict[str, Any]], str]:
+    """Run the ordinary resolver and retain private, in-memory process evidence."""
     common_dir = _common_dir(repository)
     lock_root = _fixed_lock_root()
     runtime_roots = _runtime_selector_targets()
@@ -983,11 +1009,135 @@ def resolve_production_creator_capability(repository: str | Path) -> CreatorLeas
     digests = tuple(digests_list)
     home = Path.home()
     verified_hook_digests = {(root, relative): sha for root, relative, sha in digests}
-    jobs = _verify_loaded_runtime_jobs(home, runtime_roots, verified_hook_digests)
     train_runtime, train_commit, train_digests = _verify_train_construction_runtime(home, common_dir)
-    return CreatorLeaseCapability(common_dir, runtime_roots,
-                                  (*digests, *train_digests), jobs, lock_root,
-                                  train_runtime, train_commit)
+    static_context = digest({
+        "runtime_roots": tuple(str(root) for root in runtime_roots),
+        "hook_digests": digests,
+        "train_runtime": str(train_runtime),
+        "train_commit": train_commit,
+        "train_digests": train_digests,
+    })
+    observations: dict[str, dict[str, Any]] = {}
+    try:
+        jobs = _verify_loaded_runtime_jobs(
+            home, runtime_roots, verified_hook_digests, observations)
+    except CreatorRuntimeValidationError as exc:
+        # Ephemeral continuity evidence only; never enters safe diagnostics or
+        # the serialized capability.
+        exc._readiness_hook_context = digest({
+            "static_context": static_context,
+            "consumer_job": observations.get(_PR_WAKE_CONSUMER_LABEL, {}).get("job_context"),
+        })
+        raise
+    hook_context = digest({
+        "static_context": static_context,
+        "consumer_job": observations.get(_PR_WAKE_CONSUMER_LABEL, {}).get("job_context"),
+    })
+    capability = CreatorLeaseCapability(
+        common_dir, runtime_roots, (*digests, *train_digests), jobs, lock_root,
+        train_runtime, train_commit,
+    )
+    return capability, observations, hook_context
+
+
+def resolve_production_creator_capability(repository: str | Path) -> CreatorLeaseCapability:
+    """Derive production readiness from both configured installed runtime trees.
+
+    No serialized attestation or in-memory creator registration is authoritative.
+    Every execute attempt calls this resolver again, so symlink/release drift fails
+    closed before another branch lease is acquired.
+    """
+    capability, _observations, _hook_context = _resolve_production_creator_capability_snapshot(
+        repository)
+    return capability
+
+
+_PR_WAKE_CONSUMER_LABEL = "com.mikebook.pr-convergence-wake-consumer"
+_PR_WAKE_READINESS_ATTEMPTS = 6
+_PR_WAKE_READINESS_SECONDS = 3.0
+_PR_WAKE_READINESS_INTERVAL = 0.2
+
+
+def resolve_production_creator_capability_when_ready(
+    repository: str | Path, *, _first_error: CreatorRuntimeValidationError | None = None,
+) -> CreatorLeaseCapability:
+    """Wait briefly only for the reviewed PR wake consumer wrapper transition."""
+    deadline = time.monotonic() + _PR_WAKE_READINESS_SECONDS
+    first: dict[str, Any] | None = None
+    last_error: CreatorRuntimeValidationError | None = None
+    start_attempt = 0
+    if _first_error is not None:
+        diagnostic = _first_error.safe_diagnostic()
+        if (_first_error.label != _PR_WAKE_CONSUMER_LABEL
+                or diagnostic.get("failure_stage") != "process_image_mismatch"
+                or diagnostic.get("observed_process_kind") != "reviewed_wrapper"):
+            raise _first_error
+        first = {
+            "pid": diagnostic.get("failed_pid"),
+            "start_sha256": diagnostic.get("process_start_sha256"),
+            "root_sha256": diagnostic.get("expected_runtime_root_sha256"),
+            "cwd_sha256": diagnostic.get("process_cwd_sha256"),
+            "command_sha256": diagnostic.get("process_command_sha256"),
+            "hook_context": getattr(_first_error, "_readiness_hook_context", None),
+        }
+        last_error = _first_error
+        start_attempt = 1
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(_PR_WAKE_READINESS_INTERVAL, remaining))
+    for attempt in range(start_attempt, _PR_WAKE_READINESS_ATTEMPTS):
+        if first is not None and time.monotonic() >= deadline:
+            break
+        try:
+            capability, observations, hook_context = \
+                _resolve_production_creator_capability_snapshot(repository)
+        except CreatorRuntimeValidationError as exc:
+            diagnostic = exc.safe_diagnostic()
+            if (exc.label != _PR_WAKE_CONSUMER_LABEL
+                    or diagnostic.get("failure_stage") != "process_image_mismatch"
+                    or diagnostic.get("observed_process_kind") != "reviewed_wrapper"):
+                raise
+            current = {
+                "pid": diagnostic.get("failed_pid"),
+                "start_sha256": diagnostic.get("process_start_sha256"),
+                "root_sha256": diagnostic.get("expected_runtime_root_sha256"),
+                "cwd_sha256": diagnostic.get("process_cwd_sha256"),
+                "command_sha256": diagnostic.get("process_command_sha256"),
+                "hook_context": getattr(exc, "_readiness_hook_context", None),
+            }
+            if first is None:
+                first = current
+            elif any(current.get(key) != first.get(key) for key in (
+                    "pid", "start_sha256", "root_sha256", "cwd_sha256",
+                    "command_sha256", "hook_context")):
+                raise
+            last_error = exc
+        else:
+            if first is None:
+                return capability
+            observation = observations.get(_PR_WAKE_CONSUMER_LABEL)
+            same_static = hook_context == first.get("hook_context")
+            if (same_static and observation and observation.get("kind") == "idle"
+                    and observation.get("pid") is None):
+                return capability
+            if (same_static and observation
+                    and observation.get("kind") == "reviewed_daemon"
+                    and observation.get("pid") == first.get("pid")
+                    and observation.get("start_sha256") == first.get("start_sha256")
+                    and observation.get("root_sha256") == first.get("root_sha256")
+                    and observation.get("cwd_sha256") == first.get("cwd_sha256")):
+                return capability
+            raise CreatorRuntimeValidationError(
+                "runtime_adoption_unverified: PR wake consumer identity changed during readiness",
+                failure_stage="other", label=_PR_WAKE_CONSUMER_LABEL,
+            )
+        remaining = deadline - time.monotonic()
+        if attempt + 1 >= _PR_WAKE_READINESS_ATTEMPTS or remaining <= 0:
+            break
+        time.sleep(min(_PR_WAKE_READINESS_INTERVAL, remaining))
+    if last_error is not None:
+        raise last_error
+    raise JgError("runtime_adoption_unverified: PR wake consumer readiness deadline expired")
 
 
 def build_disposable_fixture_inventory(repository: str | Path, branches: list[str],
@@ -1210,7 +1360,7 @@ class CooperativeBranchLeaseAdapter:
 
     @classmethod
     def for_production_repository(cls, repository: str | Path, *, lock_timeout: float = 0.0) -> "CooperativeBranchLeaseAdapter":
-        capability = resolve_production_creator_capability(repository)
+        capability = resolve_production_creator_capability_when_ready(repository)
         adapter = cls(str(capability.common_dir), capability.lock_root,
                       lock_timeout=lock_timeout, capability=capability)
         adapter.common_dir = capability.common_dir
