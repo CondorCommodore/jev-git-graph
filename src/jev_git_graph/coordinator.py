@@ -112,6 +112,10 @@ _REVIEWED_CANDIDATE_LIFECYCLE_RUNTIME_COMPAT_SHA = (
 _REVIEWED_VERDICT_LIFECYCLE_RUNTIME_COMPAT_SHA = (
     "c88cb5e85f1a2ea60ce670e048d5b258e9c74d02790020c00fad08165cdad7ab"
 )
+# Jev registry compatibility approval for the exact Home Lab source at eb54aad.
+_REVIEWED_VERDICT_LIFECYCLE_RUNTIME_EB54_SHA = (
+    "df119c9d1f55005a24159a9fac74baf146cc61e94ae4330e68947bb2f982973f"
+)
 _RUNTIME_SELECTORS = (
     "code/.runtime/releases/home-lab/stable",
     "code/.runtime/home-lab",
@@ -504,7 +508,10 @@ def _is_reviewed_runtime_hook_digest(relative: str, expected_sha: str, actual_sh
             or (relative == "scripts/merge_train_parts/candidate_lifecycle.py"
                 and actual_sha == _REVIEWED_CANDIDATE_LIFECYCLE_RUNTIME_COMPAT_SHA)
             or (relative == "scripts/merge_train_parts/verdict_lifecycle.py"
-                and actual_sha == _REVIEWED_VERDICT_LIFECYCLE_RUNTIME_COMPAT_SHA))
+                and actual_sha in (
+                    _REVIEWED_VERDICT_LIFECYCLE_RUNTIME_COMPAT_SHA,
+                    _REVIEWED_VERDICT_LIFECYCLE_RUNTIME_EB54_SHA,
+                )))
 
 
 def _verify_runtime_hook_files(runtime_root: Path) -> tuple[tuple[str, str, str], ...]:

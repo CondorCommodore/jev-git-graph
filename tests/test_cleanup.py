@@ -21,6 +21,7 @@ from jev_git_graph.coordinator import (CleanupActionJournal,
                                        _REVIEWED_DEPLOY_SYNC_RUNTIME_COMPAT_SHA,
                                        _REVIEWED_DEPLOY_SYNC_RUNTIME_COMPAT_7227_SHA,
                                        _REVIEWED_VERDICT_LIFECYCLE_RUNTIME_COMPAT_SHA,
+                                       _REVIEWED_VERDICT_LIFECYCLE_RUNTIME_EB54_SHA,
                                        _REVIEWED_HOOK_FILES,
                                        _is_reviewed_runtime_hook_digest,
                                        _common_dir,
@@ -531,6 +532,7 @@ class CleanupTests(unittest.TestCase):
         shell_variant = "2ec5e69c594d813624161ccdffe4a92bd6ed184999f7469b3f8a219e67563086"
         lifecycle_variant = "b798333fe2373716c80520ec37d9349e98e6dcc09147b808058addfab707d6f7"
         verdict_variant = _REVIEWED_VERDICT_LIFECYCLE_RUNTIME_COMPAT_SHA
+        verdict_eb54_variant = _REVIEWED_VERDICT_LIFECYCLE_RUNTIME_EB54_SHA
         self.assertTrue(_is_reviewed_runtime_hook_digest(
             shell, _REVIEWED_HOOK_FILES[shell], _REVIEWED_HOOK_FILES[shell]))
         self.assertTrue(_is_reviewed_runtime_hook_digest(
@@ -542,6 +544,8 @@ class CleanupTests(unittest.TestCase):
             _REVIEWED_HOOK_FILES[verdict_lifecycle]))
         self.assertTrue(_is_reviewed_runtime_hook_digest(
             verdict_lifecycle, _REVIEWED_HOOK_FILES[verdict_lifecycle], verdict_variant))
+        self.assertTrue(_is_reviewed_runtime_hook_digest(
+            verdict_lifecycle, _REVIEWED_HOOK_FILES[verdict_lifecycle], verdict_eb54_variant))
         self.assertFalse(_is_reviewed_runtime_hook_digest(
             shell, _REVIEWED_HOOK_FILES[shell], lifecycle_variant))
         self.assertFalse(_is_reviewed_runtime_hook_digest(
@@ -550,6 +554,8 @@ class CleanupTests(unittest.TestCase):
             verdict_lifecycle, _REVIEWED_HOOK_FILES[verdict_lifecycle], lifecycle_variant))
         self.assertFalse(_is_reviewed_runtime_hook_digest(
             lifecycle, _REVIEWED_HOOK_FILES[lifecycle], verdict_variant))
+        self.assertFalse(_is_reviewed_runtime_hook_digest(
+            lifecycle, _REVIEWED_HOOK_FILES[lifecycle], verdict_eb54_variant))
         self.assertFalse(_is_reviewed_runtime_hook_digest(
             verdict_lifecycle, _REVIEWED_HOOK_FILES[verdict_lifecycle], "0" * 64))
         self.assertFalse(_is_reviewed_runtime_hook_digest(
@@ -564,32 +570,35 @@ class CleanupTests(unittest.TestCase):
             "scripts/merge_train_parts/candidate_lifecycle.py": (
                 "b798333fe2373716c80520ec37d9349e98e6dcc09147b808058addfab707d6f7"),
             "scripts/merge_train_parts/verdict_lifecycle.py": (
-                _REVIEWED_VERDICT_LIFECYCLE_RUNTIME_COMPAT_SHA),
+                (_REVIEWED_VERDICT_LIFECYCLE_RUNTIME_COMPAT_SHA,
+                 _REVIEWED_VERDICT_LIFECYCLE_RUNTIME_EB54_SHA)),
         }
-        for relative, compatible_sha in variants.items():
-            with self.subTest(relative=relative):
-                original_sha = _REVIEWED_HOOK_FILES[relative]
-                expected = CreatorLeaseCapability(
-                    common_dir=root / ".git", runtime_roots=roots, hook_digests=tuple(
-                        (str(runtime_root), relative, original_sha) for runtime_root in roots
-                    ), loaded_runtime_jobs=(), lock_root=root / "locks",
-                    train_construction_runtime=root / "train-runtime",
-                    train_construction_commit=None,
-                )
-                changed = replace(expected, hook_digests=tuple(
-                    (str(runtime_root), relative,
-                     compatible_sha if runtime_root == roots[0] else original_sha)
-                    for runtime_root in roots
-                ))
-                with patch("jev_git_graph.coordinator.resolve_production_creator_capability",
-                           return_value=changed):
-                    diagnostic = production_capability_diagnostic(expected, root)
-                self.assertFalse(diagnostic["ok"])
-                self.assertEqual(["hook_digests"], diagnostic["changed_fields"])
-                self.assertNotEqual(
-                    capability_receipt_metadata(expected)["creator_capability_sha256"],
-                    capability_receipt_metadata(changed)["creator_capability_sha256"],
-                )
+        for relative, compatible_shas in variants.items():
+            for compatible_sha in (compatible_shas if isinstance(compatible_shas, tuple)
+                                   else (compatible_shas,)):
+                with self.subTest(relative=relative, compatible_sha=compatible_sha):
+                    original_sha = _REVIEWED_HOOK_FILES[relative]
+                    expected = CreatorLeaseCapability(
+                        common_dir=root / ".git", runtime_roots=roots, hook_digests=tuple(
+                            (str(runtime_root), relative, original_sha) for runtime_root in roots
+                        ), loaded_runtime_jobs=(), lock_root=root / "locks",
+                        train_construction_runtime=root / "train-runtime",
+                        train_construction_commit=None,
+                    )
+                    changed = replace(expected, hook_digests=tuple(
+                        (str(runtime_root), relative,
+                         compatible_sha if runtime_root == roots[0] else original_sha)
+                        for runtime_root in roots
+                    ))
+                    with patch("jev_git_graph.coordinator.resolve_production_creator_capability",
+                               return_value=changed):
+                        diagnostic = production_capability_diagnostic(expected, root)
+                    self.assertFalse(diagnostic["ok"])
+                    self.assertEqual(["hook_digests"], diagnostic["changed_fields"])
+                    self.assertNotEqual(
+                        capability_receipt_metadata(expected)["creator_capability_sha256"],
+                        capability_receipt_metadata(changed)["creator_capability_sha256"],
+                    )
 
     def test_train_construction_requires_live_clean_origin_main_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
