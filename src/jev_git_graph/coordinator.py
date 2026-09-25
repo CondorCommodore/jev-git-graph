@@ -343,6 +343,7 @@ def _safe_validation_failure(
 _CREATOR_FAILURE_STAGES = frozenset({
     "pid_lookup_failed", "process_lookup_failed", "start_lookup_failed",
     "cwd_lookup_failed", "cwd_mismatch", "process_image_mismatch",
+    "loaded_job_contract_mismatch",
     "attestation_missing", "attestation_generation_mismatch",
     "attestation_source_mismatch", "other",
 })
@@ -809,12 +810,8 @@ def _verify_loaded_runtime_jobs(
                          != Path(wd).resolve(strict=False)))):
             raise CreatorRuntimeValidationError(
                 f"runtime_adoption_unverified: loaded creator command differs from reviewed plist: {label}",
-                failure_stage="process_image_mismatch", label=label,
-                expected_root=root,
-                observed_root=(loaded_wd.group(1).strip() if loaded_wd else None),
-                process_command="\0".join(loaded_tokens),
-                process_cwd=(loaded_wd.group(1).strip() if loaded_wd else None),
-                observed_process_kind="other", pid=pid,
+                failure_stage="loaded_job_contract_mismatch", label=label,
+                expected_root=root, pid=pid,
             )
         if pid is None:
             # Interval jobs may be idle. Their next invocation loads the

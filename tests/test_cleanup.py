@@ -233,7 +233,7 @@ class CleanupTests(unittest.TestCase):
                 ("cwd_mismatch", "cwd_mismatch"),
                 ("start_parse_failed", "start_lookup_failed"),
                 ("reviewed_wrapper", "process_image_mismatch"),
-                ("loaded_command_mismatch", "process_image_mismatch"),
+                ("loaded_command_mismatch", "loaded_job_contract_mismatch"),
                 ("wrong_process", "process_image_mismatch"),
             )
             for fault, stage in cases:
@@ -272,6 +272,14 @@ class CleanupTests(unittest.TestCase):
                     elif fault == "cwd_mismatch":
                         self.assertEqual(hashlib.sha256(str(wrong_root).encode()).hexdigest(),
                                          diagnostic["observed_runtime_root_sha256"])
+                    elif fault == "loaded_command_mismatch":
+                        self.assertEqual(["launchctl"], [call[0] for call in calls])
+                        for field in (
+                            "observed_runtime_root_sha256", "process_command_sha256",
+                            "process_cwd_sha256", "process_start_sha256",
+                            "observed_process_kind",
+                        ):
+                            self.assertNotIn(field, diagnostic)
                     with patch("jev_git_graph.coordinator.resolve_production_creator_capability",
                                side_effect=error) as resolve:
                         safe = production_capability_diagnostic(
