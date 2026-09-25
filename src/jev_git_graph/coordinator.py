@@ -101,6 +101,10 @@ _REVIEWED_DEPLOY_SYNC_RUNTIME_COMPAT_SHA = (
 _REVIEWED_DEPLOY_SYNC_RUNTIME_COMPAT_7227_SHA = (
     "7227de6c32bcc421b4715babcf7ca06529df206d7536b6e3978b9cde5910ff8e"
 )
+# Exact reviewed stable source at Home Lab commit 1792a23 (#8607).
+_REVIEWED_DEPLOY_SYNC_RUNTIME_8607_SHA = (
+    "e7077039016d0f498082696f1f3de226f94aa0135f112c69f22cb1eea0688f04"
+)
 # Exact reviewed stable helper source from Home Lab PR #8603 at merge 3608e2b.
 _REVIEWED_COOPERATIVE_BRANCH_LEASE_RUNTIME_8603_SHA = (
     "299bbc68ec12f7bfd11797eb0f6ef5456103c6b79ff0d456f2e2afa6c75e3466"
@@ -526,6 +530,7 @@ def _is_reviewed_runtime_hook_digest(relative: str, expected_sha: str, actual_sh
                 and actual_sha in (
                     _REVIEWED_DEPLOY_SYNC_RUNTIME_COMPAT_SHA,
                     _REVIEWED_DEPLOY_SYNC_RUNTIME_COMPAT_7227_SHA,
+                    _REVIEWED_DEPLOY_SYNC_RUNTIME_8607_SHA,
                 ))
             or (relative == "scripts/merge-safe-prs-loop.sh"
                 and actual_sha == _REVIEWED_MERGE_LOOP_SHELL_RUNTIME_COMPAT_SHA)
