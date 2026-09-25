@@ -101,11 +101,19 @@ _REVIEWED_DEPLOY_SYNC_RUNTIME_COMPAT_SHA = (
 _REVIEWED_DEPLOY_SYNC_RUNTIME_COMPAT_7227_SHA = (
     "7227de6c32bcc421b4715babcf7ca06529df206d7536b6e3978b9cde5910ff8e"
 )
+# Exact reviewed stable helper source from Home Lab PR #8603 at merge 3608e2b.
+_REVIEWED_COOPERATIVE_BRANCH_LEASE_RUNTIME_8603_SHA = (
+    "299bbc68ec12f7bfd11797eb0f6ef5456103c6b79ff0d456f2e2afa6c75e3466"
+)
 _REVIEWED_MERGE_LOOP_SHELL_RUNTIME_COMPAT_SHA = (
     "2ec5e69c594d813624161ccdffe4a92bd6ed184999f7469b3f8a219e67563086"
 )
 _REVIEWED_CANDIDATE_LIFECYCLE_RUNTIME_COMPAT_SHA = (
     "b798333fe2373716c80520ec37d9349e98e6dcc09147b808058addfab707d6f7"
+)
+# Exact reviewed stable/compat lifecycle source at Home Lab commit ff1ef33 (#8599).
+_REVIEWED_CANDIDATE_LIFECYCLE_RUNTIME_FF1EF33_SHA = (
+    "c19afbbb22dfb5419f2c9559aac093aca3d9a9297ce9a3659dc2b289ed326e90"
 )
 # PR #8581 scopes this variant to DLTB dry-run train selection; production
 # train checks retain the pinned stamp requirement.
@@ -115,6 +123,10 @@ _REVIEWED_VERDICT_LIFECYCLE_RUNTIME_COMPAT_SHA = (
 # Jev registry compatibility approval for the exact Home Lab source at eb54aad.
 _REVIEWED_VERDICT_LIFECYCLE_RUNTIME_EB54_SHA = (
     "df119c9d1f55005a24159a9fac74baf146cc61e94ae4330e68947bb2f982973f"
+)
+# Exact reviewed stable/compat lifecycle source at Home Lab commit 7a305ff (#8605).
+_REVIEWED_VERDICT_LIFECYCLE_RUNTIME_7A305FF_SHA = (
+    "54edaee8d983c2b947c318a82a6d18dea29ee9a1c1b999c9f967fa98efa793ef"
 )
 _RUNTIME_SELECTORS = (
     "code/.runtime/releases/home-lab/stable",
@@ -508,6 +520,8 @@ def _runtime_selector_targets(home: Path | None = None) -> tuple[Path, ...]:
 
 def _is_reviewed_runtime_hook_digest(relative: str, expected_sha: str, actual_sha: str) -> bool:
     return (actual_sha == expected_sha
+            or (relative == "scripts/cooperative_branch_lease.py"
+                and actual_sha == _REVIEWED_COOPERATIVE_BRANCH_LEASE_RUNTIME_8603_SHA)
             or (relative == "scripts/deploy_sync.py"
                 and actual_sha in (
                     _REVIEWED_DEPLOY_SYNC_RUNTIME_COMPAT_SHA,
@@ -516,11 +530,15 @@ def _is_reviewed_runtime_hook_digest(relative: str, expected_sha: str, actual_sh
             or (relative == "scripts/merge-safe-prs-loop.sh"
                 and actual_sha == _REVIEWED_MERGE_LOOP_SHELL_RUNTIME_COMPAT_SHA)
             or (relative == "scripts/merge_train_parts/candidate_lifecycle.py"
-                and actual_sha == _REVIEWED_CANDIDATE_LIFECYCLE_RUNTIME_COMPAT_SHA)
+                and actual_sha in (
+                    _REVIEWED_CANDIDATE_LIFECYCLE_RUNTIME_COMPAT_SHA,
+                    _REVIEWED_CANDIDATE_LIFECYCLE_RUNTIME_FF1EF33_SHA,
+                ))
             or (relative == "scripts/merge_train_parts/verdict_lifecycle.py"
                 and actual_sha in (
                     _REVIEWED_VERDICT_LIFECYCLE_RUNTIME_COMPAT_SHA,
                     _REVIEWED_VERDICT_LIFECYCLE_RUNTIME_EB54_SHA,
+                    _REVIEWED_VERDICT_LIFECYCLE_RUNTIME_7A305FF_SHA,
                 )))
 
 
