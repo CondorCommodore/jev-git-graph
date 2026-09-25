@@ -18,6 +18,7 @@ from jev_git_graph.coordinator import (CleanupActionJournal,
                                        CooperativeBranchLeaseAdapter,
                                        CreatorLeaseCapability,
                                        _REVIEWED_DEPLOY_SYNC_RUNTIME_COMPAT_SHA,
+                                       _REVIEWED_VERDICT_LIFECYCLE_RUNTIME_COMPAT_SHA,
                                        _REVIEWED_HOOK_FILES,
                                        _is_reviewed_runtime_hook_digest,
                                        _common_dir,
@@ -353,25 +354,38 @@ class CleanupTests(unittest.TestCase):
             capability_receipt_metadata(current)["creator_capability_sha256"],
         )
 
-    def test_exact_reviewed_merge_loop_runtime_variants_are_path_bound(self):
+    def test_exact_reviewed_merge_loop_and_verdict_variants_are_path_bound(self):
         shell = "scripts/merge-safe-prs-loop.sh"
         lifecycle = "scripts/merge_train_parts/candidate_lifecycle.py"
+        verdict_lifecycle = "scripts/merge_train_parts/verdict_lifecycle.py"
         shell_variant = "2ec5e69c594d813624161ccdffe4a92bd6ed184999f7469b3f8a219e67563086"
         lifecycle_variant = "b798333fe2373716c80520ec37d9349e98e6dcc09147b808058addfab707d6f7"
+        verdict_variant = _REVIEWED_VERDICT_LIFECYCLE_RUNTIME_COMPAT_SHA
         self.assertTrue(_is_reviewed_runtime_hook_digest(
             shell, _REVIEWED_HOOK_FILES[shell], _REVIEWED_HOOK_FILES[shell]))
         self.assertTrue(_is_reviewed_runtime_hook_digest(
             shell, _REVIEWED_HOOK_FILES[shell], shell_variant))
         self.assertTrue(_is_reviewed_runtime_hook_digest(
             lifecycle, _REVIEWED_HOOK_FILES[lifecycle], lifecycle_variant))
+        self.assertTrue(_is_reviewed_runtime_hook_digest(
+            verdict_lifecycle, _REVIEWED_HOOK_FILES[verdict_lifecycle],
+            _REVIEWED_HOOK_FILES[verdict_lifecycle]))
+        self.assertTrue(_is_reviewed_runtime_hook_digest(
+            verdict_lifecycle, _REVIEWED_HOOK_FILES[verdict_lifecycle], verdict_variant))
         self.assertFalse(_is_reviewed_runtime_hook_digest(
             shell, _REVIEWED_HOOK_FILES[shell], lifecycle_variant))
         self.assertFalse(_is_reviewed_runtime_hook_digest(
             lifecycle, _REVIEWED_HOOK_FILES[lifecycle], shell_variant))
         self.assertFalse(_is_reviewed_runtime_hook_digest(
+            verdict_lifecycle, _REVIEWED_HOOK_FILES[verdict_lifecycle], lifecycle_variant))
+        self.assertFalse(_is_reviewed_runtime_hook_digest(
+            lifecycle, _REVIEWED_HOOK_FILES[lifecycle], verdict_variant))
+        self.assertFalse(_is_reviewed_runtime_hook_digest(
+            verdict_lifecycle, _REVIEWED_HOOK_FILES[verdict_lifecycle], "0" * 64))
+        self.assertFalse(_is_reviewed_runtime_hook_digest(
             shell, _REVIEWED_HOOK_FILES[shell], "0" * 64))
 
-    def test_merge_loop_runtime_hash_changes_remain_capability_changes(self):
+    def test_merge_loop_and_verdict_runtime_hash_changes_remain_capability_changes(self):
         root = Path("/fixture/home-lab")
         roots = (root / "stable", root / "compat", root / "canonical")
         variants = {
@@ -379,6 +393,8 @@ class CleanupTests(unittest.TestCase):
                 "2ec5e69c594d813624161ccdffe4a92bd6ed184999f7469b3f8a219e67563086"),
             "scripts/merge_train_parts/candidate_lifecycle.py": (
                 "b798333fe2373716c80520ec37d9349e98e6dcc09147b808058addfab707d6f7"),
+            "scripts/merge_train_parts/verdict_lifecycle.py": (
+                _REVIEWED_VERDICT_LIFECYCLE_RUNTIME_COMPAT_SHA),
         }
         for relative, compatible_sha in variants.items():
             with self.subTest(relative=relative):

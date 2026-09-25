@@ -103,6 +103,11 @@ _REVIEWED_MERGE_LOOP_SHELL_RUNTIME_COMPAT_SHA = (
 _REVIEWED_CANDIDATE_LIFECYCLE_RUNTIME_COMPAT_SHA = (
     "b798333fe2373716c80520ec37d9349e98e6dcc09147b808058addfab707d6f7"
 )
+# PR #8581 scopes this variant to DLTB dry-run train selection; production
+# train checks retain the pinned stamp requirement.
+_REVIEWED_VERDICT_LIFECYCLE_RUNTIME_COMPAT_SHA = (
+    "c88cb5e85f1a2ea60ce670e048d5b258e9c74d02790020c00fad08165cdad7ab"
+)
 _RUNTIME_SELECTORS = (
     "code/.runtime/releases/home-lab/stable",
     "code/.runtime/home-lab",
@@ -429,7 +434,9 @@ def _is_reviewed_runtime_hook_digest(relative: str, expected_sha: str, actual_sh
             or (relative == "scripts/merge-safe-prs-loop.sh"
                 and actual_sha == _REVIEWED_MERGE_LOOP_SHELL_RUNTIME_COMPAT_SHA)
             or (relative == "scripts/merge_train_parts/candidate_lifecycle.py"
-                and actual_sha == _REVIEWED_CANDIDATE_LIFECYCLE_RUNTIME_COMPAT_SHA))
+                and actual_sha == _REVIEWED_CANDIDATE_LIFECYCLE_RUNTIME_COMPAT_SHA)
+            or (relative == "scripts/merge_train_parts/verdict_lifecycle.py"
+                and actual_sha == _REVIEWED_VERDICT_LIFECYCLE_RUNTIME_COMPAT_SHA))
 
 
 def _verify_runtime_hook_files(runtime_root: Path) -> tuple[tuple[str, str, str], ...]:
