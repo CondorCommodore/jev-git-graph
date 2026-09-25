@@ -97,6 +97,12 @@ _REVIEWED_HOOK_FILES = {
 _REVIEWED_DEPLOY_SYNC_RUNTIME_COMPAT_SHA = (
     "6c702771a35b2fb3ab8a101a62d04973adbd03ec888d2eef8a498e895e2a22bd"
 )
+_REVIEWED_MERGE_LOOP_SHELL_RUNTIME_COMPAT_SHA = (
+    "2ec5e69c594d813624161ccdffe4a92bd6ed184999f7469b3f8a219e67563086"
+)
+_REVIEWED_CANDIDATE_LIFECYCLE_RUNTIME_COMPAT_SHA = (
+    "b798333fe2373716c80520ec37d9349e98e6dcc09147b808058addfab707d6f7"
+)
 _RUNTIME_SELECTORS = (
     "code/.runtime/releases/home-lab/stable",
     "code/.runtime/home-lab",
@@ -419,7 +425,11 @@ def _runtime_selector_targets(home: Path | None = None) -> tuple[Path, ...]:
 def _is_reviewed_runtime_hook_digest(relative: str, expected_sha: str, actual_sha: str) -> bool:
     return (actual_sha == expected_sha
             or (relative == "scripts/deploy_sync.py"
-                and actual_sha == _REVIEWED_DEPLOY_SYNC_RUNTIME_COMPAT_SHA))
+                and actual_sha == _REVIEWED_DEPLOY_SYNC_RUNTIME_COMPAT_SHA)
+            or (relative == "scripts/merge-safe-prs-loop.sh"
+                and actual_sha == _REVIEWED_MERGE_LOOP_SHELL_RUNTIME_COMPAT_SHA)
+            or (relative == "scripts/merge_train_parts/candidate_lifecycle.py"
+                and actual_sha == _REVIEWED_CANDIDATE_LIFECYCLE_RUNTIME_COMPAT_SHA))
 
 
 def _verify_runtime_hook_files(runtime_root: Path) -> tuple[tuple[str, str, str], ...]:
@@ -521,6 +531,7 @@ def _attest_process_generation(runtime_root: Path, pid: int, started_at: float) 
 def _verify_process_startup_attestation(
     home: Path, runtime_root: Path, pid: int, process_start: str,
     label: str, process_rel: str,
+    verified_shell_digests: Mapping[str, str] | None = None,
 ) -> str:
     """Require a mode-0600 self-attestation for this exact process generation."""
     if process_rel.endswith(".sh"):
@@ -590,20 +601,34 @@ def _verify_process_startup_attestation(
     if label in _SUPERVISED_SHELL_SOURCES:
         for shell_rel in _SUPERVISED_SHELL_SOURCES[label]:
             shell_sha = _REVIEWED_HOOK_FILES.get(shell_rel)
+            verified_sha = ((verified_shell_digests or {}).get(shell_rel))
+            shell_path = runtime_root / shell_rel
             shell_match = next((item for item in attestations if isinstance(item, dict)
                                 and item.get("source_path") == shell_rel
                                 and item.get("creator") == label
                                 and item.get("kind") == "shell_fd"), None)
-            if (shell_sha is None or shell_match is None
-                    or shell_match.get("source_sha256") != shell_sha
-                    or shell_match.get("loaded_code_sha256") != shell_sha
+            try:
+                if shell_path.is_symlink() or not shell_path.is_file():
+                    raise OSError("not a regular file")
+                actual_shell_sha = hashlib.sha256(shell_path.read_bytes()).hexdigest()
+            except OSError:
+                actual_shell_sha = None
+            if (shell_sha is None or shell_match is None or actual_shell_sha is None
+                    or not _is_reviewed_runtime_hook_digest(
+                        shell_rel, shell_sha, actual_shell_sha)
+                    or verified_sha is None or actual_shell_sha != verified_sha
+                    or shell_match.get("source_sha256") != verified_sha
+                    or shell_match.get("loaded_code_sha256") != verified_sha
                     or shell_match.get("helper_path") != "scripts/cooperative_branch_lease.py"
                     or shell_match.get("helper_sha256") != helper_digest):
                 raise JgError(f"runtime_adoption_unverified: reviewed shell descriptor missing: {label}")
     return digest(payload)
 
 
-def _verify_loaded_runtime_jobs(home: Path, runtime_roots: tuple[Path, ...]) -> tuple[tuple[str, str, str, str], ...]:
+def _verify_loaded_runtime_jobs(
+    home: Path, runtime_roots: tuple[Path, ...],
+    verified_hook_digests: Mapping[tuple[str, str], str] | None = None,
+) -> tuple[tuple[str, str, str, str], ...]:
     """Verify configured launchd entrypoints and their currently loaded processes."""
     expected_roots = {selector: root for selector, root in zip(_RUNTIME_SELECTORS, runtime_roots)}
     jobs: list[tuple[str, str, str, str]] = []
@@ -723,6 +748,8 @@ def _verify_loaded_runtime_jobs(home: Path, runtime_roots: tuple[Path, ...]) -> 
             raise JgError(f"runtime_adoption_unverified: creator process start time is unavailable: {label}") from None
         receipt_digest = _verify_process_startup_attestation(
             home, root, pid, start_result.stdout.strip(), label, process_rel,
+            {shell_rel: (verified_hook_digests or {}).get((str(root), shell_rel), "")
+             for shell_rel in _SUPERVISED_SHELL_SOURCES.get(label, ())},
         )
         generation = digest({
             "mtime_generation": _attest_process_generation(root, pid, started_at),
@@ -757,7 +784,8 @@ def resolve_production_creator_capability(repository: str | Path) -> CreatorLeas
             raise
     digests = tuple(digests_list)
     home = Path.home()
-    jobs = _verify_loaded_runtime_jobs(home, runtime_roots)
+    verified_hook_digests = {(root, relative): sha for root, relative, sha in digests}
+    jobs = _verify_loaded_runtime_jobs(home, runtime_roots, verified_hook_digests)
     train_runtime, train_commit, train_digests = _verify_train_construction_runtime(home, common_dir)
     return CreatorLeaseCapability(common_dir, runtime_roots,
                                   (*digests, *train_digests), jobs, lock_root,

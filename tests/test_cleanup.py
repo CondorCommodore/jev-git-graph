@@ -247,7 +247,53 @@ class CleanupTests(unittest.TestCase):
                     })
                     path.write_text(json.dumps(receipt))
                     self.assertEqual(_verify_process_startup_attestation(
-                        home, runtime, pid, process_start, label, "scripts/entry.py"), digest(receipt))
+                        home, runtime, pid, process_start, label, "scripts/entry.py",
+                        {"launchd/start.sh": shell_sha}), digest(receipt))
+                    merge_loop_shell = runtime / "scripts/merge-safe-prs-loop.sh"
+                    original_merge_loop_shell = b"#!/bin/bash\n# original test bytes\nexit 0\n"
+                    original_merge_loop_sha = hashlib.sha256(original_merge_loop_shell).hexdigest()
+                    merge_loop_shell.write_bytes(b"#!/bin/bash\n# compatible test bytes\nexit 0\n")
+                    merge_loop_sha = hashlib.sha256(merge_loop_shell.read_bytes()).hexdigest()
+                    merge_loop_rel = "scripts/merge-safe-prs-loop.sh"
+                    merge_loop_receipt = {
+                        "creator": label, "kind": "shell_fd",
+                        "source_path": merge_loop_rel,
+                        "source_sha256": merge_loop_sha,
+                        "loaded_code_sha256": merge_loop_sha,
+                        "helper_path": "scripts/cooperative_branch_lease.py",
+                        "helper_sha256": helper_sha,
+                    }
+                    receipt["attestations"].append(merge_loop_receipt)
+                    path.write_text(json.dumps(receipt))
+                    reviewed_files = {
+                        "scripts/cooperative_branch_lease.py": helper_sha,
+                        "scripts/entry.py": source_sha,
+                        "launchd/start.sh": shell_sha,
+                        merge_loop_rel: original_merge_loop_sha,
+                    }
+                    with patch("jev_git_graph.coordinator._REVIEWED_HOOK_FILES", reviewed_files), \
+                            patch("jev_git_graph.coordinator._SUPERVISED_SHELL_SOURCES", {
+                                label: (merge_loop_rel,)}), \
+                            patch("jev_git_graph.coordinator._REVIEWED_MERGE_LOOP_SHELL_RUNTIME_COMPAT_SHA",
+                                  merge_loop_sha):
+                        self.assertEqual(_verify_process_startup_attestation(
+                            home, runtime, pid, process_start, label, "scripts/entry.py",
+                            {merge_loop_rel: merge_loop_sha}), digest(receipt))
+                        merge_loop_receipt["source_sha256"] = original_merge_loop_sha
+                        merge_loop_receipt["loaded_code_sha256"] = original_merge_loop_sha
+                        path.write_text(json.dumps(receipt))
+                        with self.assertRaisesRegex(JgError, "reviewed shell descriptor missing"):
+                            _verify_process_startup_attestation(
+                                home, runtime, pid, process_start, label, "scripts/entry.py",
+                                {merge_loop_rel: merge_loop_sha})
+                        merge_loop_receipt["source_sha256"] = merge_loop_sha
+                        merge_loop_receipt["loaded_code_sha256"] = merge_loop_sha
+                        path.write_text(json.dumps(receipt))
+                        merge_loop_shell.write_bytes(original_merge_loop_shell)
+                        with self.assertRaisesRegex(JgError, "reviewed shell descriptor missing"):
+                            _verify_process_startup_attestation(
+                                home, runtime, pid, process_start, label, "scripts/entry.py",
+                                {merge_loop_rel: "0" * 64})
 
     def test_unreviewed_creator_hook_digest_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -306,6 +352,58 @@ class CleanupTests(unittest.TestCase):
             capability_receipt_metadata(expected)["creator_capability_sha256"],
             capability_receipt_metadata(current)["creator_capability_sha256"],
         )
+
+    def test_exact_reviewed_merge_loop_runtime_variants_are_path_bound(self):
+        shell = "scripts/merge-safe-prs-loop.sh"
+        lifecycle = "scripts/merge_train_parts/candidate_lifecycle.py"
+        shell_variant = "2ec5e69c594d813624161ccdffe4a92bd6ed184999f7469b3f8a219e67563086"
+        lifecycle_variant = "b798333fe2373716c80520ec37d9349e98e6dcc09147b808058addfab707d6f7"
+        self.assertTrue(_is_reviewed_runtime_hook_digest(
+            shell, _REVIEWED_HOOK_FILES[shell], _REVIEWED_HOOK_FILES[shell]))
+        self.assertTrue(_is_reviewed_runtime_hook_digest(
+            shell, _REVIEWED_HOOK_FILES[shell], shell_variant))
+        self.assertTrue(_is_reviewed_runtime_hook_digest(
+            lifecycle, _REVIEWED_HOOK_FILES[lifecycle], lifecycle_variant))
+        self.assertFalse(_is_reviewed_runtime_hook_digest(
+            shell, _REVIEWED_HOOK_FILES[shell], lifecycle_variant))
+        self.assertFalse(_is_reviewed_runtime_hook_digest(
+            lifecycle, _REVIEWED_HOOK_FILES[lifecycle], shell_variant))
+        self.assertFalse(_is_reviewed_runtime_hook_digest(
+            shell, _REVIEWED_HOOK_FILES[shell], "0" * 64))
+
+    def test_merge_loop_runtime_hash_changes_remain_capability_changes(self):
+        root = Path("/fixture/home-lab")
+        roots = (root / "stable", root / "compat", root / "canonical")
+        variants = {
+            "scripts/merge-safe-prs-loop.sh": (
+                "2ec5e69c594d813624161ccdffe4a92bd6ed184999f7469b3f8a219e67563086"),
+            "scripts/merge_train_parts/candidate_lifecycle.py": (
+                "b798333fe2373716c80520ec37d9349e98e6dcc09147b808058addfab707d6f7"),
+        }
+        for relative, compatible_sha in variants.items():
+            with self.subTest(relative=relative):
+                original_sha = _REVIEWED_HOOK_FILES[relative]
+                expected = CreatorLeaseCapability(
+                    common_dir=root / ".git", runtime_roots=roots, hook_digests=tuple(
+                        (str(runtime_root), relative, original_sha) for runtime_root in roots
+                    ), loaded_runtime_jobs=(), lock_root=root / "locks",
+                    train_construction_runtime=root / "train-runtime",
+                    train_construction_commit=None,
+                )
+                changed = replace(expected, hook_digests=tuple(
+                    (str(runtime_root), relative,
+                     compatible_sha if runtime_root == roots[0] else original_sha)
+                    for runtime_root in roots
+                ))
+                with patch("jev_git_graph.coordinator.resolve_production_creator_capability",
+                           return_value=changed):
+                    diagnostic = production_capability_diagnostic(expected, root)
+                self.assertFalse(diagnostic["ok"])
+                self.assertEqual(["hook_digests"], diagnostic["changed_fields"])
+                self.assertNotEqual(
+                    capability_receipt_metadata(expected)["creator_capability_sha256"],
+                    capability_receipt_metadata(changed)["creator_capability_sha256"],
+                )
 
     def test_train_construction_requires_live_clean_origin_main_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
