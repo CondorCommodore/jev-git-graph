@@ -17,6 +17,7 @@ from jev_git_graph.cli import main as jg_main
 from jev_git_graph.coordinator import (CleanupActionJournal,
                                        CooperativeBranchLeaseAdapter,
                                        CreatorLeaseCapability,
+                                       CreatorRuntimeValidationError,
                                        _REVIEWED_DEPLOY_SYNC_RUNTIME_COMPAT_SHA,
                                        _REVIEWED_VERDICT_LIFECYCLE_RUNTIME_COMPAT_SHA,
                                        _REVIEWED_HOOK_FILES,
@@ -145,6 +146,156 @@ class CleanupTests(unittest.TestCase):
                     with self.assertRaisesRegex(JgError, "unavailable and not disabled"):
                         _verify_loaded_runtime_jobs(home, (runtime, runtime, runtime))
 
+    def test_running_creator_failures_have_hashed_diagnostics_and_wrapper_still_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            home = base / "home"
+            runtime = (home / "code/home-lab").resolve(strict=False)
+            launcher = runtime / "launchd/start.sh"
+            daemon = runtime / "scripts/entry.py"
+            launcher.parent.mkdir(parents=True)
+            daemon.parent.mkdir(parents=True)
+            launcher.write_text("#!/bin/bash\nexit 0\n")
+            daemon.write_text("pass\n")
+            label = "com.mikebook.pr-convergence-wake-consumer"
+            plist_path = home / f"Library/LaunchAgents/{label}.plist"
+            plist_path.parent.mkdir(parents=True)
+            arguments = ["/bin/bash", str(launcher)]
+            plist_path.write_bytes(plistlib.dumps({
+                "Label": label,
+                "ProgramArguments": arguments,
+                "WorkingDirectory": str(runtime),
+            }))
+            launchctl = subprocess.CompletedProcess(
+                ["launchctl"], 0,
+                stdout=(f"path = {plist_path}\nstate = running\n"
+                        f"arguments = {{\n    /bin/bash\n    {launcher}\n}}\n"
+                        f"working directory = {runtime}\n"
+                        "pid = 4812\n"),
+                stderr="",
+            )
+            start_text = "Thu Sep 24 21:28:29 2026"
+            command_text = f"/bin/bash {launcher}"
+            cwd_text = str(runtime)
+
+            def capture(fault=None, command=command_text, cwd=cwd_text):
+                calls = []
+
+                def fake_run(argv, **_kwargs):
+                    calls.append(tuple(argv))
+                    if argv[0] == "launchctl":
+                        output = launchctl.stdout
+                        if fault == "pid_lookup_failed":
+                            output = output.replace("pid = 4812", "pid = invalid")
+                        if fault == "loaded_args_missing":
+                            output = output.replace(
+                                f"arguments = {{\n    /bin/bash\n    {launcher}\n}}\n", "")
+                        if fault == "loaded_command_mismatch":
+                            output = output.replace(str(launcher), str(base / "unreviewed.sh"))
+                        return subprocess.CompletedProcess(argv, 0, stdout=output, stderr="")
+                    if argv[0] == "ps" and argv[-1] == "command=":
+                        rc = 1 if fault == "process_lookup_failed" else 0
+                        return subprocess.CompletedProcess(argv, rc,
+                                                           stdout=command if rc == 0 else "",
+                                                           stderr="PRIVATE_ERROR_MARKER")
+                    if argv[0] == "ps" and argv[-1] == "lstart=":
+                        rc = 1 if fault == "start_lookup_failed" else 0
+                        text = "invalid start" if fault == "start_parse_failed" else start_text
+                        return subprocess.CompletedProcess(argv, rc,
+                                                           stdout=text if rc == 0 else "",
+                                                           stderr="PRIVATE_ERROR_MARKER")
+                    if argv[0] == "lsof":
+                        rc = 1 if fault == "cwd_lookup_failed" else 0
+                        return subprocess.CompletedProcess(
+                            argv, rc, stdout=f"p4812\nfcwd\nn{cwd}\n" if rc == 0 else "",
+                            stderr="PRIVATE_ERROR_MARKER",
+                        )
+                    raise AssertionError(argv)
+
+                with patch("jev_git_graph.coordinator._RUNTIME_SELECTORS", (
+                        "code/home-lab", "code/home-lab", "code/home-lab")), \
+                        patch("jev_git_graph.coordinator._REQUIRED_LAUNCHD_SELECTORS", {
+                            label: "code/home-lab"}), \
+                        patch("jev_git_graph.coordinator._REQUIRED_LAUNCHD_PATHS", {
+                            label: ("launchd/start.sh", "scripts/entry.py", "runtime")}), \
+                        patch("jev_git_graph.coordinator.subprocess.run", side_effect=fake_run):
+                    with self.assertRaises(CreatorRuntimeValidationError) as caught:
+                        _verify_loaded_runtime_jobs(home, (runtime, runtime, runtime))
+                return caught.exception, calls
+
+            expected_root_hash = hashlib.sha256(str(runtime.resolve(strict=False)).encode()).hexdigest()
+            cases = (
+                ("pid_lookup_failed", "pid_lookup_failed"),
+                ("loaded_args_missing", "process_lookup_failed"),
+                ("process_lookup_failed", "process_lookup_failed"),
+                ("start_lookup_failed", "start_lookup_failed"),
+                ("cwd_lookup_failed", "cwd_lookup_failed"),
+                ("cwd_mismatch", "cwd_mismatch"),
+                ("start_parse_failed", "start_lookup_failed"),
+                ("reviewed_wrapper", "process_image_mismatch"),
+                ("loaded_command_mismatch", "loaded_job_contract_mismatch"),
+                ("wrong_process", "process_image_mismatch"),
+            )
+            for fault, stage in cases:
+                with self.subTest(fault=fault):
+                    if fault == "cwd_mismatch":
+                        wrong_root = (base / "wrong-root").resolve(strict=False)
+                        error, calls = capture(fault, cwd=str(wrong_root))
+                    elif fault == "wrong_process":
+                        error, calls = capture(fault, command=f"/bin/bash {base / 'unreviewed.sh'}")
+                    elif fault == "start_parse_failed":
+                        error, calls = capture(fault, command=f"/usr/bin/python3 {daemon}")
+                    else:
+                        error, calls = capture(fault)
+                    diagnostic = error.safe_diagnostic()
+                    self.assertEqual(stage, diagnostic["failure_stage"])
+                    self.assertEqual(label, diagnostic["failed_label"])
+                    if fault == "pid_lookup_failed":
+                        self.assertNotIn("failed_pid", diagnostic)
+                    else:
+                        self.assertEqual(4812, diagnostic["failed_pid"])
+                    self.assertEqual(expected_root_hash,
+                                     diagnostic["expected_runtime_root_sha256"])
+                    self.assertNotIn(str(runtime), json.dumps(diagnostic))
+                    self.assertNotIn("PRIVATE_ERROR_MARKER", json.dumps(diagnostic))
+                    self.assertEqual(1, sum(call[0] == "launchctl" for call in calls))
+                    if fault == "reviewed_wrapper":
+                        self.assertEqual("reviewed_wrapper", diagnostic["observed_process_kind"])
+                        self.assertEqual(hashlib.sha256(command_text.encode()).hexdigest(),
+                                         diagnostic["process_command_sha256"])
+                        self.assertEqual(hashlib.sha256(cwd_text.encode()).hexdigest(),
+                                         diagnostic["process_cwd_sha256"])
+                        self.assertEqual(hashlib.sha256(start_text.encode()).hexdigest(),
+                                         diagnostic["process_start_sha256"])
+                    elif fault == "wrong_process":
+                        self.assertEqual("other", diagnostic["observed_process_kind"])
+                    elif fault == "cwd_mismatch":
+                        self.assertEqual(hashlib.sha256(str(wrong_root).encode()).hexdigest(),
+                                         diagnostic["observed_runtime_root_sha256"])
+                    elif fault == "loaded_command_mismatch":
+                        self.assertEqual(["launchctl"], [call[0] for call in calls])
+                        for field in (
+                            "observed_runtime_root_sha256", "process_command_sha256",
+                            "process_cwd_sha256", "process_start_sha256",
+                            "observed_process_kind",
+                        ):
+                            self.assertNotIn(field, diagnostic)
+                    with patch("jev_git_graph.coordinator.resolve_production_creator_capability",
+                               side_effect=error) as resolve:
+                        safe = production_capability_diagnostic(
+                            CreatorLeaseCapability(
+                                common_dir=base, runtime_roots=(runtime, runtime, runtime),
+                                hook_digests=(), loaded_runtime_jobs=((label, "plist", str(runtime), "a" * 64),),
+                                lock_root=base / "locks", train_construction_runtime=runtime,
+                                train_construction_commit=None,
+                            ), base,
+                        )
+                    self.assertEqual(1, resolve.call_count)
+                    self.assertEqual(stage, safe["failure_stage"])
+                    self.assertEqual(diagnostic, {key: value for key, value in safe.items()
+                                                  if key in diagnostic})
+                    self.assertNotIn(str(runtime), json.dumps(safe))
+
     def test_creator_generation_is_bound_to_pid_and_reviewed_hook_bytes(self):
         with tempfile.TemporaryDirectory() as directory:
             runtime = Path(directory)
@@ -216,23 +367,31 @@ class CleanupTests(unittest.TestCase):
                 self.assertEqual(_verify_process_startup_attestation(
                     home, runtime, pid, process_start, label, "scripts/entry.py"),
                     digest(receipt))
-                with self.assertRaisesRegex(JgError, "shell source receipts are not authoritative"):
+                with self.assertRaises(CreatorRuntimeValidationError) as shell_error:
                     _verify_process_startup_attestation(
                         home, runtime, pid, process_start, label, "launchd/start.sh")
-                with self.assertRaisesRegex(JgError, "generation mismatch"):
+                self.assertEqual("attestation_source_mismatch",
+                                 shell_error.exception.safe_diagnostic()["failure_stage"])
+                with self.assertRaises(CreatorRuntimeValidationError) as generation_error:
                     _verify_process_startup_attestation(
                         home, runtime, pid, process_start + " stale", label, "scripts/entry.py")
+                self.assertEqual("attestation_generation_mismatch",
+                                 generation_error.exception.safe_diagnostic()["failure_stage"])
                 path.unlink()
-                with self.assertRaisesRegex(JgError, "attestation missing"):
+                with self.assertRaises(CreatorRuntimeValidationError) as missing_error:
                     _verify_process_startup_attestation(
                         home, runtime, pid, process_start, label, "scripts/entry.py")
+                self.assertEqual("attestation_missing",
+                                 missing_error.exception.safe_diagnostic()["failure_stage"])
                 tampered = dict(receipt)
                 tampered["attestations"] = [dict(receipt["attestations"][0], source_sha256="0" * 64)]
                 path.write_text(json.dumps(tampered))
                 os.chmod(path, 0o600)
-                with self.assertRaisesRegex(JgError, "source digest mismatch"):
+                with self.assertRaises(CreatorRuntimeValidationError) as source_error:
                     _verify_process_startup_attestation(
                         home, runtime, pid, process_start, label, "scripts/entry.py")
+                self.assertEqual("attestation_source_mismatch",
+                                 source_error.exception.safe_diagnostic()["failure_stage"])
                 path.write_text(json.dumps(receipt))
                 with patch("jev_git_graph.coordinator._SUPERVISED_SHELL_SOURCES", {
                         label: ("launchd/start.sh",)}):
@@ -841,25 +1000,91 @@ class CleanupTests(unittest.TestCase):
             adapter.common_dir = common_dir
             journal_path = root / "actions.jsonl"
             marker = "PRIVATE_PATH_SECRET_MARKER"
+            resolver_error = CreatorRuntimeValidationError(
+                f"runtime_adoption_unverified: failed {label}",
+                failure_stage="process_image_mismatch", label=label, pid=4821,
+                expected_root=root / "stable", observed_root=root / "stable",
+                process_command=marker, process_cwd=root / "stable", process_start=marker,
+                observed_process_kind="other",
+            )
             with patch("jev_git_graph.cleanup._fixed_lock_root",
                        return_value=lease_root), \
                     patch("jev_git_graph.coordinator.resolve_production_creator_capability",
                           side_effect=[capability, capability, capability,
-                                       RuntimeError(marker + " /private/path")]) as resolve:
+                                       resolver_error]) as resolve:
                 result = execute_cleanup(
                     repo, approved, approved_digest=approved["plan_digest"],
                     lease_contract=adapter, journal_path=journal_path,
                 )
             self.assertEqual(4, resolve.call_count)
             self.assertEqual("creator_capability_changed", result["stopped"])
-            self.assertEqual("runtime_validation_error",
+            self.assertEqual("runtime_adoption_unverified",
                              result["capability_diagnostic"]["validation_failure"])
+            self.assertEqual("process_image_mismatch",
+                             result["capability_diagnostic"]["failure_stage"])
+            self.assertEqual(4821, result["capability_diagnostic"]["failed_pid"])
             self.assertNotIn(marker, json.dumps(result))
             self.assertEqual(topic_tip, run(repo, "rev-parse", "refs/heads/topic"))
             events = CleanupActionJournal(journal_path).read_events()
-            self.assertEqual("runtime_validation_error",
-                             events[-1]["capability_diagnostic"]["validation_failure"])
+            self.assertEqual(result["capability_diagnostic"],
+                             events[-1]["capability_diagnostic"])
             self.assertNotIn(marker, json.dumps(events))
+
+    def test_creator_failure_diagnostic_before_first_transaction_has_no_journal_or_delete(self):
+        repo, topic_tip, main_tip = self.make_repo(old_commits=True)
+        coverage = coverage_for(repo, [{"name": "topic", "tip": topic_tip,
+                                        "main_tip": main_tip, "verdict": "EXACT",
+                                        "reason": None, "last_activity_epoch": 1,
+                                        "paths": [{"path": "topic",
+                                                   "verdict": "EXACT_PRESENT"}]}])
+        with tempfile.TemporaryDirectory() as out:
+            root = Path(out)
+            plan = build_old_plan(repo, coverage, bundle_dir=root / "bundle")
+            approved = approve_cleanup_plan(plan, approved_digest=plan["plan_digest"])
+            common_dir = _common_dir(repo)
+            lease_root = (root / "leases").resolve(strict=False)
+            label = "com.mikebook.pr-convergence-wake-consumer"
+            capability = CreatorLeaseCapability(
+                common_dir=common_dir,
+                runtime_roots=(root / "stable", root / "compat", root / "canonical"),
+                hook_digests=((str(root / "stable"), "scripts/cooperative_branch_lease.py",
+                               "1" * 64),),
+                loaded_runtime_jobs=((label, str(root / "launchd.plist"),
+                                      str(root / "stable"), "a" * 64),),
+                lock_root=lease_root,
+                train_construction_runtime=root / "train-runtime",
+                train_construction_commit=None,
+            )
+            adapter = CooperativeBranchLeaseAdapter(
+                str(common_dir), lease_root, capability=capability,
+            )
+            adapter.common_dir = common_dir
+            journal_path = root / "actions.jsonl"
+            marker = "PRIVATE_PRE_TRANSACTION_SECRET"
+            resolver_error = CreatorRuntimeValidationError(
+                f"runtime_adoption_unverified: failed {label}",
+                failure_stage="cwd_mismatch", label=label, pid=7931,
+                expected_root=root / "stable", observed_root=root / "other",
+                process_command=marker, process_cwd=root / "other", process_start=marker,
+                observed_process_kind="other",
+            )
+            with patch("jev_git_graph.cleanup._fixed_lock_root", return_value=lease_root), \
+                    patch("jev_git_graph.coordinator.resolve_production_creator_capability",
+                          side_effect=resolver_error) as resolve:
+                result = execute_cleanup(
+                    repo, approved, approved_digest=approved["plan_digest"],
+                    lease_contract=adapter, journal_path=journal_path,
+                )
+            self.assertEqual(1, resolve.call_count)
+            self.assertEqual("cooperative_lease_unestablished", result["stopped"])
+            self.assertEqual([], result["deleted"])
+            self.assertEqual("cwd_mismatch",
+                             result["capability_diagnostic"]["failure_stage"])
+            self.assertEqual(7931, result["capability_diagnostic"]["failed_pid"])
+            self.assertFalse(result["destructive_action_authorized"])
+            self.assertTrue(_ref_exists(repo, "topic"))
+            self.assertFalse(journal_path.exists())
+            self.assertNotIn(marker, json.dumps(result))
 
     def test_lease_path_runtime_error_has_fixed_diagnostic(self):
         with tempfile.TemporaryDirectory() as directory:
