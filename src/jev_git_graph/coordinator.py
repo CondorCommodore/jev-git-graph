@@ -305,8 +305,11 @@ def _capability_diff(expected: CreatorLeaseCapability,
     }
 
 
-def _safe_validation_failure(exc: BaseException) -> tuple[str, str | None]:
-    """Map resolver failures to a fixed code and an allowlisted service label."""
+def _safe_validation_failure(
+    exc: BaseException,
+) -> tuple[str, str | None, dict[str, Any]]:
+    """Map resolver failures to fixed codes and non-sensitive diagnostics."""
+    details: dict[str, Any] = {"failure_stage": "other"}
     if isinstance(exc, JgError):
         message = str(exc)
         if message.startswith("runtime_adoption_unverified:"):
@@ -331,7 +334,63 @@ def _safe_validation_failure(exc: BaseException) -> tuple[str, str | None]:
         code = "runtime_probe_failed"
         message = ""
     label = next((item for item in _REQUIRED_LAUNCHD_SELECTORS if item in message), None)
-    return code, label
+    if isinstance(exc, CreatorRuntimeValidationError):
+        details = exc.safe_diagnostic()
+        label = exc.label
+    return code, label, details
+
+
+_CREATOR_FAILURE_STAGES = frozenset({
+    "pid_lookup_failed", "process_lookup_failed", "start_lookup_failed",
+    "cwd_lookup_failed", "cwd_mismatch", "process_image_mismatch",
+    "attestation_missing", "attestation_generation_mismatch",
+    "attestation_source_mismatch", "other",
+})
+_OBSERVED_PROCESS_KINDS = frozenset({"reviewed_wrapper", "reviewed_daemon", "other"})
+
+
+def _diagnostic_sha256(value: str | Path | None) -> str | None:
+    if value is None:
+        return None
+    encoded = str(value).encode("utf-8", errors="replace")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+class CreatorRuntimeValidationError(JgError):
+    """Resolver failure with a fixed, path-free diagnostic projection."""
+
+    def __init__(
+        self, message: str, *, failure_stage: str = "other", label: str | None = None,
+        pid: int | None = None, expected_root: str | Path | None = None,
+        observed_root: str | Path | None = None,
+        process_command: str | None = None, process_cwd: str | Path | None = None,
+        process_start: str | None = None, observed_process_kind: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.label = label if label in _REQUIRED_LAUNCHD_SELECTORS else None
+        self._diagnostic: dict[str, Any] = {
+            "failure_stage": (failure_stage if failure_stage in _CREATOR_FAILURE_STAGES
+                              else "other"),
+        }
+        if self.label is not None:
+            self._diagnostic["failed_label"] = self.label
+        if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+            self._diagnostic["failed_pid"] = pid
+        for field, value in (
+            ("expected_runtime_root_sha256", expected_root),
+            ("observed_runtime_root_sha256", observed_root),
+            ("process_command_sha256", process_command),
+            ("process_cwd_sha256", process_cwd),
+            ("process_start_sha256", process_start),
+        ):
+            hashed = _diagnostic_sha256(value)
+            if hashed is not None:
+                self._diagnostic[field] = hashed
+        if observed_process_kind in _OBSERVED_PROCESS_KINDS:
+            self._diagnostic["observed_process_kind"] = observed_process_kind
+
+    def safe_diagnostic(self) -> dict[str, Any]:
+        return dict(self._diagnostic)
 
 
 def production_capability_diagnostic(
@@ -346,13 +405,14 @@ def production_capability_diagnostic(
     try:
         current = resolve_production_creator_capability(repository)
     except (JgError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
-        failure, label = _safe_validation_failure(exc)
+        failure, label, details = _safe_validation_failure(exc)
         return {
             "ok": False,
             "status": "validation_failed",
             "changed_fields": ["current_creator_validation"],
             "validation_failure": failure,
             "failed_label": label,
+            **details,
             "expected_generation_hashes": [
                 {"label": service if service in _REQUIRED_LAUNCHD_SELECTORS else "unknown_creator",
                  "generation_sha256": generation}
@@ -539,39 +599,53 @@ def _verify_process_startup_attestation(
     home: Path, runtime_root: Path, pid: int, process_start: str,
     label: str, process_rel: str,
     verified_shell_digests: Mapping[str, str] | None = None,
+    *, process_command: str | None = None, process_cwd: Path | None = None,
 ) -> str:
     """Require a mode-0600 self-attestation for this exact process generation."""
-    if process_rel.endswith(".sh"):
-        raise JgError(
-            f"runtime_adoption_unverified: shell source receipts are not authoritative: {label}"
+    def fail(message: str, stage: str) -> None:
+        raise CreatorRuntimeValidationError(
+            message, failure_stage=stage, label=label, pid=pid,
+            expected_root=runtime_root, observed_root=process_cwd,
+            process_command=process_command, process_cwd=process_cwd,
+            process_start=process_start,
+            observed_process_kind=("other" if process_rel.endswith(".sh")
+                                   else "reviewed_daemon"),
         )
+
+    if process_rel.endswith(".sh"):
+        fail(f"runtime_adoption_unverified: shell source receipts are not authoritative: {label}",
+             "attestation_source_mismatch")
     directory = home / ".local/state/jev-git-graph/creator-runtime-attestations"
     receipt_path = directory / f"{pid}.json"
     if (directory.is_symlink() or not directory.is_dir() or receipt_path.is_symlink()
             or not receipt_path.is_file()):
-        raise JgError(f"runtime_adoption_unverified: startup attestation missing: {label}")
+        fail(f"runtime_adoption_unverified: startup attestation missing: {label}",
+             "attestation_missing")
     try:
         for parent in (directory.parent, *directory.parent.parents):
             if parent == home or parent == Path("/"):
                 break
             if (parent.is_symlink() or not parent.is_dir()
                     or parent.stat().st_uid != os.getuid() or parent.stat().st_mode & 0o022):
-                raise JgError(f"runtime_adoption_unverified: startup attestation parent unsafe: {label}")
+                fail(f"runtime_adoption_unverified: startup attestation parent unsafe: {label}",
+                     "other")
         directory_stat = directory.stat()
         receipt_stat = receipt_path.stat()
         if (directory_stat.st_uid != os.getuid() or directory_stat.st_mode & 0o077
                 or receipt_stat.st_uid != os.getuid() or receipt_stat.st_mode & 0o077):
-            raise JgError(f"runtime_adoption_unverified: startup attestation permissions invalid: {label}")
+            fail(f"runtime_adoption_unverified: startup attestation permissions invalid: {label}",
+                 "other")
         payload = json.loads(receipt_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise JgError(f"runtime_adoption_unverified: startup attestation unreadable: {label}") from exc
+        fail(f"runtime_adoption_unverified: startup attestation unreadable: {label}", "other")
     if (not isinstance(payload, dict)
             or payload.get("contract") != "jev-git-graph/creator-runtime-attestation-v1"
             or payload.get("pid") != pid
             or payload.get("process_start") != process_start
             or payload.get("creator") != label
             or payload.get("runtime_root_sha256") != hashlib.sha256(str(runtime_root.resolve()).encode()).hexdigest()):
-        raise JgError(f"runtime_adoption_unverified: startup attestation generation mismatch: {label}")
+        fail(f"runtime_adoption_unverified: startup attestation generation mismatch: {label}",
+             "attestation_generation_mismatch")
     runtime_commit = payload.get("runtime_commit")
     try:
         git_head = subprocess.run(["git", "-C", str(runtime_root), "rev-parse", "--verify", "HEAD^{commit}"],
@@ -585,15 +659,19 @@ def _verify_process_startup_attestation(
         else:
             expected_commit = git_head.stdout.strip().lower()
     except (OSError, KeyError, json.JSONDecodeError, ValueError) as exc:
-        raise JgError(f"runtime_adoption_unverified: startup runtime commit unavailable: {label}") from exc
+        fail(f"runtime_adoption_unverified: startup runtime commit unavailable: {label}",
+             "attestation_generation_mismatch")
     if runtime_commit != expected_commit:
-        raise JgError(f"runtime_adoption_unverified: startup runtime commit mismatch: {label}")
+        fail(f"runtime_adoption_unverified: startup runtime commit mismatch: {label}",
+             "attestation_generation_mismatch")
     expected_sha = _REVIEWED_HOOK_FILES.get(process_rel)
     if expected_sha is None:
-        raise JgError(f"runtime_adoption_unverified: creator process source is not pinned: {label}")
+        fail(f"runtime_adoption_unverified: creator process source is not pinned: {label}",
+             "attestation_source_mismatch")
     attestations = payload.get("attestations")
     if not isinstance(attestations, list):
-        raise JgError(f"runtime_adoption_unverified: startup source attestations missing: {label}")
+        fail(f"runtime_adoption_unverified: startup source attestations missing: {label}",
+             "attestation_source_mismatch")
     expected_kind = "python_code"
     match = next((item for item in attestations if isinstance(item, dict)
                   and item.get("source_path") == process_rel
@@ -604,7 +682,8 @@ def _verify_process_startup_attestation(
             or match.get("helper_path") != "scripts/cooperative_branch_lease.py"
             or match.get("helper_sha256") != helper_digest
             or not re.fullmatch(r"[0-9a-f]{64}", str(match.get("loaded_code_sha256", "")))):
-        raise JgError(f"runtime_adoption_unverified: startup source digest mismatch: {label}")
+        fail(f"runtime_adoption_unverified: startup source digest mismatch: {label}",
+             "attestation_source_mismatch")
     if label in _SUPERVISED_SHELL_SOURCES:
         for shell_rel in _SUPERVISED_SHELL_SOURCES[label]:
             shell_sha = _REVIEWED_HOOK_FILES.get(shell_rel)
@@ -628,7 +707,8 @@ def _verify_process_startup_attestation(
                     or shell_match.get("loaded_code_sha256") != verified_sha
                     or shell_match.get("helper_path") != "scripts/cooperative_branch_lease.py"
                     or shell_match.get("helper_sha256") != helper_digest):
-                raise JgError(f"runtime_adoption_unverified: reviewed shell descriptor missing: {label}")
+                fail(f"runtime_adoption_unverified: reviewed shell descriptor missing: {label}",
+                     "attestation_source_mismatch")
     return digest(payload)
 
 
@@ -701,10 +781,23 @@ def _verify_loaded_runtime_jobs(
             raise JgError(f"creator runtime launchd job is unavailable and not disabled: {label}")
         if f"path = {plist_path}" not in check.stdout:
             raise JgError(f"creator runtime launchd job is not loaded from the reviewed plist: {label}")
+        pid_line = re.search(r"(?m)^\s*pid\s*=\s*(.*?)\s*$", check.stdout)
+        pid = None
+        if pid_line is not None:
+            if not re.fullmatch(r"[0-9]+", pid_line.group(1)) or int(pid_line.group(1)) <= 0:
+                raise CreatorRuntimeValidationError(
+                    f"runtime_adoption_unverified: loaded creator pid unavailable: {label}",
+                    failure_stage="pid_lookup_failed", label=label, expected_root=root,
+                )
+            pid = int(pid_line.group(1))
         loaded_arguments = re.search(r"(?m)^\s*arguments = \{\s*\n(.*?)^\s*\}",
                                      check.stdout, re.DOTALL)
         if loaded_arguments is None:
-            raise JgError(f"runtime_adoption_unverified: loaded creator arguments unavailable: {label}")
+            raise CreatorRuntimeValidationError(
+                f"runtime_adoption_unverified: loaded creator arguments unavailable: {label}",
+                failure_stage="process_lookup_failed", label=label, pid=pid,
+                expected_root=root,
+            )
         loaded_tokens = [token for line in loaded_arguments.group(1).splitlines()
                          for token in shlex.split(line.strip())]
         configured_tokens = [token for argument in args for token in shlex.split(argument)]
@@ -714,13 +807,15 @@ def _verify_loaded_runtime_jobs(
                     and (loaded_wd is None
                          or Path(loaded_wd.group(1).strip()).resolve(strict=False)
                          != Path(wd).resolve(strict=False)))):
-            raise JgError(f"runtime_adoption_unverified: loaded creator command differs from reviewed plist: {label}")
-        pid = None
-        for line in check.stdout.splitlines():
-            match = re.match(r"\s*pid = ([0-9]+)\s*$", line)
-            if match:
-                pid = int(match.group(1))
-                break
+            raise CreatorRuntimeValidationError(
+                f"runtime_adoption_unverified: loaded creator command differs from reviewed plist: {label}",
+                failure_stage="process_image_mismatch", label=label,
+                expected_root=root,
+                observed_root=(loaded_wd.group(1).strip() if loaded_wd else None),
+                process_command="\0".join(loaded_tokens),
+                process_cwd=(loaded_wd.group(1).strip() if loaded_wd else None),
+                observed_process_kind="other", pid=pid,
+            )
         if pid is None:
             # Interval jobs may be idle. Their next invocation loads the
             # currently reviewed entrypoint. A start during cleanup changes
@@ -728,16 +823,65 @@ def _verify_loaded_runtime_jobs(
             jobs.append((label, str(plist_path.resolve()), str(root),
                          digest({"idle": True, "loaded_arguments": loaded_tokens})))
             continue
-        process = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
-                                 capture_output=True, text=True, check=False, timeout=5)
-        start_result = subprocess.run(["ps", "-p", str(pid), "-o", "lstart="],
-                                      capture_output=True, text=True, check=False, timeout=5)
-        cwd_result = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
-                                    capture_output=True, text=True, check=False, timeout=5)
+        try:
+            process = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                                     capture_output=True, text=True, check=False, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            raise CreatorRuntimeValidationError(
+                f"runtime_adoption_unverified: creator process lookup failed: {label}",
+                failure_stage="process_lookup_failed", label=label, pid=pid,
+                expected_root=root,
+            ) from None
+        process_command = process.stdout.strip() if process.returncode == 0 else None
+        if process.returncode != 0:
+            raise CreatorRuntimeValidationError(
+                f"runtime_adoption_unverified: creator process lookup failed: {label}",
+                failure_stage="process_lookup_failed", label=label, pid=pid,
+                expected_root=root,
+            )
+        try:
+            start_result = subprocess.run(["ps", "-p", str(pid), "-o", "lstart="],
+                                          capture_output=True, text=True, check=False, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            raise CreatorRuntimeValidationError(
+                f"runtime_adoption_unverified: creator start lookup failed: {label}",
+                failure_stage="start_lookup_failed", label=label, pid=pid,
+                expected_root=root, process_command=process_command,
+            ) from None
+        if start_result.returncode != 0:
+            raise CreatorRuntimeValidationError(
+                f"runtime_adoption_unverified: creator start lookup failed: {label}",
+                failure_stage="start_lookup_failed", label=label, pid=pid,
+                expected_root=root, process_command=process_command,
+            )
+        try:
+            cwd_result = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                                        capture_output=True, text=True, check=False, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            raise CreatorRuntimeValidationError(
+                f"runtime_adoption_unverified: creator cwd lookup failed: {label}",
+                failure_stage="cwd_lookup_failed", label=label, pid=pid,
+                expected_root=root, process_command=process_command,
+                process_start=start_result.stdout.strip(),
+            ) from None
+        if cwd_result.returncode != 0:
+            raise CreatorRuntimeValidationError(
+                f"runtime_adoption_unverified: creator cwd lookup failed: {label}",
+                failure_stage="cwd_lookup_failed", label=label, pid=pid,
+                expected_root=root, process_command=process_command,
+                process_start=start_result.stdout.strip(),
+            )
         cwd = next((line[1:] for line in cwd_result.stdout.splitlines()
-                    if line.startswith("n/") and cwd_result.returncode == 0), None)
+                    if line.startswith("n/")), None)
+        if cwd is None:
+            raise CreatorRuntimeValidationError(
+                f"runtime_adoption_unverified: creator cwd lookup failed: {label}",
+                failure_stage="cwd_lookup_failed", label=label, pid=pid,
+                expected_root=root, process_command=process_command,
+                process_start=start_result.stdout.strip(),
+            )
         cwd_path = Path(cwd).resolve(strict=False) if cwd else None
-        argv = shlex.split(process.stdout) if process.returncode == 0 else []
+        argv = shlex.split(process_command) if process_command else []
         expected_process = (root / process_rel).resolve(strict=False)
         executable_evidence = False
         for token in argv:
@@ -746,17 +890,53 @@ def _verify_loaded_runtime_jobs(
             if candidate.is_file() and candidate.resolve(strict=False) == expected_process:
                 executable_evidence = True
         expected_cwd = root if cwd_scope == "runtime" else runtime_roots[-1]
-        if (not cwd_path or cwd_path != expected_cwd or not executable_evidence
-                or process.returncode != 0 or start_result.returncode != 0):
-            raise JgError(f"runtime_adoption_unverified: creator process is not running from the reviewed tree: {label}")
+        wrapper_evidence = (
+            cwd_path == expected_cwd
+            and argv == configured_tokens
+            and argv
+            and Path(argv[0]).name == "bash"
+            and any(
+                (Path(token) if Path(token).is_absolute() else root / token)
+                .resolve(strict=False) == expected_launcher
+                for token in argv[1:]
+            )
+        )
+        process_kind = ("reviewed_daemon" if cwd_path == expected_cwd and executable_evidence
+                        else "reviewed_wrapper" if wrapper_evidence else "other")
+        if cwd_path != expected_cwd:
+            raise CreatorRuntimeValidationError(
+                f"runtime_adoption_unverified: creator cwd differs from reviewed tree: {label}",
+                failure_stage="cwd_mismatch", label=label, pid=pid,
+                expected_root=expected_cwd, observed_root=cwd_path,
+                process_command=process_command, process_cwd=cwd_path,
+                process_start=start_result.stdout.strip(),
+                observed_process_kind=process_kind,
+            )
+        if not executable_evidence:
+            raise CreatorRuntimeValidationError(
+                f"runtime_adoption_unverified: creator process image differs from reviewed tree: {label}",
+                failure_stage="process_image_mismatch", label=label, pid=pid,
+                expected_root=expected_cwd, observed_root=cwd_path,
+                process_command=process_command, process_cwd=cwd_path,
+                process_start=start_result.stdout.strip(),
+                observed_process_kind=process_kind,
+            )
         try:
             started_at = datetime.strptime(start_result.stdout.strip(), "%a %b %d %H:%M:%S %Y").timestamp()
         except (ValueError, OverflowError):
-            raise JgError(f"runtime_adoption_unverified: creator process start time is unavailable: {label}") from None
+            raise CreatorRuntimeValidationError(
+                f"runtime_adoption_unverified: creator process start time is unavailable: {label}",
+                failure_stage="start_lookup_failed", label=label, pid=pid,
+                expected_root=expected_cwd, observed_root=cwd_path,
+                process_command=process_command, process_cwd=cwd_path,
+                process_start=start_result.stdout.strip(),
+                observed_process_kind=process_kind,
+            ) from None
         receipt_digest = _verify_process_startup_attestation(
             home, root, pid, start_result.stdout.strip(), label, process_rel,
             {shell_rel: (verified_hook_digests or {}).get((str(root), shell_rel), "")
              for shell_rel in _SUPERVISED_SHELL_SOURCES.get(label, ())},
+            process_command=process_command, process_cwd=cwd_path,
         )
         generation = digest({
             "mtime_generation": _attest_process_generation(root, pid, started_at),
