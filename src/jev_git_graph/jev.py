@@ -311,6 +311,16 @@ class _TypeSafeTransport:
 
         return TypeSafeClient(api_key=token, retry=RetryPolicy(max_retries=0), timeout=30)
 
+    def prepare(self, token: str) -> None:
+        """Load the local SDK and initialize its client before recording dispatch."""
+        if not token:
+            raise JgError("Jev credential is unavailable")
+        if self._client is None:
+            self._client = self._build_client(token)
+            self._token = token
+        elif token != self._token:
+            raise JgError("Jev client cannot change credentials during a run")
+
     def __call__(self, payload: dict[str, Any], token: str) -> dict[str, Any]:
         from typesafe_sdk import RetryPolicy
 
