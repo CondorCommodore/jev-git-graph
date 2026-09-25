@@ -23,6 +23,7 @@ from jev_git_graph.coordinator import (CleanupActionJournal,
                                        _REVIEWED_DEPLOY_SYNC_RUNTIME_COMPAT_SHA,
                                        _REVIEWED_DEPLOY_SYNC_RUNTIME_COMPAT_7227_SHA,
                                        _REVIEWED_DEPLOY_SYNC_RUNTIME_8607_SHA,
+                                       _REVIEWED_DEPLOY_SYNC_RUNTIME_8617_SHA,
                                        _REVIEWED_VERDICT_LIFECYCLE_RUNTIME_COMPAT_SHA,
                                        _REVIEWED_VERDICT_LIFECYCLE_RUNTIME_EB54_SHA,
                                        _REVIEWED_VERDICT_LIFECYCLE_RUNTIME_7A305FF_SHA,
@@ -690,6 +691,9 @@ class CleanupTests(unittest.TestCase):
         self.assertTrue(_is_reviewed_runtime_hook_digest(
             "scripts/deploy_sync.py", reviewed,
             _REVIEWED_DEPLOY_SYNC_RUNTIME_8607_SHA))
+        self.assertTrue(_is_reviewed_runtime_hook_digest(
+            "scripts/deploy_sync.py", reviewed,
+            _REVIEWED_DEPLOY_SYNC_RUNTIME_8617_SHA))
         self.assertFalse(_is_reviewed_runtime_hook_digest(
             "scripts/deploy_sync.py", reviewed, "0" * 64))
         self.assertFalse(_is_reviewed_runtime_hook_digest(
@@ -700,6 +704,9 @@ class CleanupTests(unittest.TestCase):
         self.assertFalse(_is_reviewed_runtime_hook_digest(
             "scripts/cooperative_branch_lease.py", "1" * 64,
             _REVIEWED_DEPLOY_SYNC_RUNTIME_8607_SHA))
+        self.assertFalse(_is_reviewed_runtime_hook_digest(
+            "scripts/cooperative_branch_lease.py", "1" * 64,
+            _REVIEWED_DEPLOY_SYNC_RUNTIME_8617_SHA))
 
     def test_pr8603_runtime_hook_variants_are_exact_and_path_bound(self):
         helper = "scripts/cooperative_branch_lease.py"
