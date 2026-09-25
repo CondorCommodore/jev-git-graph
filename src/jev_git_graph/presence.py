@@ -18,7 +18,7 @@ from typing import Any, Callable, Mapping
 
 from .errors import JgError
 from .group_requests import revalidate_source_only_evidence, revalidate_two_sided_evidence
-from .jev import _default_transport, validate_response
+from .jev import _TypeSafeTransport, _default_transport, validate_response
 from .questions import PRESENCE_CHOICES, PRESENCE_QUESTION_VERSION
 from .safety import canonical_json, digest, read_json, write_json
 
@@ -627,6 +627,14 @@ def execute_presence_preview(
     attempted = {item.get("request_sha256"): item for item in ledger.get("attempts", [])}
     request_by_sha = {digest(request): request for request in requests if digest(request) not in attempted}
     request_index = {digest(request): request for request in requests}
+
+    if trusted_sdk_executor and request_by_sha and isinstance(actual_transport, _TypeSafeTransport):
+        try:
+            actual_transport.prepare(token)
+        except JgError:
+            raise
+        except Exception:
+            raise JgError("presence local preflight failed: Jev SDK dependency or client is unavailable") from None
 
     def update_unattempted() -> None:
         done_ids = {item["request_sha256"] for item in ledger["attempts"]}

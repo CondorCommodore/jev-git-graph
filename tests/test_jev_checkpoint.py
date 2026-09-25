@@ -1,7 +1,9 @@
 import os
 import json
 import tempfile
+import sys
 import unittest
+from types import ModuleType
 from pathlib import Path
 from unittest.mock import patch
 
@@ -21,23 +23,46 @@ from jev_git_graph.safety import canonical_json, digest, read_json, write_json
 class CheckpointTests(unittest.TestCase):
     def test_default_transport_reuses_one_sdk_client_without_retries(self):
         response = type("Response", (), {"model_dump": lambda self, **_: {"model": "jev-latest"}})()
-        client = type("Client", (), {
-            "__init__": lambda self: setattr(self, "calls", []),
-            "system_one": lambda self, **kwargs: (self.calls.append(kwargs), response)[1],
-            "close": lambda self: setattr(self, "closed", True),
-        })()
+
+        class FakeRetryPolicy:
+            def __init__(self, max_retries):
+                self.max_retries = max_retries
+
+        clients = []
+
+        class FakeTypeSafeClient:
+            def __init__(self, *, api_key, retry, timeout):
+                self.api_key = api_key
+                self.init_retry = retry
+                self.timeout = timeout
+                self.calls = []
+                clients.append(self)
+
+            def system_one(self, **kwargs):
+                self.calls.append(kwargs)
+                return response
+
+            def close(self):
+                self.closed = True
+
+        sdk = ModuleType("typesafe_sdk")
+        sdk.RetryPolicy = FakeRetryPolicy
+        sdk.TypeSafeClient = FakeTypeSafeClient
         transport = _TypeSafeTransport()
-        with patch.object(transport, "_build_client", return_value=client) as build_client:
+        with patch.dict(sys.modules, {"typesafe_sdk": sdk}):
+            transport.prepare("token")
             result_a = transport({"state": "a", "questions": {}, "model": "jev-latest"}, "token")
             result_b = transport({"state": "b", "questions": {}, "model": "jev-latest"}, "token")
             transport.close()
         self.assertEqual(result_a, {"model": "jev-latest"})
         self.assertEqual(result_b, {"model": "jev-latest"})
-        build_client.assert_called_once_with("token")
-        self.assertEqual(len(client.calls), 2)
-        self.assertTrue(all(call["retry"].max_retries == 0 for call in client.calls))
-        self.assertTrue(client.closed)
-        self.assertNotIn("token", repr(client.calls))
+        self.assertEqual(len(clients), 1)
+        self.assertEqual(len(clients[0].calls), 2)
+        self.assertEqual(clients[0].init_retry.max_retries, 0)
+        self.assertTrue(all(call["retry"].max_retries == 0 for call in clients[0].calls))
+        self.assertEqual(clients[0].timeout, 30)
+        self.assertTrue(clients[0].closed)
+        self.assertNotIn("token", repr(clients[0].calls))
 
     def test_metadata_checkpoint_drops_provider_extra_fields(self):
         with tempfile.TemporaryDirectory() as directory:

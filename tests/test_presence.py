@@ -4,13 +4,15 @@ import base64
 import copy
 import hashlib
 import subprocess
+import sys
 import threading
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
 import jev_git_graph.presence as presence_module
 from jev_git_graph.errors import JgError
+from jev_git_graph.jev import _TypeSafeTransport
 from jev_git_graph.group_requests import (
     approved_presence_preview,
     build_group_requests,
@@ -305,6 +307,90 @@ def test_trusted_sdk_receipt_binds_answers_and_reconciled_outcome(tmp_path, monk
     tampered_result["presence_digest"] = digest(tampered_result)
     with pytest.raises(JgError, match="trusted reconciliation receipt"):
         validate_outcome_presence(tampered_result, contributions)
+
+
+def test_missing_sdk_fails_local_preflight_before_attempt_or_transport(tmp_path, monkeypatch):
+    contributions, groups = _artifact()
+    plan = build_group_requests(contributions, groups, estimated_input_tokens=100, max_provider_tokens=1000)
+    _add_context_contract(plan)
+    preview = approved_presence_preview(plan)
+    monkeypatch.setattr(presence_module, "_presence_key_path", lambda: tmp_path / "private" / "key")
+
+    class TrackingTransport(_TypeSafeTransport):
+        def __call__(self, payload, token):
+            calls.append((payload, token))
+            return super().__call__(payload, token)
+
+    calls = []
+    transport = TrackingTransport()
+    monkeypatch.setitem(sys.modules, "typesafe_sdk", None)
+    monkeypatch.setattr(presence_module, "_default_transport", transport)
+    checkpoint = tmp_path / "checkpoint.json"
+
+    with pytest.raises(JgError, match="presence local preflight failed: Jev SDK dependency or client is unavailable"):
+        execute_presence_preview(
+            preview, preview["payload_sha256"],
+            approved_approval_sha256=preview["approval_sha256"],
+            token="fixture-only", checkpoint=checkpoint,
+        )
+
+    assert calls == []
+    assert not checkpoint.exists()
+
+
+def test_mocked_sdk_preflight_and_trusted_execution_succeed(tmp_path, monkeypatch):
+    contributions, groups = _artifact()
+    plan = build_group_requests(contributions, groups, estimated_input_tokens=100, max_provider_tokens=1000)
+    _add_context_contract(plan)
+    preview = approved_presence_preview(plan)
+    monkeypatch.setattr(presence_module, "_presence_key_path", lambda: tmp_path / "private" / "key")
+    checkpoint = tmp_path / "checkpoint.json"
+
+    class RetryPolicy:
+        def __init__(self, max_retries):
+            self.max_retries = max_retries
+
+    clients = []
+
+    class TypeSafeClient:
+        def __init__(self, *, api_key, retry, timeout):
+            assert not checkpoint.exists()
+            self.api_key = api_key
+            self.init_retry = retry
+            self.timeout = timeout
+            self.calls = []
+            clients.append(self)
+
+        def system_one(self, *, state, questions, model, retry):
+            self.calls.append({"state": state, "questions": questions, "model": model, "retry": retry})
+            request = {"state": state, "questions": questions, "model": model}
+            response = _response(request)
+            response["model"] = model
+            return SimpleNamespace(model_dump=lambda **_: response)
+
+        def close(self):
+            pass
+
+    sdk = ModuleType("typesafe_sdk")
+    sdk.RetryPolicy = RetryPolicy
+    sdk.TypeSafeClient = TypeSafeClient
+    monkeypatch.setitem(sys.modules, "typesafe_sdk", sdk)
+    transport = _TypeSafeTransport()
+    monkeypatch.setattr(presence_module, "_default_transport", transport)
+
+    executed = execute_presence_preview(
+        preview, preview["payload_sha256"],
+        approved_approval_sha256=preview["approval_sha256"],
+        token="fixture-only", checkpoint=checkpoint,
+    )
+
+    assert executed["origin"] == "jev"
+    assert executed["network_performed"] is True
+    assert len(clients) == 1
+    assert len(clients[0].calls) == len(preview["requests"])
+    assert clients[0].init_retry.max_retries == 0
+    assert all(call["retry"].max_retries == 0 for call in clients[0].calls)
+    assert clients[0].timeout == 30
 
 
 def test_unsigned_success_checkpoint_cannot_mint_receipt_without_dispatch(tmp_path, monkeypatch):
