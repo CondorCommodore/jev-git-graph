@@ -653,6 +653,7 @@ def _verify_process_startup_attestation(
     label: str, process_rel: str,
     verified_shell_digests: Mapping[str, str] | None = None,
     *, process_command: str | None = None, process_cwd: Path | None = None,
+    verified_runtime_hook_digests: Mapping[tuple[str, str], str] | None = None,
 ) -> str:
     """Require a mode-0600 self-attestation for this exact process generation."""
     def fail(message: str, stage: str) -> None:
@@ -717,9 +718,33 @@ def _verify_process_startup_attestation(
     if runtime_commit != expected_commit:
         fail(f"runtime_adoption_unverified: startup runtime commit mismatch: {label}",
              "attestation_generation_mismatch")
-    expected_sha = _REVIEWED_HOOK_FILES.get(process_rel)
-    if expected_sha is None:
+
+    if verified_runtime_hook_digests is None:
+        try:
+            verified_runtime_hook_digests = {
+                (root, relative): sha
+                for root, relative, sha in _verify_runtime_hook_files(runtime_root)
+            }
+        except JgError:
+            fail(f"runtime_adoption_unverified: runtime hooks are not reviewed: {label}",
+                 "attestation_source_mismatch")
+
+    def verified_digest(relative: str) -> str | None:
+        expected = _REVIEWED_HOOK_FILES.get(relative)
+        actual = verified_runtime_hook_digests.get((str(runtime_root), relative))
+        if (expected is None or actual is None
+                or not _is_reviewed_runtime_hook_digest(relative, expected, actual)):
+            return None
+        return actual
+
+    source_digest = verified_digest(process_rel)
+    if source_digest is None:
         fail(f"runtime_adoption_unverified: creator process source is not pinned: {label}",
+             "attestation_source_mismatch")
+    helper_rel = "scripts/cooperative_branch_lease.py"
+    helper_digest = verified_digest(helper_rel)
+    if helper_digest is None:
+        fail(f"runtime_adoption_unverified: creator runtime helper is not reviewed: {label}",
              "attestation_source_mismatch")
     attestations = payload.get("attestations")
     if not isinstance(attestations, list):
@@ -730,9 +755,8 @@ def _verify_process_startup_attestation(
                   and item.get("source_path") == process_rel
                   and item.get("creator") == label
                   and item.get("kind") == expected_kind), None)
-    helper_digest = _REVIEWED_HOOK_FILES["scripts/cooperative_branch_lease.py"]
-    if (match is None or match.get("source_sha256") != expected_sha
-            or match.get("helper_path") != "scripts/cooperative_branch_lease.py"
+    if (match is None or match.get("source_sha256") != source_digest
+            or match.get("helper_path") != helper_rel
             or match.get("helper_sha256") != helper_digest
             or not re.fullmatch(r"[0-9a-f]{64}", str(match.get("loaded_code_sha256", "")))):
         fail(f"runtime_adoption_unverified: startup source digest mismatch: {label}",
@@ -758,7 +782,7 @@ def _verify_process_startup_attestation(
                     or verified_sha is None or actual_shell_sha != verified_sha
                     or shell_match.get("source_sha256") != verified_sha
                     or shell_match.get("loaded_code_sha256") != verified_sha
-                    or shell_match.get("helper_path") != "scripts/cooperative_branch_lease.py"
+                    or shell_match.get("helper_path") != helper_rel
                     or shell_match.get("helper_sha256") != helper_digest):
                 fail(f"runtime_adoption_unverified: reviewed shell descriptor missing: {label}",
                      "attestation_source_mismatch")
@@ -998,6 +1022,7 @@ def _verify_loaded_runtime_jobs(
             {shell_rel: (verified_hook_digests or {}).get((str(root), shell_rel), "")
              for shell_rel in _SUPERVISED_SHELL_SOURCES.get(label, ())},
             process_command=process_command, process_cwd=cwd_path,
+            verified_runtime_hook_digests=verified_hook_digests,
         )
         generation = digest({
             "mtime_generation": _attest_process_generation(root, pid, started_at),
