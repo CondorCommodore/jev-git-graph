@@ -19,6 +19,7 @@ from jev_git_graph.coordinator import (CleanupActionJournal,
                                        CreatorLeaseCapability,
                                        CreatorRuntimeValidationError,
                                        _REVIEWED_DEPLOY_SYNC_RUNTIME_COMPAT_SHA,
+                                       _REVIEWED_DEPLOY_SYNC_RUNTIME_COMPAT_7227_SHA,
                                        _REVIEWED_VERDICT_LIFECYCLE_RUNTIME_COMPAT_SHA,
                                        _REVIEWED_HOOK_FILES,
                                        _is_reviewed_runtime_hook_digest,
@@ -473,17 +474,22 @@ class CleanupTests(unittest.TestCase):
             "scripts/deploy_sync.py", reviewed, reviewed))
         self.assertTrue(_is_reviewed_runtime_hook_digest(
             "scripts/deploy_sync.py", reviewed, compatible))
+        self.assertTrue(_is_reviewed_runtime_hook_digest(
+            "scripts/deploy_sync.py", reviewed,
+            _REVIEWED_DEPLOY_SYNC_RUNTIME_COMPAT_7227_SHA))
         self.assertFalse(_is_reviewed_runtime_hook_digest(
             "scripts/deploy_sync.py", reviewed, "0" * 64))
         self.assertFalse(_is_reviewed_runtime_hook_digest(
             "scripts/cooperative_branch_lease.py", "1" * 64, compatible))
+        self.assertFalse(_is_reviewed_runtime_hook_digest(
+            "scripts/cooperative_branch_lease.py", "1" * 64,
+            _REVIEWED_DEPLOY_SYNC_RUNTIME_COMPAT_7227_SHA))
 
     def test_deploy_sync_hash_change_remains_a_capability_change(self):
         root = Path("/fixture/home-lab")
         roots = (root / "stable", root / "compat", root / "canonical")
         relative = "scripts/deploy_sync.py"
         original_sha = _REVIEWED_HOOK_FILES[relative]
-        compatible_sha = _REVIEWED_DEPLOY_SYNC_RUNTIME_COMPAT_SHA
         expected = CreatorLeaseCapability(
             common_dir=root / ".git", runtime_roots=roots, hook_digests=tuple(
                 (str(runtime_root), relative, original_sha) for runtime_root in roots
@@ -491,27 +497,32 @@ class CleanupTests(unittest.TestCase):
             train_construction_runtime=root / "train-runtime",
             train_construction_commit=None,
         )
-        current_hooks = tuple(
-            (str(runtime_root), relative,
-             compatible_sha if runtime_root == roots[0] else original_sha)
-            for runtime_root in roots
-        )
-        current = replace(expected, hook_digests=current_hooks)
-        with patch("jev_git_graph.coordinator.resolve_production_creator_capability",
-                   return_value=current):
-            diagnostic = production_capability_diagnostic(expected, root)
-        self.assertFalse(diagnostic["ok"])
-        self.assertEqual(["hook_digests"], diagnostic["changed_fields"])
-        self.assertEqual({"added_count": 1, "removed_count": 1},
-                         diagnostic["hook_changes"])
+        for compatible_sha in (
+            _REVIEWED_DEPLOY_SYNC_RUNTIME_COMPAT_SHA,
+            _REVIEWED_DEPLOY_SYNC_RUNTIME_COMPAT_7227_SHA,
+        ):
+            with self.subTest(compatible_sha=compatible_sha):
+                current_hooks = tuple(
+                    (str(runtime_root), relative,
+                     compatible_sha if runtime_root == roots[0] else original_sha)
+                    for runtime_root in roots
+                )
+                current = replace(expected, hook_digests=current_hooks)
+                with patch("jev_git_graph.coordinator.resolve_production_creator_capability",
+                           return_value=current):
+                    diagnostic = production_capability_diagnostic(expected, root)
+                self.assertFalse(diagnostic["ok"])
+                self.assertEqual(["hook_digests"], diagnostic["changed_fields"])
+                self.assertEqual({"added_count": 1, "removed_count": 1},
+                                 diagnostic["hook_changes"])
 
-        self.assertIn((str(roots[0]), relative, compatible_sha), current.hook_digests)
-        self.assertIn((str(roots[1]), relative, original_sha), current.hook_digests)
-        self.assertIn((str(roots[2]), relative, original_sha), current.hook_digests)
-        self.assertNotEqual(
-            capability_receipt_metadata(expected)["creator_capability_sha256"],
-            capability_receipt_metadata(current)["creator_capability_sha256"],
-        )
+                self.assertIn((str(roots[0]), relative, compatible_sha), current.hook_digests)
+                self.assertIn((str(roots[1]), relative, original_sha), current.hook_digests)
+                self.assertIn((str(roots[2]), relative, original_sha), current.hook_digests)
+                self.assertNotEqual(
+                    capability_receipt_metadata(expected)["creator_capability_sha256"],
+                    capability_receipt_metadata(current)["creator_capability_sha256"],
+                )
 
     def test_exact_reviewed_merge_loop_and_verdict_variants_are_path_bound(self):
         shell = "scripts/merge-safe-prs-loop.sh"

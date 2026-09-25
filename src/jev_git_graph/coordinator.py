@@ -97,6 +97,10 @@ _REVIEWED_HOOK_FILES = {
 _REVIEWED_DEPLOY_SYNC_RUNTIME_COMPAT_SHA = (
     "6c702771a35b2fb3ab8a101a62d04973adbd03ec888d2eef8a498e895e2a22bd"
 )
+# Exact reviewed stable/compat source at Home Lab commit eb54aad (#8593).
+_REVIEWED_DEPLOY_SYNC_RUNTIME_COMPAT_7227_SHA = (
+    "7227de6c32bcc421b4715babcf7ca06529df206d7536b6e3978b9cde5910ff8e"
+)
 _REVIEWED_MERGE_LOOP_SHELL_RUNTIME_COMPAT_SHA = (
     "2ec5e69c594d813624161ccdffe4a92bd6ed184999f7469b3f8a219e67563086"
 )
@@ -491,7 +495,10 @@ def _runtime_selector_targets(home: Path | None = None) -> tuple[Path, ...]:
 def _is_reviewed_runtime_hook_digest(relative: str, expected_sha: str, actual_sha: str) -> bool:
     return (actual_sha == expected_sha
             or (relative == "scripts/deploy_sync.py"
-                and actual_sha == _REVIEWED_DEPLOY_SYNC_RUNTIME_COMPAT_SHA)
+                and actual_sha in (
+                    _REVIEWED_DEPLOY_SYNC_RUNTIME_COMPAT_SHA,
+                    _REVIEWED_DEPLOY_SYNC_RUNTIME_COMPAT_7227_SHA,
+                ))
             or (relative == "scripts/merge-safe-prs-loop.sh"
                 and actual_sha == _REVIEWED_MERGE_LOOP_SHELL_RUNTIME_COMPAT_SHA)
             or (relative == "scripts/merge_train_parts/candidate_lifecycle.py"
