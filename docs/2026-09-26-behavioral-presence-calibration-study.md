@@ -346,6 +346,31 @@ for the 18 multi-branch families (726 pairs). Total: 16,197 calls, **$2.95**.
 - **Conclusion:** the reverse direction doubled cost without improving separation.
   Use the forward screen alone.
 
+### Applying the screen to the remaining 78 families
+
+The forward screen was then run on the remaining 78 families, with the selection
+rule fixed before any scores were seen: flag families with a no-match share ≥0.3,
+plus a deterministic random 10% audit sample of the unflagged ones. Only those 12
+families went to the verifier plus skeptic.
+
+| Group | Families | PORT | DROP | UNSURE |
+|---|---:|---:|---:|---:|
+| Flagged by the screen | 4 | 1 | 2 | 1 |
+| Random audit (unflagged) | 8 | 0 | 7 | 1 |
+
+The audit sample found no missed port work (0 of 8). That is consistent with the
+screen, but the sample is too small to bound its miss rate tightly. The flag rate
+was lower than in the top 60 (4 of 78 versus 9 of 55), as expected for smaller,
+lower-ranked families. Across both rounds, 8 families were judged PORT and handed to
+builders as follow-up pull requests onto current main.
+
+### Measured spend
+
+Metered provider usage for the Jev key across all rounds: 19,665 requests, 80.0M
+input tokens and 3.1M output tokens, or **$3.36** at the published input rate. The
+bidirectional round accounts for most of it ($2.95). The verifier-plus-skeptic
+reference judgments used a separate, larger budget on a Haiku-class model.
+
 ### Recommended branch-level pipeline
 
 Screen the remaining families forward-only with Jev (a few cents per family). Send
