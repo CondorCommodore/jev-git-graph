@@ -7,7 +7,9 @@ to help retire stale branches without losing unique work?
 **Answer: not as a deletion signal.** On independently verified negatives Jev
 answered "already on main" 20% of the time. Git alone settled more of the backlog,
 for free and with proof. Jev stays advisory: a cheap ranking hint, never cleanup
-authority.
+authority. Three follow-up rounds the same day (v2, v2b, v2c; see "Follow-up
+rounds" below) confirmed this. The best configuration found 90% of covered code
+but falsely called 52% of unique code "on main".
 
 This document records the method so the study can be reproduced on another
 repository or re-run after a model or prompt change. It contains aggregate results
@@ -148,6 +150,93 @@ Safe policy that needs no model: retire only git-proven CONTAINED or
 CONTAINED_BY_CONTENT tips through the digest-approved executor, and keep everything
 else pending review. This result agrees with an earlier, separate NO-GO on using
 Jev for defect and scope triage.
+
+## Follow-up rounds (same day)
+
+### Re-labelling and miss diagnosis (free)
+
+An offline diagnosis of the 13 misses (static reading only, no model calls)
+classified the primary causes as: missing context 8 (the equivalent behavior is
+spread across callers, delegates or config outside the excerpt), superseded
+ambiguity 2, suspect reference label 2, judgment error 1, retrieval miss 0. A
+second, independent verifier-plus-skeptic pass relabelled all three suspect cases,
+and each one moved away from "equivalent": two to SUPERSEDED, one to ABSENT. So the
+first-pass reference labels carried roughly a 10% error rate. SUPERSEDED (main
+deliberately does the opposite) is scored as its own class from here on.
+
+An unguided keyword/AST candidate index (BM25 over identifiers, literals, imports
+and calls) found the cited main location in the top 10 for 90% of renamed
+positives (recall@1 50%, @5 87%).
+
+### v2: candidates plus decomposed questions
+
+Design: 60 new held-out units, each labelled by a verifier plus an independent
+skeptic (disagreement goes to UNSURE): 14 COVERED, 18 ABSENT, 19 SUPERSEDED,
+9 UNSURE. Each request carried one unit plus its top-10 retrieved main candidates,
+and asked:
+
+- a Noul per candidate, "same behavior?";
+- Nouls for "evidence sufficient?" and "deliberately opposite?";
+- a Choice for the best candidate, including `__none__`.
+
+Routing required all three probabilities past a threshold of 0.74, carried over
+from v1's Choice confidence.
+
+Result ($0.03): **every unit came back unresolved**. "Evidence sufficient" never
+reached 0.74, and the Choice picked `__none__` for 49 of 60 units. A v2b re-run
+with complete candidate context ($0.03) gave the same result, so missing context
+was not the blocker.
+
+A post-hoc score review, fitted on the same labels and therefore only a hypothesis,
+showed the per-pair scores do carry signal. ABSENT maxima topped out at 0.25, while
+the COVERED median was 0.29, so a cutoff of 0.27 would have separated 8/14 COVERED
+from 0/18 ABSENT.
+
+A side-by-side comparison with public Jev code-search implementations and the
+official skill guidance found five payload defects:
+
+1. Each question stacked several hedging clauses instead of one plain criterion.
+2. There was no cheap shortlist stage before full-evidence verification.
+3. Candidate code was shipped raw and truncated, instead of as aimed evidence
+   windows.
+4. The threshold was transferred from a different primitive.
+5. `__none__` was overloaded with "deliberately opposite".
+
+### v2c: payload redesign
+
+Design: 90 new held-out units (20 COVERED, 25 ABSENT, 31 SUPERSEDED, 14 UNSURE).
+Stage one was a Noul shortlist; stage two was full verification with one plain
+criterion per question, `__none__` meaning only "no match", and routing on the best
+pair score alone at a cutoff of 0.27 frozen before any call.
+
+The first attempt hit an HTTP 400 `max_tokens_exceeded` on large requests. The
+resumed attempt (a protocol deviation, reported as such) used the top four
+candidates under a measured 20 KB request cap.
+
+Result ($0.10 in total):
+
+| Reference | n | Routed "on main" |
+|---|---:|---:|
+| COVERED | 20 | 18 (90% recall) |
+| ABSENT | 25 | **13 (52% false on main)** |
+| SUPERSEDED | 31 | 16 |
+
+The "deliberately opposite" question never fired.
+
+### Overall conclusion
+
+Across four configurations (v1, v2, v2b, v2c), total Jev spend was under $0.25.
+Jev either answered with a confident wrong "on main" (v1, 20%; v2c, 52%) or
+abstained on everything (v2, v2b). No configuration reached a false-on-main rate
+low enough to justify discarding code.
+
+The pair scores do rank matches well: v2c found 90% of covered units. Jev is
+therefore usable to **order a human review queue**, not to decide. Retirement
+remains limited to branches git proves are already on main.
+
+Verifier-plus-skeptic labelling gives decisive, cited labels at roughly $0.10 per
+unit. Using the same verifier family to re-check the model's picks would be
+circular, so the Jev-only numbers above are the honest ones.
 
 ## Reproducing
 
