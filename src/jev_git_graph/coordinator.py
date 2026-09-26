@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping
 
 from .errors import JgError
+from .process_identity import receipt_generation_matches
 from .safety import canonical_json, digest
 
 
@@ -533,7 +534,7 @@ def _runtime_selector_targets(home: Path | None = None) -> tuple[Path, ...]:
 
 
 # Exact source review at Home Lab 50247d669d69ef480bbac1259b95258863f6c712.
-# These byte pins do not change process-generation receipt validation.
+# Receipt generation is independently checked against the operating system.
 _REVIEWED_TRAIN_RUNTIME_VARIANTS = {
     "launchd/start-train-construction.sh": "71fdf889987ae1be1ee357ccb8e5ef3a16afafe21aff62a9c6fae714593a2638",
     "scripts/cooperative_branch_lease.py": "32e8488552e3273cdf1a72b324c5f54d8adacbcb1aab7ebd5bc148a8414daeb7",
@@ -707,10 +708,16 @@ def _verify_process_startup_attestation(
         payload = json.loads(receipt_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         fail(f"runtime_adoption_unverified: startup attestation unreadable: {label}", "other")
+    try:
+        generation_matches = (isinstance(payload, dict) and receipt_generation_matches(
+            payload.get("process_start"), pid, process_start))
+    except JgError:
+        fail(f"runtime_adoption_unverified: native process generation unavailable: {label}",
+             "attestation_generation_mismatch")
     if (not isinstance(payload, dict)
             or payload.get("contract") != "jev-git-graph/creator-runtime-attestation-v1"
             or payload.get("pid") != pid
-            or payload.get("process_start") != process_start
+            or not generation_matches
             or payload.get("creator") != label
             or payload.get("runtime_root_sha256") != hashlib.sha256(str(runtime_root.resolve()).encode()).hexdigest()):
         fail(f"runtime_adoption_unverified: startup attestation generation mismatch: {label}",

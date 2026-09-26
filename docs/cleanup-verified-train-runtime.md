@@ -45,24 +45,40 @@ These are the lease-sensitive execution files, not a claim that every transitive
 application import has been independently reviewed. The existing runtime commit,
 cleanliness, loaded-process and source-attestation checks remain required.
 
-## Remaining blocker: process-generation receipt compatibility
+## Process-generation receipt compatibility
 
 The newer lease module emits `darwin:pid:seconds:microseconds` or
-`linux:boot-id:start-ticks` in `process_start`. Jev currently obtains `ps lstart`
-and requires exact receipt equality. This PR deliberately leaves that equality
-check intact. A newer receipt will therefore remain blocked; byte acceptance
-must not be mistaken for a successful live creator capability or deletion
-permission. A separate, scoped generation-reader compatibility review is needed
-before claiming runtime readiness. No runtime was restarted for this PR.
+`linux:boot-id:start-ticks` in `process_start`. Jev now obtains those identities
+independently: Darwin `proc_pidinfo(PROC_PIDTBSDINFO)` validates the returned
+structure size, PID and timestamp; Linux reads the boot UUID and process start
+ticks from procfs. Native receipt mismatches and unavailable native identity
+fail closed, with no fallback to `ps lstart`. Legacy receipt strings still
+require the existing exact `ps lstart` equality and a valid legacy format.
+
+The change validates receipt generation only. Runtime root, commit, source
+hashes, loaded-code receipts, process image, branch locks and all cleanup gates
+remain required. No runtime was restarted and no production capability or
+cleanup readiness is claimed from tests alone.
 
 ## Verification
 
-`PYTHONPATH=src python3 -m unittest discover -s tests -p test_cleanup.py -k verified_train -v`: 2 passed.
+- Cleanup tests: 45 passed.
+- Native process identity tests: 7 passed, including a live own-process read,
+  mocked Darwin kernel size/PID/time failures, Linux parsing, stale PID/reboot
+  rejection and no native-to-legacy downgrade.
+- Receipt integration covers a valid native receipt and same-PID microsecond
+  mismatch rejection.
+- The former baseline diagnostic test failure came from mocking the initial
+  resolver but allowing its newer readiness retry to inspect real state. The
+  test now mocks both resolver boundaries with the same typed error; production
+  diagnostic behavior is unchanged.
 
-Full cleanup file: 44 passed, 1 failed. The failure also reproduces on unchanged
-main: `test_running_creator_failures_have_hashed_diagnostics_and_wrapper_still_fails`
-(`reviewed_wrapper`) expects `process_image_mismatch` but the safe diagnostic
-returns `other`. This pre-existing diagnostic mismatch is not changed here.
+Commands:
+
+```sh
+PYTHONPATH=src python3 -m unittest discover -s tests -p test_cleanup.py -q
+PYTHONPATH=src python3 -m unittest discover -s tests -p test_process_identity.py -v
+```
 
 The new tests require all chain paths and their reviewed hashes, verify path
 binding, exercise real file reads, mutate helper and dependency bytes, and

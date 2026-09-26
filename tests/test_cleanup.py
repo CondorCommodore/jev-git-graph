@@ -493,7 +493,9 @@ class CleanupTests(unittest.TestCase):
                         ):
                             self.assertNotIn(field, diagnostic)
                     with patch("jev_git_graph.coordinator.resolve_production_creator_capability",
-                               side_effect=error) as resolve:
+                               side_effect=error) as resolve, \
+                            patch("jev_git_graph.coordinator.resolve_production_creator_capability_when_ready",
+                                  side_effect=error):
                         safe = production_capability_diagnostic(
                             CreatorLeaseCapability(
                                 common_dir=base, runtime_roots=(runtime, runtime, runtime),
@@ -580,6 +582,22 @@ class CleanupTests(unittest.TestCase):
                 self.assertEqual(_verify_process_startup_attestation(
                     home, runtime, pid, process_start, label, "scripts/entry.py"),
                     digest(receipt))
+
+                # A native receipt must bind to the independently observed
+                # process generation, including same-PID microsecond reuse.
+                native_receipt = dict(receipt, process_start=f"darwin:{pid}:100:10")
+                path.write_text(json.dumps(native_receipt))
+                with patch("jev_git_graph.process_identity.native_process_generation",
+                           return_value=native_receipt["process_start"]):
+                    self.assertEqual(_verify_process_startup_attestation(
+                        home, runtime, pid, process_start, label, "scripts/entry.py"),
+                        digest(native_receipt))
+                with patch("jev_git_graph.process_identity.native_process_generation",
+                           return_value=f"darwin:{pid}:100:11"):
+                    with self.assertRaisesRegex(JgError, "generation mismatch"):
+                        _verify_process_startup_attestation(
+                            home, runtime, pid, process_start, label, "scripts/entry.py")
+                path.write_text(json.dumps(receipt))
 
                 helper_rel = "scripts/cooperative_branch_lease.py"
                 entry_rel = "scripts/entry.py"
