@@ -4,12 +4,22 @@
 function's behavior?" for code that exists only on unmerged branches, well enough
 to help retire stale branches without losing unique work?
 
-**Answer: not as a deletion signal.** On independently verified negatives Jev
-answered "already on main" 20% of the time. Git alone settled more of the backlog,
-for free and with proof. Jev stays advisory: a cheap ranking hint, never cleanup
-authority. Three follow-up rounds the same day (v2, v2b, v2c; see "Follow-up
-rounds" below) confirmed this. The best configuration found 90% of covered code
-but falsely called 52% of unique code "on main".
+**Answer: not per function; yes as a branch-level screen.**
+
+- **Per function, Jev is not a deletion signal.** On independently verified
+  negatives it answered "already on main" 20% of the time (v1). The best redesigned
+  configuration found 90% of covered code but still called 52% of unique code "on
+  main" (v2c).
+- **Per branch, it is a useful screen.** Aggregated over a whole branch, the share
+  of functions with no match on main separated "work worth porting" from "safe to
+  drop". A cutoff of ≥30% caught 5 of 7 port candidates while flagging 4 of 48
+  drops, for $1.60 across 60 branch families.
+- **Most of the backlog needed no model at all.** Deterministic facts (git
+  ancestry, exact-head PR history, branch-naming policy) decided 92% of 3,505
+  branch tips.
+
+Jev stays advisory throughout: it orders expensive review; it never authorizes
+deletion.
 
 This document records the method so the study can be reproduced on another
 repository or re-run after a model or prompt change. It contains aggregate results
@@ -29,39 +39,56 @@ Every metric below is weighted toward that error.
 
 ## Pipeline
 
+Facts first, models last. Each tier removes what it can prove, and only the
+remainder moves on.
+
 ```
-all refs (local + remote-tracking)
-  │  Step 0: exclusions (free)
-  │    open PR · push/ref activity < 24h · checked out in a worktree → EXCLUDED
-  │  Tier 0: git containment (free)
-  │    ancestor of main · git cherry shows every commit upstream ·
-  │    empty diff vs merge-base → CONTAINED
-  │  Tier 1: content equality (free)
-  │    every changed file byte- or AST-equal to main → CONTAINED_BY_CONTENT
-  │  Step 1: dedupe by tip commit; conflicting copies keep the most
-  │    conservative bucket (EXCLUDED > RESIDUE > CONTAINED_BY_CONTENT > CONTAINED)
+all refs (local + remote-tracking), deduped by tip commit
+  │  Step 0 · exclusions (free): open PR · recent push/ref activity ·
+  │          checked out in a worktree                          → EXCLUDED
+  │  Tier 0 · git containment (free): ancestor of main · every commit
+  │          upstream by patch-id · empty diff vs merge-base     → CONTAINED
+  │  Tier 1 · content equality (free): every changed file
+  │          byte- or AST-equal to main                  → CONTAINED_BY_CONTENT
+  │  Tier 2 · exact-head PR history (1 git call + ~90 paged API reads):
+  │          tip == head sha of a merged PR          → MERGED (squash-merged)
+  │          tip == head sha of a closed, unmerged PR  → CLOSED_UNMERGED
+  │  Tier 3 · branch-naming policy (free): no-PR tips named wip/*, l1-drive/*
+  │          → DRAIN_ELIGIBLE; feat/*, fix/* and other names stay open
   ▼
-RESIDUE = git cannot decide → split into function-level units
-  │  Calibration (this study) before any residue-wide Jev run
+UNDECIDED = no fact decides it → group into feature families
+  │  Tier 4 · family facts (free): landed sibling · all changed lines already
+  │          on main · all touched paths deleted on main
+  │  Tier 5 · Jev branch screen (cents): share of functions with no match
+  │  Tier 6 · verifier + skeptic (≈$0.15/family): PORT / DROP, with citations
   ▼
-Jev may only RANK residue; it never promotes a unit to CONTAINED
+retirement only via the digest-approved executor, with recovery bundles
 ```
 
-### Population results (free tiers, no model calls)
+Squash merges are why Tier 2 matters: a squash creates a new commit on main with
+no ancestry link to the branch, so Tiers 0 and 1 cannot see the merge. The PR
+record does.
 
-| Bucket | Refs (raw) | Unique tips (deduped) |
+### Population results
+
+| Tier | Tips | Share of 3,505 |
 |---|---:|---:|
-| CONTAINED | 1,016 | 906 |
-| CONTAINED_BY_CONTENT | 60 | 57 |
-| EXCLUDED | 1,153 | 872 |
-| RESIDUE | 2,120 | 1,670 |
-| **Total** | **4,349** | **3,505** |
+| 0–1 · contained in main (git) | 963 | 27% |
+| Step 0 · excluded (live) | 872 | 25% |
+| 2 · merged PR at exact head | 543 | 15% |
+| 2 · PR closed without merging | 501 | 14% |
+| 3 · no PR, drain-eligible by naming policy | 355 | 10% |
+| **Undecided by facts** | **271** | **8%** |
 
-Git settled 963 tips (27%) with proof and zero model cost. The residue splits into
-16,081 unique function units. The 7,513 of those with a named counterpart on main
-are estimated at 22.1M input tokens, about **$0.93** at Jev's published rate. The
-other 8,568 were unpriced. Function-level units are about 13× cheaper than
-whole-file units ($12–34).
+Tiers 0–3 used no model and about 90 API calls in total. The 271 undecided tips
+formed 178 feature families (clustered by shared paths, task ids and dates). Tier 4
+decided 40 of those families: 12 had a sibling already on main, 23 added nothing not
+already on main, and 5 only touched paths deleted on main. That left 138 families
+for judgment.
+
+The function-level calibration below was run on the residue before Tiers 2–4 were
+applied. Its results characterize Jev per function and motivated the branch-level
+design.
 
 ## Calibration design
 
@@ -238,10 +265,102 @@ Verifier-plus-skeptic labelling gives decisive, cited labels at roughly $0.10 pe
 unit. Using the same verifier family to re-check the model's picks would be
 circular, so the Jev-only numbers above are the honest ones.
 
+## Branch-level screening
+
+The function-level results show that per-unit answers are too noisy to act on.
+This round tests whether aggregating over a whole branch gives a usable signal.
+
+### Reference verdicts
+
+The 60 highest-ranked undecided families were each judged by a verifier plus an
+independent skeptic, reading the best branch's diff against pinned main. Only
+verdicts that survived the skeptic were kept; disagreement became UNSURE. One PORT
+verdict that proposed raising a polling interval was reclassified to SUPERSEDED,
+because it conflicts with an explicit project policy against lengthening freshness
+bounds. The verifier had no access to that policy.
+
+| Verdict | Families |
+|---|---:|
+| DROP_COVERED | 21 |
+| DROP_SUPERSEDED | 27 |
+| PORT | 7 |
+| UNSURE | 5 |
+
+Cost was about 6.9M Haiku-class tokens (roughly $8–10), or about $0.15 per family.
+
+### Jev forward screen
+
+Design: every function of each family's best branch, using the v2c two-stage
+design (shortlist, then verification against the top candidates under a 20 KB cap),
+blind to the reference verdicts. Result: 3,990 functions, **$1.60**. Per family,
+the no-match share is the fraction of functions whose best pair score was below
+0.27.
+
+| Reference | Families | Median no-match share |
+|---|---:|---:|
+| PORT | 7 | **0.50** |
+| DROP_SUPERSEDED | 27 | 0.15 |
+| DROP_COVERED | 21 | 0.06 |
+
+| Screen rule | PORT caught | DROP flagged |
+|---|---:|---:|
+| no-match share ≥ 0.3 | **5 / 7** | **4 / 48** |
+| no-match share ≥ 0.5 | 4 / 7 | 2 / 48 |
+
+At ≥0.3 the screen passes 9 of 55 decided families to review, and 5 of those 9
+are real port candidates. That concentrates the verifier budget about 6×. The two
+misses were small fixes inside branches that otherwise match main, which no
+branch-level aggregate can see.
+
+### Bidirectional containment matrix (did not help)
+
+Hypothesis: asking both directions would expose "the branch adds something extra"
+cases that one direction cannot. For each pair of branch unit B and main candidate
+M, ask both:
+
+```
+                         P(B's behavior in M)   P(M's behavior in B)
+EQUIVALENT                     high                    high
+BRANCH_SUBSET (main grew)      high                    low
+BRANCH_ADDS  (port signal)     low                     high
+UNRELATED                      low                     low
+```
+
+Both directions were asked in separate, independent requests, with the 0.5
+thresholds fixed in advance. Within-family branch-to-branch matrices were also built
+for the 18 multi-branch families (726 pairs). Total: 16,197 calls, **$2.95**.
+
+| Reference | Median BRANCH_ADDS share | Median UNRELATED share | Median EQUIVALENT share |
+|---|---:|---:|---:|
+| PORT | 0.00 | 0.50 | 0.30 |
+| DROP_COVERED | 0.00 | 0.15 | 0.71 |
+| DROP_SUPERSEDED | 0.00 | 0.24 | 0.57 |
+
+- **BRANCH_ADDS rarely fired.** At ≥0.1 it caught only 2 of 7 PORT families, and it
+  missed the same two small-fix cases as the forward screen.
+- **The useful separation came from signals the forward pass already provides:**
+  the UNRELATED share (≈ the no-match share), and the EQUIVALENT share, which is
+  high for DROP_COVERED.
+- **Consistency held:** zero contradiction flags (both directions ≈1.0 on very
+  different-sized code).
+- **Conclusion:** the reverse direction doubled cost without improving separation.
+  Use the forward screen alone.
+
+### Recommended branch-level pipeline
+
+Screen the remaining families forward-only with Jev (a few cents per family). Send
+families with a no-match share ≥0.3, plus a random 10% audit sample of the rest, to
+the verifier plus skeptic. Hand PORT verdicts to builders as pull requests, and add
+DROP verdicts to digest-approved retirement batches. The audit sample measures what
+the screen misses.
+
 ## Reproducing
 
-1. Pin `origin/main`. Inventory all local and remote-tracking refs. Apply the
-   exclusions and tiers above, then dedupe by tip. No model calls.
+1. Pin `origin/main`. Inventory all local and remote-tracking refs, dedupe by tip,
+   and apply Step 0 and Tiers 0–3 above. Read PR heads with `git ls-remote origin
+   'refs/pull/*/head'`, and merged or closed state from one paged PR listing
+   through your rate governor. Match tips to PR heads exactly; never by ancestry. No
+   model calls.
 2. Build function-level residue units and the negative candidates exactly as
    described, whole-tree symbol absence included.
 3. Verify candidates with an independent model from a different vendor or family
@@ -266,3 +385,8 @@ Thirty negatives put wide confidence bounds on a 20% rate.
 - Python function units only. Non-Python and unparsable units were out of scope.
 - Unit-level results are not whole-branch dispositions. Cost is usage-based, not
   reconciled against an invoice.
+- Branch-level screen thresholds (≥0.3) were chosen after observing 60 families
+  with only 7 PORT references. They are a hypothesis to confirm on a fresh set, and
+  the audit sample in the recommended pipeline exists for that purpose.
+- Exact-head PR matching deliberately leaves any branch with commits after its
+  PR's head unresolved.
