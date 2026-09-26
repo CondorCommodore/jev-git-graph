@@ -71,6 +71,12 @@ _REVIEWED_HOOK_FILES = {
     "scripts/train_builder.py": "289c985aaf9d8b9b00f3934ba767eee9114773240ec67a44207d74625d8ab367",
     "scripts/train_construction_driver.py": "4b9c1631c0b940d6df18ae1987fcef9801776a03ff3a6f1abd98e60059403b70",
     "launchd/start-train-construction.sh": "0f42fc8d72145a5f1845770317e88b677d25fca3d0939633ff79316419903e8f",
+    # Verified train snapshot execution chain, Home Lab 50247d669d69.
+    # The helper embeds its child bootstrap; pinning it covers both programs.
+    "scripts/run_verified_train_runtime.py": "16478ebef85d3a7f33ed21325aea88e93aee1c17452bbf71418f305f85c18920",
+    "scripts/train_shadow_runner.py": "40df0a573a871f62c5f02e98f9d6905635124c96de245b5545c04ca38be6fd17",
+    "scripts/train_promotion_driver.py": "6a534433b4809d52a80775fe8c791d3686f81ea0e19beb7442fbd68cbb7a7088",
+    "shared/require-python314.sh": "626a40e292841d433e95378cc3ef69d512413270fca3779a5619db87c1232b1b",
     "scripts/l1_drain/self_reported.py": "662d9cbcd86fc021dad1612347e10a9f23f4456e8d482ca3362419ef63e69fae",
     "scripts/l1_drain/workspace.py": "5aecacb06b3322cc64dc729227d45508eb4ffff7cd0504bcf6f46bce20795b70",
     "scripts/pr_repair_loop.py": "2791deaa05197388532898610f3ab3024f617356fcbbfb545724c45782ca108e",
@@ -526,8 +532,17 @@ def _runtime_selector_targets(home: Path | None = None) -> tuple[Path, ...]:
     return tuple(targets)
 
 
+# Exact source review at Home Lab 50247d669d69ef480bbac1259b95258863f6c712.
+# These byte pins do not change process-generation receipt validation.
+_REVIEWED_TRAIN_RUNTIME_VARIANTS = {
+    "launchd/start-train-construction.sh": "71fdf889987ae1be1ee357ccb8e5ef3a16afafe21aff62a9c6fae714593a2638",
+    "scripts/cooperative_branch_lease.py": "32e8488552e3273cdf1a72b324c5f54d8adacbcb1aab7ebd5bc148a8414daeb7",
+}
+
+
 def _is_reviewed_runtime_hook_digest(relative: str, expected_sha: str, actual_sha: str) -> bool:
     return (actual_sha == expected_sha
+            or actual_sha == _REVIEWED_TRAIN_RUNTIME_VARIANTS.get(relative)
             or (relative == "scripts/cooperative_branch_lease.py"
                 and actual_sha == _REVIEWED_COOPERATIVE_BRANCH_LEASE_RUNTIME_8603_SHA)
             or (relative == "scripts/deploy_sync.py"

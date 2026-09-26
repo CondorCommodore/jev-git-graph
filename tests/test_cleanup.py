@@ -737,6 +737,60 @@ class CleanupTests(unittest.TestCase):
                                 home, runtime, pid, process_start, label, "scripts/entry.py",
                                 {merge_loop_rel: "0" * 64})
 
+    def test_verified_train_execution_chain_is_pinned_and_path_bound(self):
+        expected = {
+            "scripts/run_verified_train_runtime.py": "16478ebef85d3a7f33ed21325aea88e93aee1c17452bbf71418f305f85c18920",
+            "scripts/train_shadow_runner.py": "40df0a573a871f62c5f02e98f9d6905635124c96de245b5545c04ca38be6fd17",
+            "scripts/train_promotion_driver.py": "6a534433b4809d52a80775fe8c791d3686f81ea0e19beb7442fbd68cbb7a7088",
+            "shared/require-python314.sh": "626a40e292841d433e95378cc3ef69d512413270fca3779a5619db87c1232b1b",
+            "scripts/train_builder.py": "289c985aaf9d8b9b00f3934ba767eee9114773240ec67a44207d74625d8ab367",
+            "scripts/train_construction_driver.py": "4b9c1631c0b940d6df18ae1987fcef9801776a03ff3a6f1abd98e60059403b70",
+            "scripts/attested_shell_supervisor.py": "fd1b2e6134d30e170dcd989f9e2d37726db1a49bfcb7009c3c2c8310cd127e81",
+            "scripts/cooperative_branch_lease.py": "32e8488552e3273cdf1a72b324c5f54d8adacbcb1aab7ebd5bc148a8414daeb7",
+            "launchd/start-train-construction.sh": "71fdf889987ae1be1ee357ccb8e5ef3a16afafe21aff62a9c6fae714593a2638",
+        }
+        for path, sha in expected.items():
+            with self.subTest(path=path):
+                self.assertIn(path, _REVIEWED_HOOK_FILES)
+                self.assertTrue(_is_reviewed_runtime_hook_digest(path, _REVIEWED_HOOK_FILES[path], sha))
+                self.assertFalse(_is_reviewed_runtime_hook_digest(path, _REVIEWED_HOOK_FILES[path], "0" * 64))
+                self.assertFalse(_is_reviewed_runtime_hook_digest("wrong/path.py", "0" * 64, sha))
+
+    def test_modified_verified_train_helper_bytes_fail_closed(self):
+        # Exercise actual file reads and the production verifier, not a mocked
+        # failure. Keep every registry key so removing the new helper is caught.
+        helper = "scripts/run_verified_train_runtime.py"
+        self.assertIn(helper, _REVIEWED_HOOK_FILES)
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory)
+            fixture_pins = {}
+            for relative in _REVIEWED_HOOK_FILES:
+                data = ('CONTRACT = "jev-git-graph/cooperative-branch-lease-v1"\n'
+                        if relative == "scripts/cooperative_branch_lease.py"
+                        else "# synthetic reviewed source: " + relative + "\n").encode()
+                path = runtime / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+                fixture_pins[relative] = hashlib.sha256(data).hexdigest()
+            with patch("jev_git_graph.coordinator._REVIEWED_HOOK_FILES", fixture_pins):
+                self.assertEqual(len(fixture_pins), len(_verify_runtime_hook_files(runtime)))
+                for relative in (helper, "scripts/train_shadow_runner.py",
+                                 "scripts/train_promotion_driver.py", "shared/require-python314.sh"):
+                    with self.subTest(path=relative):
+                        path = runtime / relative
+                        original = path.read_bytes()
+                        path.write_bytes(original + b"# modified after review\n")
+                        with self.assertRaisesRegex(JgError, "creator runtime hook digest mismatch"):
+                            _verify_runtime_hook_files(runtime)
+                        path.write_bytes(original)
+                path = runtime / helper
+                path.unlink()
+                with self.assertRaisesRegex(JgError, "missing or symlinked"):
+                    _verify_runtime_hook_files(runtime)
+                path.symlink_to(runtime / "scripts/train_builder.py")
+                with self.assertRaisesRegex(JgError, "missing or symlinked"):
+                    _verify_runtime_hook_files(runtime)
+
     def test_unreviewed_creator_hook_digest_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             runtime = Path(directory)
