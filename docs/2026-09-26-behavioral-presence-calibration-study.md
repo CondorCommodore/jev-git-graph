@@ -379,6 +379,28 @@ the verifier plus skeptic. Hand PORT verdicts to builders as pull requests, and 
 DROP verdicts to digest-approved retirement batches. The audit sample measures what
 the screen misses.
 
+## Port outcomes & retirement results
+
+The branch-level screen identified eight PORT families. Five ports have merged:
+
+| Port | Home Lab PR | Merge |
+|---|---:|---|
+| P8 | #8955 | `4c3e2ab` |
+| P1 | #8960 | `8c35bc5` |
+| P7 | #8961 | `67198da` |
+| P6 | #8954 | `eff6eab` |
+| P6 fix-forward | #8970 | `806c99f` |
+| P2 | #8958 | `97eba09` |
+
+P2 was merged by operator exception; two Codex review threads were deferred.
+Three other ports remain outside these completed outcomes.
+
+The digest-approved Home Lab retirement runs removed **776 refs** (321 + 455).
+In a separate broker-manager pass, **3,728 of 4,357 refs** were deleted. Jev's
+zero-LLM-token grouping found five patch families and only six unique branches in
+the retired population. The ref producer was Forge's `wip-autosave` workflow, which
+has since been disabled.
+
 ## Reproducing
 
 1. Pin `origin/main`. Inventory all local and remote-tracking refs, dedupe by tip,
