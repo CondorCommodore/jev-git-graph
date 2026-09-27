@@ -96,7 +96,7 @@ design.
 
 | Set | n | Reference answer | How the label was established |
 |---|---:|---|---|
-| (a) git-provable positive | 40 | YES, on main | Unit from a CONTAINED branch whose definition exists on pinned main. Proof is git itself. |
+| (a) git-provable positive | 40 | YES, on main | Unit from a CONTAINED branch whose definition bytes exactly match the pinned-main definition. The manifest records byte equality for each unit. |
 | (b) renamed/refactored positive | 30 | YES, on main | Candidate negative that an independent verifier found implemented on main under another name or structure. |
 | (c) verified negative | 30 | NO | Candidate negative that the independent verifier confirmed absent. |
 
@@ -170,7 +170,7 @@ output tokens. **Estimated $0.0064** at $0.042/M input, free output. Model:
 |---|---|
 | Promote a branch to CONTAINED / authorize deletion | **No.** A 20% false-on-main rate would lose about 1 in 5 unique units. |
 | Declare code unique from a NO answer | **No.** 7/16 NO answers were wrong. |
-| Order a human review queue (YES first) | Possible, as a hint only. About $1 for the whole residue. |
+| Order a human review queue (YES first) | Possible, as a hint only. The original estimate priced only a subset of residue units; the full-residue cost is unknown. The later branch-family screen cost $1.60 for 60 families. |
 | Replace git containment | **No.** Git is free, provable, and settled 27% of tips. |
 
 Safe policy that needs no model: retire only git-proven CONTAINED or
