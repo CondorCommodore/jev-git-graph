@@ -185,7 +185,7 @@ class LocalFirstTest(unittest.TestCase):
         self.assertGreater(preview["request_count"], 0)
         for request in preview["requests"]:
             self.assertEqual({"state", "model", "questions"}, set(request))
-            self.assertEqual("jev-latest", request["model"])
+            self.assertEqual("jev-1.14.0", request["model"])
             self.assertEqual(set(QUESTION_IDS), set(request["questions"]))
             for question in request["questions"].values():
                 self.assertEqual({"type", "instructions", "criteria"}, set(question))

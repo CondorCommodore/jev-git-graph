@@ -145,7 +145,7 @@ selection_digest = study["study_digest"]
 range_manifest["selection_digest"] = selection_digest
 kwargs = {"selected_contribution_ids": [row["contribution_id"] for row in selection_rows],
           "selection_digest": selection_digest, "max_groups": 3, "max_requests": 8,
-          "max_request_bytes": 64_000, "model_settings": {"model": "jev-latest"}}
+          "max_request_bytes": 64_000, "model_settings": {"model": "jev-1.14.0"}}
 initial_plan = build_group_requests(contributions, groups, evidence_by_id, **kwargs)
 estimated_input_tokens = math.ceil(initial_plan["payload_bytes"] / 4) + 256 * initial_plan["request_count"]
 plan = build_group_requests(
@@ -162,7 +162,7 @@ write_json(output / "three-case-contributions.json", contributions)
 write_json(output / "three-case-groups.json", groups)
 write_json(output / "three-case-ranges.json", range_manifest)
 write_json(output / "three-case-study.json", study)
-write_json(output / "model-settings.json", {"model": "jev-latest"})
+write_json(output / "model-settings.json", {"model": "jev-1.14.0"})
 write_json(output / "three-case-selection.json", {
     "kind": "focused-jev-pilot-selection", "schema_version": 1,
     "snapshot_digest": snapshot["snapshot_digest"], "main_tip": snapshot["main"]["tip"],
