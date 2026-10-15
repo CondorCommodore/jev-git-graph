@@ -271,7 +271,7 @@ def build_group_requests(
     if not isinstance(edges, list) or any(not isinstance(edge, Mapping) for edge in edges):
         raise JgError("contributions edges must be objects")
     evidence_by_contribution = evidence_by_contribution or {}
-    settings = dict(model_settings or {"model": "jev-latest", "reasoning_effort": None, "max_output_tokens": None})
+    settings = dict(model_settings or {"model": "jev-1.14.0", "reasoning_effort": None, "max_output_tokens": None})
     if set(settings) - {"model", "reasoning_effort", "max_output_tokens", "temperature", "seed"}:
         raise JgError("model settings contain unsupported or sensitive fields")
     if any(value is not None and not isinstance(value, (str, int, float, bool)) for value in settings.values()):

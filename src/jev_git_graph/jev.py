@@ -21,7 +21,7 @@ from .code_evidence import CODE_EVIDENCE_PROFILE, code_evidence_digest, revalida
 
 
 JEV_ENDPOINT = "https://api.typesafe.ai/v1/systemone"
-JEV_MODEL = "jev-latest"
+JEV_MODEL = "jev-1.14.0"
 EVIDENCE_PROFILES = ("minimal", "review", CODE_EVIDENCE_PROFILE)
 DEFAULT_MAX_JEV_REQUESTS = 1
 DEFAULT_MAX_JEV_PAYLOAD_BYTES = 8_192
